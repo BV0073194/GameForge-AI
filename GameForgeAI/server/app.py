@@ -784,35 +784,86 @@ def git_rollback(p: Path, revision: str) -> dict[str, Any]:
 
 def run_input_sequence(project_id: str, sequence: list[dict[str, Any]]) -> dict[str, Any]:
     try:
-        import pyautogui  # type: ignore
+        from pynput import keyboard, mouse  # type: ignore
     except Exception as exc:
         return {"ok": False, "error": f"Input automation unavailable: {exc}"}
+
     if len(sequence) > 500:
         return {"ok": False, "error": "Sequence too long"}
+
+    kb = keyboard.Controller()
+    ms = mouse.Controller()
+
+    special_keys = {
+        "enter": keyboard.Key.enter, "return": keyboard.Key.enter,
+        "esc": keyboard.Key.esc, "escape": keyboard.Key.esc,
+        "space": keyboard.Key.space, "tab": keyboard.Key.tab,
+        "shift": keyboard.Key.shift, "ctrl": keyboard.Key.ctrl,
+        "control": keyboard.Key.ctrl, "alt": keyboard.Key.alt,
+        "backspace": keyboard.Key.backspace, "delete": keyboard.Key.delete,
+        "up": keyboard.Key.up, "down": keyboard.Key.down,
+        "left": keyboard.Key.left, "right": keyboard.Key.right,
+        "home": keyboard.Key.home, "end": keyboard.Key.end,
+        "pageup": keyboard.Key.page_up, "pagedown": keyboard.Key.page_down,
+    }
+    for i in range(1, 13):
+        special_keys[f"f{i}"] = getattr(keyboard.Key, f"f{i}")
+
+    buttons = {
+        "left": mouse.Button.left,
+        "right": mouse.Button.right,
+        "middle": mouse.Button.middle,
+    }
+
+    def key_for(raw: Any):
+        name = str(raw or "").strip().lower()
+        if name in special_keys:
+            return special_keys[name]
+        if len(name) == 1:
+            return name
+        raise ValueError(f"Unsupported key: {raw}")
+
     events = []
     for step in sequence:
         kind = str(step.get("type", "")).lower()
         delay = min(30.0, max(0.0, float(step.get("delay", 0))))
-        if delay: time.sleep(delay)
+        if delay:
+            time.sleep(delay)
         try:
             if kind == "key":
-                pyautogui.press(str(step.get("key", ""))[:40])
+                kb.press(key_for(step.get("key")))
+                kb.release(key_for(step.get("key")))
             elif kind == "keydown":
-                pyautogui.keyDown(str(step.get("key", ""))[:40])
+                kb.press(key_for(step.get("key")))
             elif kind == "keyup":
-                pyautogui.keyUp(str(step.get("key", ""))[:40])
+                kb.release(key_for(step.get("key")))
             elif kind == "click":
-                pyautogui.click(button=str(step.get("button", "left")))
+                button = buttons.get(str(step.get("button", "left")).lower())
+                if button is None:
+                    raise ValueError("Unsupported mouse button")
+                ms.click(button, int(step.get("count", 1) or 1))
             elif kind == "move":
-                pyautogui.moveRel(int(step.get("x", 0)), int(step.get("y", 0)), duration=min(2.0, max(0.0, float(step.get("duration", 0)))))
+                x = int(step.get("x", 0))
+                y = int(step.get("y", 0))
+                duration = min(2.0, max(0.0, float(step.get("duration", 0))))
+                if duration <= 0:
+                    ms.move(x, y)
+                else:
+                    steps = max(1, int(duration * 60))
+                    sx, sy = x / steps, y / steps
+                    for _ in range(steps):
+                        ms.move(int(round(sx)), int(round(sy)))
+                        time.sleep(duration / steps)
             elif kind == "sleep":
                 time.sleep(min(30.0, max(0.0, float(step.get("seconds", 1)))))
             else:
-                events.append({"step": step, "ok": False, "error": "unknown input type"}); continue
+                events.append({"step": step, "ok": False, "error": "unknown input type"})
+                continue
             events.append({"step": step, "ok": True})
         except Exception as exc:
             events.append({"step": step, "ok": False, "error": str(exc)})
             break
+
     out = {"ok": all(e.get("ok") for e in events), "ran_at": now_iso(), "events": events}
     write_json(project_path(project_id) / ".gameforge" / "last_input_replay.json", out)
     return out

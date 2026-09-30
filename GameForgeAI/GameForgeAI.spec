@@ -6,7 +6,7 @@ datas = [("web", "web")]
 binaries = []
 hiddenimports = []
 
-for pkg in ["cv2", "mss", "psutil", "numpy", "pyautogui"]:
+for pkg in ["cv2", "mss", "psutil", "numpy", "pynput"]:
     try:
         d, b, h = collect_all(pkg)
         datas += d
