@@ -920,13 +920,15 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
     return True
 
 
-def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_result: dict[str, Any] | None, test_result: dict[str, Any] | None) -> str:
+def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_result: dict[str, Any] | None, test_result: dict[str, Any] | None, recovery_context: dict[str, Any] | None = None) -> str:
     evidence = collect_logs(p, cfg)
     prior = ""
     if build_result is not None:
         prior += "\nPrevious build result:\n" + json.dumps({k:v for k,v in build_result.items() if k != "output"}, indent=2) + "\n" + build_result.get("output", "")[-12000:]
     if test_result is not None:
         prior += "\nPrevious test result:\n" + json.dumps({k:v for k,v in test_result.items() if k != "output"}, indent=2) + "\n" + test_result.get("output", "")[-12000:]
+    if recovery_context:
+        prior += "\nAutomatic recovery context:\n" + json.dumps(recovery_context, indent=2)[-16000:]
     research = cfg.get("research_mode", "deep")
     return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\nRead AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything.\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
 
@@ -985,7 +987,7 @@ def agent_loop(project_id: str) -> None:
             state.last_update = now_iso()
             state.message = f"Iteration {iteration}: checkpointing and asking Codex to improve the playable result"
             git_checkpoint(p, f"GameForge pre-iteration {iteration}")
-            prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result)
+            prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result, recovery_context)
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
             final_path = p / f"logs/codex-iteration-{iteration:04d}.final.txt"
             trace_path.parent.mkdir(parents=True, exist_ok=True)
