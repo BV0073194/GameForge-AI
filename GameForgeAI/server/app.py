@@ -582,11 +582,14 @@ def _gameforge_process_env() -> dict[str, str]:
     that layout; export it into WSL as well as native child processes.
     """
     env = os.environ.copy()
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
     if os.name == "nt":
         env.setdefault("UV_LINK_MODE", "copy")
+        env.setdefault("DEBIAN_FRONTEND", "noninteractive")
         entries = [x for x in env.get("WSLENV", "").split(":") if x]
-        if not any(x.split("/", 1)[0] == "UV_LINK_MODE" for x in entries):
-            entries.append("UV_LINK_MODE/u")
+        for name in ("UV_LINK_MODE", "DEBIAN_FRONTEND", "GIT_TERMINAL_PROMPT"):
+            if not any(x.split("/", 1)[0] == name for x in entries):
+                entries.append(name + "/u")
         env["WSLENV"] = ":".join(entries)
     return env
 
