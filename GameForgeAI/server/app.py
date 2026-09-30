@@ -206,6 +206,48 @@ def command_exists(name: str) -> bool:
     return shutil.which(name) is not None
 
 
+def _command_invocation(name: str, args: list[str]) -> tuple[str | list[str], bool]:
+    """Return a subprocess-compatible invocation for native commands and Windows npm shims.
+
+    npm global executables on Windows are commonly exposed as .cmd/.bat shims.
+    CreateProcess cannot reliably execute those the same way it executes an .exe,
+    so route only those shim types through the Windows command processor.
+    """
+    resolved = shutil.which(name)
+    if not resolved:
+        raise FileNotFoundError(f"{name} was not found on PATH")
+
+    suffix = Path(resolved).suffix.lower()
+    if os.name == "nt" and suffix in {".cmd", ".bat"}:
+        # The argument list here is composed by GameForge from trusted constants,
+        # while large/user project prompts are sent on stdin instead of the shell
+        # command line. This also avoids cmd.exe's much smaller command-length limit.
+        command = subprocess.list2cmdline([resolved, *args])
+        return command, True
+
+    return [resolved, *args], False
+
+
+def run_codex(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    input_text: str | None = None,
+    timeout: int = 3600,
+) -> subprocess.CompletedProcess[str]:
+    command, use_shell = _command_invocation("codex", args)
+    return subprocess.run(
+        command,
+        cwd=str(cwd) if cwd else None,
+        shell=use_shell,
+        input=input_text,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        timeout=timeout,
+    )
+
+
 def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | None = None) -> dict[str, Any]:
     if not command.strip():
         return {"configured": False, "ok": True, "exit_code": None, "output": ""}
@@ -490,13 +532,20 @@ def agent_loop(project_id: str) -> None:
             prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result)
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
             final_path = p / f"logs/codex-iteration-{iteration:04d}.final.txt"
-            cmd = ["codex", "exec", "--json"]
+            codex_args = ["exec", "--json"]
             if cfg.get("agent", {}).get("permission_mode", "full-auto") == "full-auto":
-                cmd.append("--full-auto")
-            cmd.append(prompt)
+                codex_args.append("--full-auto")
+            # "-" forces Codex to read the prompt from stdin. This avoids Windows
+            # npm .cmd shim execution issues and command-line length limits.
+            codex_args.append("-")
             started = time.time()
             try:
-                proc = subprocess.run(cmd, cwd=p, capture_output=True, text=True, errors="replace", timeout=max(timeout, 3600))
+                proc = run_codex(
+                    codex_args,
+                    cwd=p,
+                    input_text=prompt,
+                    timeout=max(timeout, 3600),
+                )
                 trace_path.write_text(proc.stdout or "", encoding="utf-8")
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 if proc.returncode != 0:
@@ -880,7 +929,12 @@ Research depth: {cfg.get("research_mode", "deep")}. Internet research requested:
 Question/task: {question}
 
 Research broadly but use only public/authorized sources. Prioritize official/primary sources, public source repositories, archived developer materials, interviews, issue trackers, modding documentation, public reverse-engineering research, and technically relevant historical material. Separate VERIFIED facts, developer statements, reported/cut concepts, community theory, and project-original conclusions. Record URLs/titles/provenance in research/SOURCES.md and write a concise actionable synthesis to research/LATEST_RESEARCH.md. Do not modify gameplay code in this research task.'''
-    proc = subprocess.run(["codex", "exec", "--json", prompt], cwd=p, capture_output=True, text=True, errors="replace", timeout=max(3600, int(cfg.get("command_timeout_sec", 1800))))
+    proc = run_codex(
+        ["exec", "--json", "-"],
+        cwd=p,
+        input_text=prompt,
+        timeout=max(3600, int(cfg.get("command_timeout_sec", 1800))),
+    )
     log = p / "logs" / f"research-{int(time.time())}.jsonl"
     log.write_text((proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8")
     return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "log": str(log.relative_to(p)).replace("\\", "/"), "output": ((proc.stdout or "") + "\n" + (proc.stderr or ""))[-30000:]}
@@ -921,11 +975,18 @@ def analyze_assets(project_id: str) -> dict[str, Any]:
 
 def system_status() -> dict[str, Any]:
     codex_ver = ""
-    if command_exists("codex"):
+    codex_ok = False
+    codex_error = ""
+    codex_path = shutil.which("codex") or ""
+    if codex_path:
         try:
-            codex_ver = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=10).stdout.strip()
-        except Exception:
-            pass
+            proc = run_codex(["--version"], timeout=10)
+            codex_ver = (proc.stdout or proc.stderr or "").strip()
+            codex_ok = proc.returncode == 0
+            if not codex_ok:
+                codex_error = f"Codex --version exited with {proc.returncode}"
+        except Exception as exc:
+            codex_error = str(exc)
     deps = {}
     for name in ["cv2", "mss", "psutil"]:
         try:
@@ -937,8 +998,10 @@ def system_status() -> dict[str, Any]:
         "platform": platform.platform(),
         "python": sys.version.split()[0],
         "git": command_exists("git"),
-        "codex": command_exists("codex"),
+        "codex": codex_ok,
+        "codex_path": codex_path,
         "codex_version": codex_ver,
+        "codex_error": codex_error,
         "opencv": deps["cv2"],
         "mss": deps["mss"],
         "psutil": deps["psutil"],
