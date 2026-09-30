@@ -412,6 +412,29 @@ def start_codex_login(save_login: bool = True) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
+def codex_auth_preflight(cwd: Path | None = None) -> dict[str, Any]:
+    """Verify that Codex can make an authenticated inference, not just read local login state."""
+    status = codex_auth_status()
+    if not status.get("authenticated"):
+        return {"ok": False, "kind": "not_logged_in", "message": status.get("message") or "Sign in to Codex"}
+    try:
+        proc = run_codex(
+            ["exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only", "-"],
+            cwd=cwd or USER_DATA,
+            input_text="Reply with exactly: GAMEFORGE_AUTH_OK",
+            timeout=60,
+        )
+        combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        lower = combined.lower()
+        if proc.returncode == 0:
+            return {"ok": True, "kind": "ready", "message": "Codex authenticated and ready"}
+        if "401 unauthorized" in lower or "missing bearer or basic authentication" in lower:
+            return {"ok": False, "kind": "transport_401", "message": "Codex login is stored locally, but Codex sent the request without usable authentication (401). Sign out and sign in again; if it persists, the installed Codex runtime has an authentication transport failure."}
+        return {"ok": False, "kind": "exec_failed", "message": combined[-2000:] or f"Codex preflight exited with {proc.returncode}"}
+    except Exception as exc:
+        return {"ok": False, "kind": "preflight_error", "message": str(exc)}
+
+
 def codex_logout() -> dict[str, Any]:
     if not command_exists("codex"):
         return {"ok": True, "message": "Codex is not installed"}
@@ -458,14 +481,13 @@ def _command_invocation(name: str, args: list[str]) -> tuple[str | list[str], bo
 
 
 def _codex_process_env() -> dict[str, str]:
-    """Use Codex's persisted ChatGPT login without stale API-key env overrides."""
-    env = os.environ.copy()
-    # codex exec currently gives these variables precedence over stored ChatGPT
-    # OAuth credentials. A stale/invalid key therefore produces misleading 401s
-    # even while `codex login status` reports a valid ChatGPT login.
-    for name in ("OPENAI_API_KEY", "CODEX_API_KEY"):
-        env.pop(name, None)
-    return env
+    """Preserve Codex's normal auth selection.
+
+    Do not strip OPENAI_API_KEY/CODEX_API_KEY here: doing so can turn a valid
+    API-key session into an unauthenticated request. Codex itself owns auth
+    precedence between its supported login mechanisms.
+    """
+    return os.environ.copy()
 
 
 def run_codex(
@@ -776,6 +798,17 @@ def agent_loop(project_id: str) -> None:
                 state.status = "paused"
                 state.message = f"Reached configured max_iterations={max_iter}"
                 return
+
+            # A local "login status" is insufficient: affected Codex builds can
+            # report logged in yet send Responses requests with no Authorization
+            # header. Verify the real request path before consuming iteration 1.
+            if state.iteration == 0:
+                auth_check = codex_auth_preflight(p)
+                if not auth_check.get("ok"):
+                    state.status = "blocked"
+                    state.message = auth_check.get("message", "Codex authentication preflight failed")
+                    RUNTIME_STATE["codex_login_message"] = state.message
+                    return
 
             iteration = state.iteration
             state.last_update = now_iso()
