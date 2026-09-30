@@ -774,6 +774,12 @@ def agent_loop(project_id: str) -> None:
             final_path = p / f"logs/codex-iteration-{iteration:04d}.final.txt"
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             codex_args = ["exec", "--json"]
+            # GameForge projects can be imported/opened before Git metadata exists,
+            # or Git bootstrap can fail when user.name/user.email is not configured.
+            # We already checkpoint when Git is available, so Codex must not refuse
+            # an otherwise valid GameForge workspace solely because it is not a
+            # trusted Git repository.
+            codex_args.append("--skip-git-repo-check")
             if cfg.get("agent", {}).get("permission_mode", "full-auto") == "full-auto":
                 codex_args += ["--sandbox", "workspace-write", "-c", "approval_policy=never"]
             # "-" forces Codex to read the prompt from stdin. This avoids Windows
