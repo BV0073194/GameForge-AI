@@ -7,7 +7,7 @@ async function loadSystem(){try{const s=await api('/api/status');const codexText
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function selectProject(id){stopProjectPolling();current=id;inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();startProjectPolling()}
-async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUploads(d.uploads);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
 function renderInputRequest(r){
  const box=$('#inputRequest');if(!r){box.hidden=true;inputRequestBusy=false;inputRequestPending=false;return}inputRequestPending=true;stopProjectPolling();box.hidden=false;
  $('#inputRequestTitle').textContent=r.title||'GameForge needs input';
@@ -52,6 +52,32 @@ function renderInputRequest(r){
 function beginInputRequestInteraction(){inputRequestBusy=true}
 async function endInputRequestInteraction(){inputRequestBusy=false;if(inputRequestDirty){inputRequestDirty=false;await refreshState()}}
 async function submitRequestedValue(r,value){beginInputRequestInteraction();try{await postAction('input-request/respond',{value});if(r.resume_after_submit!==false)await postAction('agent/resume');inputRequestPending=false;startProjectPolling();await endInputRequestInteraction();await refreshState()}catch(e){await endInputRequestInteraction();alert(e.message)}}
+function renderUserReview(r){
+ r=r||{user_done:false,satisfaction:null,feedback:[]};
+ const satisfaction=$('#userSatisfaction');
+ if(satisfaction && document.activeElement!==satisfaction)satisfaction.value=r.satisfaction==null?'':String(r.satisfaction);
+ const done=!!r.user_done;
+ $('#markUserDone').hidden=done;
+ $('#reopenUserDone').hidden=!done;
+ if(done){
+   const checkpoint=r.done_checkpoint?(' • checkpoint '+r.done_checkpoint.slice(0,10)):'';
+   $('#userReviewStatus').textContent='You marked this result done. GameForge is holding this state'+checkpoint+'. You can reopen it at any time.';
+ }else if(!$('#userReviewStatus').dataset.local){
+   $('#userReviewStatus').textContent=r.satisfaction?('Current satisfaction: '+r.satisfaction+'/5'):'Add feedback whenever what you see differs from what you want.';
+ }
+ const items=(r.feedback||[]).slice(-10).reverse();
+ $('#userReviewHistory').innerHTML=items.length
+   ? '<h4>Recent feedback</h4>'+items.map(x=>`<div class="criterion"><strong>${esc(x.category||'feedback')}</strong> — ${esc(x.text||'')}<br><small>${esc(x.created_at||'')}</small></div>`).join('')
+   : '';
+}
+async function continueAfterReview(){
+ try{
+   const r=await postAction('agent/resume');
+   if(r?.status==='idle'||r?.status==='stopped'||r?.status==='error'||r?.status==='user-complete')await postAction('agent/start');
+ }catch(e){
+   try{await postAction('agent/start')}catch{}
+ }
+}
 function renderAcceptance(a){const box=$('#acceptance');box.innerHTML=`<p><strong>Project complete:</strong> ${a?.project_complete?'YES':'Not yet'}</p>`+(a?.criteria||[]).map(c=>`<div class="criterion ${c.status==='pass'?'pass':'pending'}"><strong>${esc(c.id)}</strong> — ${esc(c.description)}<br><small>${esc(c.status)}${c.evidence?` • ${esc(c.evidence)}`:''}</small></div>`).join('')}
 function renderUploads(u){$('#uploadList').innerHTML=`<p>${u?.count||0} scanned items</p>`+(u?.items||[]).slice(0,100).map(x=>`<div class="criterion"><strong>${esc(x.path)}</strong><br><small>${x.bytes||0} bytes • ${esc(x.sha256||x.error||'')}</small></div>`).join('')}
 async function postAction(action,body={}){if(!current)return;return api(`/api/project/${current}/${action}`,{method:'POST',body:JSON.stringify(body)})}
@@ -62,6 +88,48 @@ async function run(which){$('#runOutput').textContent=`Running ${which}...`;try{
 $('#runBuild').onclick=()=>run('build');$('#runTest').onclick=()=>run('test');$('#runLaunch').onclick=()=>run('launch');
 $('#checkpoint').onclick=async()=>{try{const r=await postAction('git/checkpoint',{message:'GameForge manual checkpoint'});$('#runOutput').textContent=JSON.stringify(r,null,2)}catch(e){alert(e.message)}};
 $('#saveSettings').onclick=async()=>{try{await postAction('config',{research_mode:$('#researchMode').value,internet_research:$('#internetResearch').checked,commands:{build:$('#buildCmd').value,test:$('#testCmd').value,launch:$('#launchCmd').value},visual:{monitor:Number($('#monitorNum').value)||1,interval_sec:1,freeze_seconds:Number($('#freezeSeconds').value)||8,black_mean_threshold:8,region:null,window_title:$('#windowTitle').value}});await refreshState();alert('Saved')}catch(e){alert(e.message)}};
+$('#submitFeedback').onclick=async()=>{
+ if(!current)return;
+ const textValue=$('#userFeedback').value.trim();
+ if(!textValue)return alert('Describe what you see and what you want changed.');
+ const status=$('#userReviewStatus');status.dataset.local='1';status.textContent='Saving feedback and handing it to the autonomous developer…';
+ try{
+   const review=await postAction('review/feedback',{text:textValue,category:$('#feedbackCategory').value});
+   $('#userFeedback').value='';
+   renderUserReview(review);
+   await continueAfterReview();
+   status.textContent='Feedback saved. The agent is continuing from the current project state with your feedback as priority direction.';
+   setTimeout(()=>{delete status.dataset.local},2500);
+   await refreshState();
+ }catch(e){status.textContent=e.message;delete status.dataset.local}
+};
+$('#userSatisfaction').onchange=async()=>{
+ if(!current)return;
+ try{
+   const review=await postAction('review/satisfaction',{value:$('#userSatisfaction').value});
+   renderUserReview(review);
+ }catch(e){alert(e.message)}
+};
+$('#markUserDone').onclick=async()=>{
+ if(!current)return;
+ try{
+   const review=await postAction('review/done',{done:true});
+   renderUserReview(review);
+   await refreshState();
+ }catch(e){alert(e.message)}
+};
+$('#reopenUserDone').onclick=async()=>{
+ if(!current)return;
+ const status=$('#userReviewStatus');status.dataset.local='1';status.textContent='Reopening the saved state and continuing…';
+ try{
+   const review=await postAction('review/done',{done:false});
+   renderUserReview(review);
+   await continueAfterReview();
+   status.textContent='Reopened. The agent is continuing from the exact saved project state.';
+   setTimeout(()=>{delete status.dataset.local},2500);
+   await refreshState();
+ }catch(e){status.textContent=e.message;delete status.dataset.local}
+};
 $('#scanUploads').onclick=async()=>{try{const r=await postAction('uploads/scan');renderUploads(r)}catch(e){alert(e.message)}};
 $('#uploadBtn').onclick=async()=>{if(!current)return;const files=[...$('#uploadFiles').files];if(!files.length)return alert('Select files.');const cat=$('#uploadCategory').value;for(let i=0;i<files.length;i++){const f=files[i];$('#uploadStatus').textContent=`Uploading ${i+1}/${files.length}: ${f.name}`;const r=await fetch(`/api/project/${current}/upload?category=${encodeURIComponent(cat)}&path=${encodeURIComponent(f.webkitRelativePath||f.name)}`,{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':f.name},body:f});if(!r.ok)throw new Error(await r.text())}$('#uploadStatus').textContent='Upload complete. Scanning…';const m=await postAction('uploads/scan');renderUploads(m);$('#uploadStatus').textContent='Upload intake complete.'};
 $('#refreshLogs').onclick=async()=>{if(!current)return;try{const d=await api(`/api/project/${current}/logs`);$('#logs').innerHTML=d.files.map(f=>`<details class="logbox"><summary>${esc(f.name)}</summary><pre>${esc(f.text)}</pre></details>`).join('')||'<p>No logs yet.</p>'}catch(e){alert(e.message)}};
