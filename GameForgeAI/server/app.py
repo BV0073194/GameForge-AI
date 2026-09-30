@@ -1027,24 +1027,73 @@ def agent_loop(project_id: str) -> None:
                     lower = combined.lower()
                     if "401 unauthorized" in lower:
                         state.status = "blocked"
-                        state.message = "Codex authentication was rejected (401). Project state is preserved. GameForge will not retry-loop; repair/re-authenticate the Codex runtime, then Resume."
+                        state.message = "Codex authentication was rejected (401). Project state is preserved; sign in again, then Resume."
                         RUNTIME_STATE["codex_login_message"] = "Codex request rejected (401); re-authentication may be required."
                         return
                     if any(x in lower for x in ["usage limit", "rate limit", "sign in", "login", "authentication"]):
                         state.status = "blocked"
-                        state.message = "Codex stopped for authentication/usage availability. Project state is preserved; resume after resolving it."
+                        state.message = "Codex stopped for authentication or service availability. Project state is preserved; resume after access is restored."
                         return
+
+                    recovery_failures += 1
+                    recovery_context = {
+                        "kind": "codex_process_failure",
+                        "attempt": recovery_failures,
+                        "max_attempts": max_auto_recovery,
+                        "exit_code": proc.returncode,
+                        "output_tail": combined[-12000:],
+                        "instruction": "Diagnose and repair this automatically, rerun the failed operation, verify the fix, then continue the project.",
+                    }
+                    write_json(p / ".gameforge" / "last_self_heal.json", {
+                        "timestamp": now_iso(),
+                        "iteration": iteration,
+                        **recovery_context,
+                    })
+
                     if any(x in lower for x in ["node\" is not recognized", "'node' is not recognized", "node: command not found", "env: node: no such file"]):
-                        state.status = "blocked"
-                        state.message = "Codex launcher is unusable because its Node runtime is missing. GameForge will repair Codex; resume after Codex becomes ready."
-                        ensure_codex_async()
-                        return
+                        state.status = "self-healing"
+                        state.message = "Codex runtime dependency failed; repairing the official Codex installation automatically"
+                        repair = install_codex(force=True)
+                        recovery_context["runtime_repair"] = repair
+                        if repair.get("ok"):
+                            time.sleep(min(cooldown, 3))
+                            continue
+
+                    if recovery_failures < max_auto_recovery:
+                        state.status = "self-healing"
+                        state.message = f"Iteration {iteration} hit a recoverable tooling/runtime failure; auto-diagnosing and retrying ({recovery_failures}/{max_auto_recovery})"
+                        git_checkpoint(p, f"GameForge self-heal checkpoint {iteration}")
+                        time.sleep(min(30.0, max(cooldown, recovery_failures * 2.0)))
+                        continue
+
                     state.status = "blocked"
-                    state.message = f"Codex iteration {iteration} failed with exit code {proc.returncode}. Automatic iteration stopped to prevent a retry loop; inspect the Codex log, repair the dependency, then Resume."
+                    state.message = f"Automatic recovery tried {recovery_failures} times without restoring the Codex/tooling path. Project state and diagnostics are preserved."
                     return
-            except subprocess.TimeoutExpired:
+
+                recovery_failures = 0
+                recovery_context = None
+            except subprocess.TimeoutExpired as exc:
+                recovery_failures += 1
+                recovery_context = {
+                    "kind": "codex_timeout",
+                    "attempt": recovery_failures,
+                    "max_attempts": max_auto_recovery,
+                    "timeout_sec": max(timeout, 3600),
+                    "output_tail": ((exc.stdout or "") + "\n" + (exc.stderr or ""))[-12000:],
+                    "instruction": "Determine why the previous autonomous step hung, use a non-interactive/headless alternative, verify it, and continue.",
+                }
+                write_json(p / ".gameforge" / "last_self_heal.json", {
+                    "timestamp": now_iso(),
+                    "iteration": iteration,
+                    **recovery_context,
+                })
+                if recovery_failures < max_auto_recovery:
+                    state.status = "self-healing"
+                    state.message = f"Iteration {iteration} timed out; automatically diagnosing and retrying ({recovery_failures}/{max_auto_recovery})"
+                    time.sleep(min(30.0, max(cooldown, recovery_failures * 2.0)))
+                    continue
                 state.status = "blocked"
-                state.message = f"Codex iteration {iteration} timed out. Automatic iteration stopped to prevent a runaway retry loop; project state is preserved."
+                state.message = f"Automatic recovery exhausted {recovery_failures} timeout attempts. Project state and diagnostics are preserved."
                 return
 
             cfg = project_config(project_id)  # reload in case commands changed
