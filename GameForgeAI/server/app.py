@@ -76,7 +76,9 @@ def _auth_redact(value: Any) -> Any:
         out = {}
         for k, v in value.items():
             if re.search(r"(?i)(token|secret|password|cookie|authorization|api.?key)", str(k)):
-                out[k] = "<REDACTED:PRESENT>" if v else "<EMPTY>"
+                # Presence-only diagnostic fields deliberately contain only
+                # SET/unset. Preserve those labels; redact every other value.
+                out[k] = v if v in ("SET", "unset") else ("<REDACTED:PRESENT>" if v else "<EMPTY>")
             else:
                 out[k] = _auth_redact(v)
         return out
@@ -475,9 +477,9 @@ def start_codex_login(save_login: bool = True) -> dict[str, Any]:
         result = install_codex()
         if not result.get("ok"): return result
     try:
-        command, use_shell = _command_invocation("codex", ["login", "-c", 'cli_auth_credentials_store="auto"'])
+        command, use_shell = _command_invocation("codex", ["login", "-c", 'cli_auth_credentials_store="file"'])
         env = _codex_process_env()
-        auth_trace("oauth_start_requested", save_login=save_login, codex=resolve_command("codex"),
+        auth_trace("oauth_start_requested", save_login=save_login, requested_credentials_store="file", codex=resolve_command("codex"),
                    command=command, use_shell=use_shell, cwd=str(USER_DATA),
                    env=_auth_env_snapshot(env), config=_codex_config_diagnostics(), **_auth_store_snapshot())
         store_stop = threading.Event()
