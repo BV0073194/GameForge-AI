@@ -6,6 +6,65 @@ Versions prior to the current public GitHub source were iterative prototypes. Th
 
 ---
 
+## v1.0.5-dev — Codex ChatGPT OAuth lifecycle debugging — IN PROGRESS
+
+### Symptom
+
+GameForge's official ChatGPT OAuth flow opened successfully and the Codex CLI printed `Successfully logged in`, but subsequent autonomous `codex exec` requests failed with HTTP 401 `Missing bearer or basic authentication in header`.
+
+### Diagnostic branch
+
+`debug-codex-auth-401-deep-diagnostics`
+
+Added a redacted diagnostic harness:
+
+- `GameForgeAI/tools/codex_auth_deep_diagnostics.py`
+- `GameForgeAI/tools/run-codex-auth-diagnostics.cmd`
+
+It compares direct/inherited and sanitized Codex execution environments, runs Codex Doctor, records executable/runtime provenance, checks credential-store metadata without exposing credential values, and inventories recent Codex logs.
+
+### Root cause found
+
+The captured Windows diagnostics showed:
+
+- Codex CLI 0.159.2 was installed and executable;
+- `codex login status` returned `Not logged in`;
+- Codex Doctor reported no credentials;
+- `%USERPROFILE%\\.codex\\auth.json` did not exist;
+- no API-key, token, proxy, `OPENAI_BASE_URL`, or `OPENAI_API_BASE` environment override was present;
+- both direct inference A/B tests consequently failed with unauthenticated HTTP 401 responses.
+
+GameForge's login lifecycle contained a destructive session-only path: when **Save login** was unchecked, a successful OAuth login set `session_login = True`; the process-exit handler later called `codex logout`, deleting the shared Codex credential store. This could make a genuinely successful browser OAuth flow appear to have failed later.
+
+### Fixed on diagnostic branch
+
+Commit `3f69559a412afda69b00995385b70820634d5b0e` stops GameForge shutdown from automatically calling `codex logout`. Explicit **Sign out** remains available.
+
+Related stabilization commits include:
+
+- `525f4ebc045b82deb3fa7070c51a3343b73d3fa8` — run real Codex auth preflight before consuming an agent iteration;
+- `f30855e7f5eab0946e8cd810d357d1d61b74c9b6` — diagnose provider/base-URL routing and isolate inherited base-URL overrides;
+- `d3a54e3f407d440057596d892f63bfdc4f2cf6db` — add deep redacted auth diagnostics;
+- `33b879bbb093778770f651541109d25b9043465c` — add one-click Windows diagnostics launcher.
+
+### Next verification
+
+Build a fresh Windows executable containing the diagnostic-branch fixes, then:
+
+1. sign in once through the official ChatGPT OAuth flow;
+2. verify `%USERPROFILE%\\.codex\\auth.json` survives GameForge/UI shutdown;
+3. verify `codex login status` reports ChatGPT authentication;
+4. run the real Codex inference preflight;
+5. confirm failed authentication does not consume agent iteration 1;
+6. if inference still returns 401 while stored ChatGPT credentials exist, capture a new diagnostic bundle and investigate the Codex runtime/auth transport separately;
+7. after validation, fold the confirmed fix into the release/PR branch and rebuild the one-file Windows artifact.
+
+### Security note
+
+GameForge must not extract, copy, log, inject, or package ChatGPT OAuth bearer/refresh tokens. The official Codex runtime remains responsible for its credential store and request authorization.
+
+---
+
 ## v1.0.4 — CI smoke-test import repair — CURRENT
 
 ### Fixed
