@@ -1145,6 +1145,12 @@ def agent_loop(project_id: str) -> None:
                 state.message = f"Automatic recovery exhausted {recovery_failures} timeout attempts. Project state and diagnostics are preserved."
                 return
 
+            if load_user_review(p).get("user_done"):
+                git_checkpoint(p, f"GameForge user-marked done after iteration {iteration}")
+                state.status = "user-complete"
+                state.message = "User marked this result done. Current work is checkpointed; reopen it to continue from here."
+                return
+
             cfg = project_config(project_id)  # reload in case commands changed
             commands = cfg.get("commands", {})
             state.message = f"Iteration {iteration}: running configured build"
