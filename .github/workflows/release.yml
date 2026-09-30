@@ -17,8 +17,6 @@ jobs:
         include:
           - os: windows-2025
             artifact: GameForgeAI-Windows-x64.exe
-          - os: windows-11-arm
-            artifact: GameForgeAI-Windows-arm64.exe
           - os: ubuntu-24.04
             artifact: GameForgeAI-Linux-x64
           - os: ubuntu-24.04-arm
@@ -31,57 +29,120 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v7
         with:
-          python-version: "3.13"
+          python-version: "3.12"
 
-      - name: Install build/runtime dependencies
+      - name: Environment diagnostics
         shell: bash
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt -r requirements-build.txt
+          set -euxo pipefail
+          python --version
+          python -m pip --version
+          uname -a || true
+          python - <<'PY'
+          import platform, sys
+          print("system=", platform.system())
+          print("machine=", platform.machine())
+          print("python=", sys.version)
+          PY
+
+      - name: Upgrade pip tooling
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install runtime dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install -r requirements.txt
+
+      - name: Install build dependency
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python -m pip install -r requirements-build.txt
+
+      - name: Dependency import check
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import cv2, mss, psutil, numpy
+          print("cv2", cv2.__version__)
+          print("mss", mss.__version__)
+          print("psutil", psutil.__version__)
+          print("numpy", numpy.__version__)
+          import pynput
+          print("pynput import OK")
+          PY
 
       - name: Smoke test source
         shell: bash
-        run: python tests/smoke.py
+        env:
+          PYNPUT_BACKEND: dummy
+        run: |
+          set -euxo pipefail
+          python tests/smoke.py
 
       - name: Build one-file executable
         shell: bash
-        run: python -m PyInstaller --noconfirm --clean GameForgeAI.spec
+        env:
+          PYNPUT_BACKEND: dummy
+        run: |
+          set -euxo pipefail
+          python -m PyInstaller --noconfirm --clean GameForgeAI.spec
 
       - name: Rename binary
         shell: bash
         run: |
+          set -euxo pipefail
           python - <<'PY'
           from pathlib import Path
           import os, shutil
           artifact = os.environ["ARTIFACT"]
           candidates = [Path("dist/GameForgeAI.exe"), Path("dist/GameForgeAI")]
-          src = next(p for p in candidates if p.exists())
+          src = next((p for p in candidates if p.exists()), None)
+          if src is None:
+              raise SystemExit("Built executable not found")
           dst = Path("release") / artifact
           dst.parent.mkdir(exist_ok=True)
           shutil.copy2(src, dst)
           if os.name != "nt":
               dst.chmod(0o755)
-          print(dst)
+          print(dst, dst.stat().st_size)
           PY
         env:
           ARTIFACT: ${{ matrix.artifact }}
 
       - name: Smoke test frozen executable
         shell: bash
+        env:
+          PYNPUT_BACKEND: dummy
         run: |
+          set -euxo pipefail
           python - <<'PY'
-          import os, pathlib, subprocess, time, urllib.request, signal
+          import os, pathlib, subprocess, time, urllib.request
           artifact = pathlib.Path("release") / os.environ["ARTIFACT"]
-          cmd = [str(artifact), "--no-browser", "--port", "43219"]
-          p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          p = subprocess.Popen(
+              [str(artifact.resolve()), "--no-browser", "--port", "43219"],
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              text=True,
+          )
           ok = False
           try:
-              for _ in range(45):
+              for _ in range(60):
                   time.sleep(1)
+                  if p.poll() is not None:
+                      output = p.stdout.read() if p.stdout else ""
+                      raise SystemExit(f"Executable exited early ({p.returncode}):\n{output}")
                   try:
                       with urllib.request.urlopen("http://127.0.0.1:43219/api/status", timeout=2) as r:
                           if r.status == 200:
@@ -90,7 +151,8 @@ jobs:
                   except Exception:
                       pass
               if not ok:
-                  raise SystemExit("Frozen executable did not start successfully")
+                  output = p.stdout.read() if p.stdout else ""
+                  raise SystemExit(f"Frozen executable did not become healthy:\n{output}")
           finally:
               p.terminate()
               try:
@@ -102,7 +164,8 @@ jobs:
         env:
           ARTIFACT: ${{ matrix.artifact }}
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
           path: release/${{ matrix.artifact }}
@@ -113,11 +176,3 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: release/${{ matrix.artifact }}
-
-  verify-release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Release binaries are produced by native runners
-        run: echo "Native one-file release matrix completed."
