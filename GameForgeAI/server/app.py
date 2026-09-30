@@ -814,6 +814,7 @@ class AgentState:
     stop_event: threading.Event = field(default_factory=threading.Event)
     pause_event: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
+    input_request: dict[str, Any] | None = None
 
 
 @dataclass
@@ -861,6 +862,30 @@ def collect_logs(p: Path, cfg: dict[str, Any]) -> str:
     return "".join(chunks)[-70000:]
 
 
+def user_input_request_path(p: Path) -> Path:
+    return p / ".gameforge" / "user_input_request.json"
+
+def load_user_input_request(p: Path) -> dict[str, Any] | None:
+    req = read_json(user_input_request_path(p), None)
+    return req if isinstance(req, dict) and req.get("status", "pending") == "pending" else None
+
+def validate_requested_upload(req: dict[str, Any], filename: str) -> None:
+    allowed = [str(x).lower() for x in req.get("accept_extensions", [])]
+    if allowed and Path(filename).suffix.lower() not in allowed:
+        raise ValueError("Expected file type: " + ", ".join(allowed))
+
+def detect_agent_input_request(p: Path) -> dict[str, Any] | None:
+    req = load_user_input_request(p)
+    if not req:
+        return None
+    req.setdefault("id", f"request-{int(time.time())}")
+    req.setdefault("kind", "file")
+    req.setdefault("title", "GameForge needs input")
+    req.setdefault("message", "The autonomous agent needs something only you can provide.")
+    req.setdefault("status", "pending")
+    write_json(user_input_request_path(p), req)
+    return req
+
 def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: dict[str, Any]) -> bool:
     acc = read_json(p / ".gameforge/acceptance.json", {}) or {}
     criteria = acc.get("criteria") or []
@@ -883,7 +908,11 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     if test_result is not None:
         prior += "\nPrevious test result:\n" + json.dumps({k:v for k,v in test_result.items() if k != "output"}, indent=2) + "\n" + test_result.get("output", "")[-12000:]
     research = cfg.get("research_mode", "deep")
-    return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\nRead AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything.\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.\n\nRecent evidence from logs/OpenCV/runtime:\n{evidence[-50000:] if evidence else '(none yet)'}\n{prior[-30000:]}\n'''
+    return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\nRead AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything.\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
+
+Before declaring a blocker, exhaust SAFE, LEGAL, REAL autonomous options: inspect existing project uploads/local files, public/authorized sources, official documentation, and legitimately redistributable dependencies. Never download pirated commercial games/ROMs, leaked credentials, or other unauthorized material. If progress genuinely requires user-only input, DO NOT merely mention the blocker in notes and DO NOT keep burning iterations. Write .gameforge/user_input_request.json and stop the iteration cleanly. Schema:
+{"status":"pending","kind":"file|url|text|choice|confirm","title":"short human title","message":"exactly what is needed and why","why_user_required":"why autonomous acquisition is unavailable/inappropriate","accept_extensions":[".z64"],"upload_category":"ROMS_LOCAL","placeholder":"","choices":[],"resume_after_submit":true}
+For files, list ONLY valid expected extensions. For a copyrighted base ROM, tell the user to provide their own legally obtained copy; never search for unauthorized ROM downloads. For URLs, request a URL only when the user must identify/authorize the source.\n\nRecent evidence from logs/OpenCV/runtime:\n{evidence[-50000:] if evidence else '(none yet)'}\n{prior[-30000:]}\n'''
 
 
 def agent_loop(project_id: str) -> None:
@@ -960,7 +989,13 @@ def agent_loop(project_id: str) -> None:
                 )
                 trace_path.write_text(proc.stdout or "", encoding="utf-8")
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
-                if proc.returncode != 0:
+                pending_input = detect_agent_input_request(p)
+            if pending_input:
+                state.status = "waiting_for_user"
+                state.message = pending_input.get("message") or "Waiting for required user input"
+                state.input_request = pending_input
+                return
+            if proc.returncode != 0:
                     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
                     lower = combined.lower()
                     if "401 unauthorized" in lower:
@@ -1571,6 +1606,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "evidence": read_json(p / ".gameforge/last_evidence.json", {}),
                     "uploads": read_json(p / ".gameforge/upload_manifest.json", {"count": 0, "items": []}),
                     "agent": agent_public(st) if st else {"status":"idle","iteration":0,"message":""},
+                    "input_request": load_user_input_request(p),
                     "cv": {"status": cv.status, "message": cv.message} if cv else {"status":"idle","message":""},
                     "visual": read_json(p / "captures/metrics.json", {}),
                     "managed_process": managed_process_public(pid),
@@ -1694,6 +1730,10 @@ class Handler(SimpleHTTPRequestHandler):
                 q = urllib.parse.parse_qs(parsed.query)
                 category = slugify((q.get("category") or ["REFERENCE"])[0]).upper()
                 rel = (q.get("path") or [self.headers.get("X-Filename", "upload.bin")])[0]
+                req = load_user_input_request(p)
+                if (q.get("request_id") or [None])[0] and req:
+                    validate_requested_upload(req, rel)
+                    category = slugify(req.get("upload_category") or category).upper()
                 rel = rel.replace("\\", "/").lstrip("/")
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 if length > 2_000_000_000:
@@ -1709,6 +1749,27 @@ class Handler(SimpleHTTPRequestHandler):
                         if not chunk: break
                         f.write(chunk); remaining -= len(chunk)
                 return self.send_json({"ok": True, "path": str(dest.relative_to(p)).replace("\\","/")})
+            if action == "input-request/respond":
+                body = self.body_json()
+                req = load_user_input_request(p)
+                if not req:
+                    return self.send_json({"error": "no pending input request"}, 409)
+                kind = req.get("kind", "text")
+                if kind in {"text","url","choice","confirm"}:
+                    response = body.get("value")
+                    if kind == "url" and response and not re.match(r"^https?://", str(response), re.I):
+                        return self.send_json({"error": "A valid http(s) URL is required"}, 400)
+                    if kind == "choice" and response not in req.get("choices", []):
+                        return self.send_json({"error": "Invalid choice"}, 400)
+                    write_json(p / ".gameforge" / "user_input_response.json",
+                               {"request_id": req.get("id"), "kind": kind, "value": response, "received_at": now_iso()})
+                req["status"] = "fulfilled"
+                req["fulfilled_at"] = now_iso()
+                write_json(user_input_request_path(p), req)
+                st = AGENTS.get(pid)
+                if st and st.status == "waiting_for_user":
+                    st.status = "paused"; st.message = "User input received; ready to resume"
+                return self.send_json({"ok": True, "resume_after_submit": bool(req.get("resume_after_submit", True))})
             if action in {"run/build","run/test","run/launch"}:
                 which = action.split("/")[1]
                 cmd = cfg.get("commands", {}).get(which, "")
