@@ -1,0 +1,123 @@
+name: Build Single-File Releases
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2025
+            artifact: GameForgeAI-Windows-x64.exe
+          - os: windows-11-arm
+            artifact: GameForgeAI-Windows-arm64.exe
+          - os: ubuntu-24.04
+            artifact: GameForgeAI-Linux-x64
+          - os: ubuntu-24.04-arm
+            artifact: GameForgeAI-Linux-arm64
+          - os: macos-15-intel
+            artifact: GameForgeAI-macOS-x64
+          - os: macos-15
+            artifact: GameForgeAI-macOS-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install build/runtime dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Smoke test source
+        shell: bash
+        run: python tests/smoke.py
+
+      - name: Build one-file executable
+        shell: bash
+        run: python -m PyInstaller --noconfirm --clean GameForgeAI.spec
+
+      - name: Rename binary
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import os, shutil
+          artifact = os.environ["ARTIFACT"]
+          candidates = [Path("dist/GameForgeAI.exe"), Path("dist/GameForgeAI")]
+          src = next(p for p in candidates if p.exists())
+          dst = Path("release") / artifact
+          dst.parent.mkdir(exist_ok=True)
+          shutil.copy2(src, dst)
+          if os.name != "nt":
+              dst.chmod(0o755)
+          print(dst)
+          PY
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+
+      - name: Smoke test frozen executable
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, pathlib, subprocess, time, urllib.request, signal
+          artifact = pathlib.Path("release") / os.environ["ARTIFACT"]
+          cmd = [str(artifact), "--no-browser", "--port", "43219"]
+          p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          ok = False
+          try:
+              for _ in range(45):
+                  time.sleep(1)
+                  try:
+                      with urllib.request.urlopen("http://127.0.0.1:43219/api/status", timeout=2) as r:
+                          if r.status == 200:
+                              ok = True
+                              break
+                  except Exception:
+                      pass
+              if not ok:
+                  raise SystemExit("Frozen executable did not start successfully")
+          finally:
+              p.terminate()
+              try:
+                  p.wait(timeout=10)
+              except Exception:
+                  p.kill()
+          print("FROZEN_SMOKE_OK")
+          PY
+        env:
+          ARTIFACT: ${{ matrix.artifact }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: release/${{ matrix.artifact }}
+          if-no-files-found: error
+
+      - name: Attach binary to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/${{ matrix.artifact }}
+
+  verify-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Release binaries are produced by native runners
+        run: echo "Native one-file release matrix completed."
