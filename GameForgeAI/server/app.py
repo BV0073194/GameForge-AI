@@ -223,14 +223,23 @@ def _codex_candidates() -> list[Path]:
 
 
 def resolve_command(name: str) -> str | None:
-    resolved = shutil.which(name)
-    if resolved:
-        return resolved
+    # Prefer GameForge/native Codex over npm shims. A codex.cmd can exist on
+    # Windows while its Node runtime is missing, which otherwise looks installed
+    # until every agent iteration fails with '"node" is not recognized'.
     if name == "codex":
         candidates = _codex_candidates()
-        if candidates:
-            return str(candidates[0])
-    return None
+        native = [p for p in candidates if p.suffix.lower() not in {".cmd", ".bat"}]
+        if native:
+            return str(native[0])
+        resolved = shutil.which(name)
+        if resolved and Path(resolved).suffix.lower() not in {".cmd", ".bat"}:
+            return resolved
+        # A Node-backed shim is usable only when Node itself is present.
+        shim = resolved or (str(candidates[0]) if candidates else None)
+        if shim and Path(shim).suffix.lower() in {".cmd", ".bat"} and shutil.which("node"):
+            return shim
+        return None
+    return shutil.which(name)
 
 
 def command_exists(name: str) -> bool:
@@ -692,9 +701,18 @@ def agent_loop(project_id: str) -> None:
                         state.status = "blocked"
                         state.message = "Codex stopped for authentication/usage availability. Project state is preserved; resume after resolving it."
                         return
-                    state.message = f"Codex iteration {iteration} returned {proc.returncode}; collecting evidence and retrying"
+                    if any(x in lower for x in ["node\" is not recognized", "'node' is not recognized", "node: command not found", "env: node: no such file"]):
+                        state.status = "blocked"
+                        state.message = "Codex launcher is unusable because its Node runtime is missing. GameForge will repair Codex; resume after Codex becomes ready."
+                        ensure_codex_async()
+                        return
+                    state.status = "blocked"
+                    state.message = f"Codex iteration {iteration} failed with exit code {proc.returncode}. Automatic iteration stopped to prevent a retry loop; inspect the Codex log, repair the dependency, then Resume."
+                    return
             except subprocess.TimeoutExpired:
-                state.message = f"Codex iteration {iteration} timed out; preserving state and continuing"
+                state.status = "blocked"
+                state.message = f"Codex iteration {iteration} timed out. Automatic iteration stopped to prevent a runaway retry loop; project state is preserved."
+                return
 
             cfg = project_config(project_id)  # reload in case commands changed
             commands = cfg.get("commands", {})
