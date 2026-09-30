@@ -1029,7 +1029,14 @@ def stop_managed_process(project_id: str) -> dict[str, Any]:
         return {"ok": True, **managed_process_public(project_id)}
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=15)
+            # Managed Windows processes are created in their own process group.
+            # Ask them to stop cleanly first so editors/build tools can flush data.
+            try:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+                proc.wait(timeout=8)
+            except Exception:
+                # Escalate only after the graceful request times out.
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=15)
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         try:
