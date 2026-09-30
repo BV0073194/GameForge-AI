@@ -990,12 +990,12 @@ def agent_loop(project_id: str) -> None:
                 trace_path.write_text(proc.stdout or "", encoding="utf-8")
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 pending_input = detect_agent_input_request(p)
-            if pending_input:
-                state.status = "waiting_for_user"
-                state.message = pending_input.get("message") or "Waiting for required user input"
-                state.input_request = pending_input
-                return
-            if proc.returncode != 0:
+                if pending_input:
+                    state.status = "waiting_for_user"
+                    state.message = pending_input.get("message") or "Waiting for required user input"
+                    state.input_request = pending_input
+                    return
+                if proc.returncode != 0:
                     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
                     lower = combined.lower()
                     if "401 unauthorized" in lower:
