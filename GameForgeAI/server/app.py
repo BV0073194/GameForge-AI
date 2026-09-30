@@ -18,6 +18,7 @@ import time
 import traceback
 import urllib.parse
 import webbrowser
+import atexit
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -53,8 +54,11 @@ PROJECTS = USER_DATA / "projects"
 GLOBAL_UPLOAD = USER_DATA / "UPLOAD"
 GLOBAL_LOGS = USER_DATA / "logs"
 REGISTRY_FILE = USER_DATA / "project_registry.json"
+RUNTIME = USER_DATA / "runtime"
+CODEX_RUNTIME = RUNTIME / "codex"
+RUNTIME_STATE = {"codex_installing": False, "codex_install_error": "", "codex_install_message": "", "session_login": False}
 
-for p in (USER_DATA, PROJECTS, GLOBAL_UPLOAD, GLOBAL_LOGS):
+for p in (USER_DATA, PROJECTS, GLOBAL_UPLOAD, GLOBAL_LOGS, RUNTIME, CODEX_RUNTIME):
     p.mkdir(parents=True, exist_ok=True)
 
 
@@ -182,6 +186,7 @@ def open_gfai_file(path: str | Path) -> tuple[str, Path, dict[str, Any]]:
         raise ValueError("Unsupported .gfai format version")
     root_value = str(manifest.get("root", "."))
     project_root = (manifest_path.parent / root_value).resolve()
+    repair_project_layout(project_root)
     cfg_path = project_root / str(manifest.get("config", "gameforge.json"))
     cfg = read_json(cfg_path, {})
     if not cfg:
@@ -202,8 +207,209 @@ def tail_text(path: Path, max_bytes: int = 40000) -> str:
         return ""
 
 
+def refresh_windows_environment() -> dict[str, Any]:
+    """Refresh this process from canonical Windows Machine + User environment.
+
+    Long-running Explorer/terminal processes can hand GameForge a stale PATH after
+    installers update the registry. Read the current values directly without
+    mutating the user's configuration.
+    """
+    if os.name != "nt":
+        return {"refreshed": False, "reason": "not-windows"}
+    try:
+        import winreg
+        def reg_value(root, key_path: str, name: str) -> str:
+            try:
+                with winreg.OpenKey(root, key_path) as key:
+                    value, _ = winreg.QueryValueEx(key, name)
+                    return os.path.expandvars(str(value))
+            except OSError:
+                return ""
+        machine = reg_value(winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", "Path")
+        user = reg_value(winreg.HKEY_CURRENT_USER, r"Environment", "Path")
+        entries, seen = [], set()
+        for raw in (machine, user):
+            for item in raw.split(";"):
+                # A single unmatched quote anywhere in PATH can make cmd.exe fail
+                # to execute programs that 'where' can still locate. Sanitize each
+                # registry entry independently for GameForge's process only.
+                item = os.path.expandvars(item.strip().replace('"', "").strip())
+                key = item.rstrip("\\/").lower()
+                if item and key not in seen:
+                    seen.add(key)
+                    entries.append(item)
+
+        # Known Windows tool locations are process-local fallbacks only. Never
+        # rewrite the user's Machine/User PATH from GameForge.
+        fallbacks = [
+            Path(os.environ.get("ProgramFiles", r"C:\\Program Files")) / "nodejs",
+            Path(os.environ.get("ProgramFiles", r"C:\\Program Files")) / "Git" / "cmd",
+            Path(os.environ.get("ProgramFiles", r"C:\\Program Files")) / "CMake" / "bin",
+            Path(os.environ.get("APPDATA", "")) / "npm",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "OpenAI" / "Codex" / "bin",
+        ]
+        prepend = []
+        for p in fallbacks:
+            if p and p.exists():
+                key = str(p).rstrip("\\/").lower()
+                if key not in seen:
+                    seen.add(key)
+                    prepend.append(str(p))
+        entries = prepend + entries
+
+        if entries:
+            os.environ["PATH"] = os.pathsep.join(entries)
+
+        # Report actual executable health, not merely whether a PATH entry exists.
+        health = {}
+        for command in ("node", "git", "python", "py", "cmake"):
+            resolved = shutil.which(command)
+            health[command] = resolved or ""
+        return {"refreshed": True, "path_entries": len(entries), "commands": health}
+    except Exception as exc:
+        return {"refreshed": False, "error": str(exc)}
+
+
+def _codex_candidates() -> list[Path]:
+    exe = "codex.exe" if os.name == "nt" else "codex"
+    candidates = [
+        CODEX_RUNTIME / exe,
+        Path.home() / ".codex" / "bin" / exe,
+        Path.home() / ".local" / "bin" / exe,
+    ]
+    if os.name == "nt":
+        candidates += [
+            # Official OpenAI standalone installer visible launcher.
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "OpenAI" / "Codex" / "bin" / exe,
+            # Current managed standalone payload.
+            Path.home() / ".codex" / "packages" / "standalone" / "current" / "bin" / exe,
+            # Legacy npm shim is last-resort only and requires Node.
+            Path(os.environ.get("APPDATA", "")) / "npm" / "codex.cmd",
+        ]
+    return [p for p in candidates if p.exists()]
+
+
+def resolve_command(name: str) -> str | None:
+    if os.name == "nt":
+        refresh_windows_environment()
+    # Prefer GameForge/native Codex over npm shims. A codex.cmd can exist on
+    # Windows while its Node runtime is missing, which otherwise looks installed
+    # until every agent iteration fails with '"node" is not recognized'.
+    if name == "codex":
+        candidates = _codex_candidates()
+        native = [p for p in candidates if p.suffix.lower() not in {".cmd", ".bat"}]
+        if native:
+            return str(native[0])
+        resolved = shutil.which(name)
+        if resolved and Path(resolved).suffix.lower() not in {".cmd", ".bat"}:
+            return resolved
+        # A Node-backed shim is usable only when Node itself is present.
+        shim = resolved or (str(candidates[0]) if candidates else None)
+        if shim and Path(shim).suffix.lower() in {".cmd", ".bat"} and shutil.which("node"):
+            return shim
+        return None
+    return shutil.which(name)
+
+
 def command_exists(name: str) -> bool:
-    return shutil.which(name) is not None
+    return resolve_command(name) is not None
+
+
+def install_codex() -> dict[str, Any]:
+    if command_exists("codex"):
+        return {"ok": True, "already_installed": True, "path": resolve_command("codex")}
+    if RUNTIME_STATE["codex_installing"]:
+        return {"ok": False, "installing": True}
+    RUNTIME_STATE["codex_installing"] = True
+    RUNTIME_STATE["codex_install_error"] = ""
+    RUNTIME_STATE["codex_install_message"] = "Installing official Codex CLI..."
+    try:
+        system = platform.system()
+        if system == "Windows":
+            ps = shutil.which("powershell") or shutil.which("pwsh")
+            if not ps:
+                raise RuntimeError("PowerShell is required to install Codex on Windows")
+            cmd = [ps, "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", "irm https://github.com/openai/codex/releases/latest/download/install.ps1 | iex"]
+        elif system in {"Linux", "Darwin"}:
+            shell = shutil.which("sh") or "/bin/sh"
+            if not shutil.which("curl"):
+                raise RuntimeError("curl is required for the official Codex installer")
+            cmd = [shell, "-c", "curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh"]
+        else:
+            raise RuntimeError(f"Automatic Codex install is not supported on {system}")
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=900)
+        if proc.returncode != 0:
+            raise RuntimeError(((proc.stdout or "") + "\n" + (proc.stderr or ""))[-4000:])
+        bin_dir = str(Path.home() / ".codex" / "bin")
+        if bin_dir not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+        resolved = resolve_command("codex")
+        if not resolved:
+            raise RuntimeError("Codex installer completed, but GameForge could not locate the executable")
+        RUNTIME_STATE["codex_install_message"] = "Codex installed"
+        return {"ok": True, "path": resolved}
+    except Exception as exc:
+        RUNTIME_STATE["codex_install_error"] = str(exc)
+        RUNTIME_STATE["codex_install_message"] = "Codex installation failed: " + str(exc)
+        return {"ok": False, "error": str(exc)}
+    finally:
+        RUNTIME_STATE["codex_installing"] = False
+
+
+def ensure_codex_async() -> None:
+    if command_exists("codex") or RUNTIME_STATE["codex_installing"]:
+        return
+    threading.Thread(target=install_codex, daemon=True, name="codex-installer").start()
+
+
+def codex_auth_status() -> dict[str, Any]:
+    if not command_exists("codex"):
+        return {"authenticated": False, "available": False, "message": "Codex is not installed"}
+    try:
+        proc = run_codex(["login", "status"], timeout=15)
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return {"available": True, "authenticated": proc.returncode == 0, "message": output[-2000:] or ("Authenticated" if proc.returncode == 0 else "Sign in required")}
+    except Exception as exc:
+        return {"available": True, "authenticated": False, "message": str(exc)}
+
+
+def start_codex_login(save_login: bool = True) -> dict[str, Any]:
+    if not command_exists("codex"):
+        result = install_codex()
+        if not result.get("ok"):
+            return result
+    args = ["login", "-c", 'cli_auth_credentials_store="auto"']
+    try:
+        command, use_shell = _command_invocation("codex", args)
+        subprocess.Popen(command, shell=use_shell, cwd=str(USER_DATA))
+        RUNTIME_STATE["session_login"] = not save_login
+        return {"ok": True, "started": True, "save_login": save_login, "message": "Complete the official ChatGPT sign-in in your browser."}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def codex_logout() -> dict[str, Any]:
+    if not command_exists("codex"):
+        return {"ok": True, "message": "Codex is not installed"}
+    try:
+        proc = run_codex(["logout"], timeout=30)
+        RUNTIME_STATE["session_login"] = False
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return {"ok": proc.returncode == 0, "message": output[-2000:]}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _logout_session_auth() -> None:
+    if RUNTIME_STATE.get("session_login"):
+        try:
+            codex_logout()
+        except Exception:
+            pass
+
+
+atexit.register(_logout_session_auth)
 
 
 def _command_invocation(name: str, args: list[str]) -> tuple[str | list[str], bool]:
@@ -213,7 +419,7 @@ def _command_invocation(name: str, args: list[str]) -> tuple[str | list[str], bo
     CreateProcess cannot reliably execute those the same way it executes an .exe,
     so route only those shim types through the Windows command processor.
     """
-    resolved = shutil.which(name)
+    resolved = resolve_command(name)
     if not resolved:
         raise FileNotFoundError(f"{name} was not found on PATH")
 
@@ -286,14 +492,23 @@ def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | Non
     return result
 
 
+def repair_project_layout(p: Path) -> None:
+    for rel in ("logs", "research", "workspace", "captures", ".gameforge", "UPLOAD"):
+        (p / rel).mkdir(parents=True, exist_ok=True)
+
+
 def project_path(project_id: str) -> Path:
     pid = slugify(project_id)
     registry = load_project_registry()
     if pid in registry:
         p = Path(registry[pid]).expanduser().resolve()
         if p.exists():
+            repair_project_layout(p)
             return p
-    return safe_child(PROJECTS, pid)
+    p = safe_child(PROJECTS, pid)
+    if p.exists():
+        repair_project_layout(p)
+    return p
 
 
 def project_config(project_id: str) -> dict[str, Any]:
@@ -532,6 +747,7 @@ def agent_loop(project_id: str) -> None:
             prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result)
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
             final_path = p / f"logs/codex-iteration-{iteration:04d}.final.txt"
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
             codex_args = ["exec", "--json"]
             if cfg.get("agent", {}).get("permission_mode", "full-auto") == "full-auto":
                 codex_args.append("--full-auto")
@@ -555,9 +771,18 @@ def agent_loop(project_id: str) -> None:
                         state.status = "blocked"
                         state.message = "Codex stopped for authentication/usage availability. Project state is preserved; resume after resolving it."
                         return
-                    state.message = f"Codex iteration {iteration} returned {proc.returncode}; collecting evidence and retrying"
+                    if any(x in lower for x in ["node\" is not recognized", "'node' is not recognized", "node: command not found", "env: node: no such file"]):
+                        state.status = "blocked"
+                        state.message = "Codex launcher is unusable because its Node runtime is missing. GameForge will repair Codex; resume after Codex becomes ready."
+                        ensure_codex_async()
+                        return
+                    state.status = "blocked"
+                    state.message = f"Codex iteration {iteration} failed with exit code {proc.returncode}. Automatic iteration stopped to prevent a retry loop; inspect the Codex log, repair the dependency, then Resume."
+                    return
             except subprocess.TimeoutExpired:
-                state.message = f"Codex iteration {iteration} timed out; preserving state and continuing"
+                state.status = "blocked"
+                state.message = f"Codex iteration {iteration} timed out. Automatic iteration stopped to prevent a runaway retry loop; project state is preserved."
+                return
 
             cfg = project_config(project_id)  # reload in case commands changed
             commands = cfg.get("commands", {})
@@ -936,6 +1161,7 @@ Research broadly but use only public/authorized sources. Prioritize official/pri
         timeout=max(3600, int(cfg.get("command_timeout_sec", 1800))),
     )
     log = p / "logs" / f"research-{int(time.time())}.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text((proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8")
     return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "log": str(log.relative_to(p)).replace("\\", "/"), "output": ((proc.stdout or "") + "\n" + (proc.stderr or ""))[-30000:]}
 
@@ -977,7 +1203,7 @@ def system_status() -> dict[str, Any]:
     codex_ver = ""
     codex_ok = False
     codex_error = ""
-    codex_path = shutil.which("codex") or ""
+    codex_path = resolve_command("codex") or ""
     if codex_path:
         try:
             proc = run_codex(["--version"], timeout=10)
@@ -1002,6 +1228,10 @@ def system_status() -> dict[str, Any]:
         "codex_path": codex_path,
         "codex_version": codex_ver,
         "codex_error": codex_error,
+        "codex_installing": bool(RUNTIME_STATE["codex_installing"]),
+        "codex_install_message": RUNTIME_STATE["codex_install_message"],
+        "codex_install_error": RUNTIME_STATE["codex_install_error"],
+        "codex_auth": codex_auth_status() if codex_ok else {"available": codex_ok, "authenticated": False, "message": "Codex install required"},
         "opencv": deps["cv2"],
         "mss": deps["mss"],
         "psutil": deps["psutil"],
@@ -1133,6 +1363,13 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/api/codex/install":
+                return self.send_json(install_codex())
+            if path == "/api/codex/login":
+                body = self.body_json()
+                return self.send_json(start_codex_login(bool(body.get("save_login", True))))
+            if path == "/api/codex/logout":
+                return self.send_json(codex_logout())
             if path == "/api/projects/open-gfai":
                 body = self.body_json()
                 pid, p, cfg = open_gfai_file(body.get("path", ""))
@@ -1246,6 +1483,8 @@ def main() -> None:
     if args.project_file:
         selected_project, _, _ = open_gfai_file(args.project_file)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    refresh_windows_environment()
+    ensure_codex_async()
     url = f"http://127.0.0.1:{args.port}"
     if selected_project:
         url += f"/?project={urllib.parse.quote(selected_project)}"
