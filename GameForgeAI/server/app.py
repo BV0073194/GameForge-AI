@@ -657,6 +657,8 @@ CVS: dict[str, CVState] = {}
 STATE_LOCK = threading.Lock()
 MANAGED_PROCESSES: dict[str, subprocess.Popen] = {}
 MANAGED_PROCESS_META: dict[str, dict[str, Any]] = {}
+APP_SERVER: ThreadingHTTPServer | None = None
+WEB_SESSION = {"last_heartbeat": time.monotonic(), "closing": False, "shutdown_started": False}
 
 
 
@@ -1239,6 +1241,60 @@ def system_status() -> dict[str, Any]:
     }
 
 
+def graceful_session_shutdown(reason: str = "web-ui-closed") -> dict[str, Any]:
+    """Checkpoint/pause project work and stop child runtime processes before exit."""
+    if WEB_SESSION.get("shutdown_started"):
+        return {"ok": True, "already_started": True}
+    WEB_SESSION["shutdown_started"] = True
+    report: dict[str, Any] = {"ok": True, "reason": reason, "projects": {}}
+    project_ids = set(AGENTS) | set(CVS) | set(MANAGED_PROCESSES)
+    for pid in project_ids:
+        item: dict[str, Any] = {}
+        try:
+            p = project_path(pid)
+            agent = AGENTS.get(pid)
+            cv = CVS.get(pid)
+            proc_meta = MANAGED_PROCESS_META.get(pid, {})
+            resume = {
+                "saved_at": now_iso(),
+                "reason": reason,
+                "agent_was_running": bool(agent and agent.thread and agent.thread.is_alive() and agent.status == "running"),
+                "agent_iteration": agent.iteration if agent else 0,
+                "cv_was_running": bool(cv and cv.thread and cv.thread.is_alive() and cv.status == "running"),
+                "managed_process_command": proc_meta.get("command", ""),
+            }
+            write_json(p / ".gameforge" / "resume-session.json", resume)
+            if agent and agent.thread and agent.thread.is_alive():
+                agent.pause_event.set()
+                agent.status = "paused"
+                agent.message = "Paused safely because the GameForge web UI closed"
+            if cv:
+                cv.stop_event.set()
+            if MANAGED_PROCESSES.get(pid) and MANAGED_PROCESSES[pid].poll() is None:
+                item["process"] = stop_managed_process(pid)
+            item["checkpoint"] = git_checkpoint(p, "GameForge safe checkpoint on UI exit")
+            item["resume"] = resume
+        except Exception as exc:
+            item["error"] = str(exc)
+            report["ok"] = False
+        report["projects"][pid] = item
+    write_json(USER_DATA / "last_shutdown.json", report)
+    return report
+
+
+def _schedule_web_close_shutdown() -> None:
+    """Give reload/navigation a grace period; a resumed heartbeat cancels exit."""
+    def worker() -> None:
+        time.sleep(4.0)
+        if not WEB_SESSION.get("closing") or WEB_SESSION.get("shutdown_started"):
+            return
+        graceful_session_shutdown("web-ui-closed")
+        server = APP_SERVER
+        if server:
+            threading.Thread(target=server.shutdown, daemon=True, name="server-shutdown").start()
+    threading.Thread(target=worker, daemon=True, name="web-close-grace").start()
+
+
 class Handler(SimpleHTTPRequestHandler):
     server_version = "GameForgeAI/1.0-singlefile"
 
@@ -1363,6 +1419,14 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/api/session/heartbeat":
+                WEB_SESSION["last_heartbeat"] = time.monotonic()
+                WEB_SESSION["closing"] = False
+                return self.send_json({"ok": True})
+            if path == "/api/session/closing":
+                WEB_SESSION["closing"] = True
+                _schedule_web_close_shutdown()
+                return self.send_json({"ok": True, "grace_seconds": 4})
             if path == "/api/codex/install":
                 return self.send_json(install_codex())
             if path == "/api/codex/login":
@@ -1473,6 +1537,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
+    global APP_SERVER
     parser = argparse.ArgumentParser(description="GameForge AI local game-development studio")
     parser.add_argument("--host", default="127.0.0.1", help="Use 0.0.0.0 for LAN access")
     parser.add_argument("--port", type=int, default=4217)
@@ -1483,6 +1548,7 @@ def main() -> None:
     if args.project_file:
         selected_project, _, _ = open_gfai_file(args.project_file)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    APP_SERVER = server
     refresh_windows_environment()
     ensure_codex_async()
     url = f"http://127.0.0.1:{args.port}"
@@ -1498,7 +1564,9 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopping GameForge AI")
     finally:
+        graceful_session_shutdown("server-exit")
         server.server_close()
+        APP_SERVER = None
 
 if __name__ == "__main__":
     main()
