@@ -37,42 +37,64 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Detect GameForge source root
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ -f "$GITHUB_WORKSPACE/requirements.txt" ] && [ -f "$GITHUB_WORKSPACE/GameForgeAI.spec" ]; then
+            echo "GAMEFORGE_ROOT=$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
+          elif [ -f "$GITHUB_WORKSPACE/GameForgeAI/requirements.txt" ] && [ -f "$GITHUB_WORKSPACE/GameForgeAI/GameForgeAI.spec" ]; then
+            echo "GAMEFORGE_ROOT=$GITHUB_WORKSPACE/GameForgeAI" >> "$GITHUB_ENV"
+          else
+            echo "Could not find GameForge source files."
+            echo "Repository contents:"
+            find "$GITHUB_WORKSPACE" -maxdepth 3 -type f | sort
+            exit 1
+          fi
+
       - name: Environment diagnostics
         shell: bash
         run: |
           set -euxo pipefail
+          echo "GAMEFORGE_ROOT=$GAMEFORGE_ROOT"
           python --version
           python -m pip --version
-          uname -a || true
           python - <<'PY'
           import platform, sys
           print("system=", platform.system())
           print("machine=", platform.machine())
           print("python=", sys.version)
           PY
+          find "$GAMEFORGE_ROOT" -maxdepth 2 -type f | sort
 
       - name: Upgrade pip tooling
         shell: bash
         run: |
           set -euxo pipefail
+          cd "$GAMEFORGE_ROOT"
           python -m pip install --upgrade pip setuptools wheel
 
       - name: Install runtime dependencies
         shell: bash
         run: |
           set -euxo pipefail
+          cd "$GAMEFORGE_ROOT"
           python -m pip install -r requirements.txt
 
       - name: Install build dependency
         shell: bash
         run: |
           set -euxo pipefail
+          cd "$GAMEFORGE_ROOT"
           python -m pip install -r requirements-build.txt
 
       - name: Dependency import check
         shell: bash
+        env:
+          PYNPUT_BACKEND: dummy
         run: |
           set -euxo pipefail
+          cd "$GAMEFORGE_ROOT"
           python - <<'PY'
           import cv2, mss, psutil, numpy
           print("cv2", cv2.__version__)
@@ -89,6 +111,7 @@ jobs:
           PYNPUT_BACKEND: dummy
         run: |
           set -euxo pipefail
+          cd "$GAMEFORGE_ROOT"
           python tests/smoke.py
 
       - name: Build one-file executable
@@ -97,12 +120,14 @@ jobs:
           PYNPUT_BACKEND: dummy
         run: |
           set -euxo pipefail
+          cd "$GAMEFORGE_ROOT"
           python -m PyInstaller --noconfirm --clean GameForgeAI.spec
 
       - name: Rename binary
         shell: bash
         run: |
           set -euxo pipefail
+          cd "$GAMEFORGE_ROOT"
           python - <<'PY'
           from pathlib import Path
           import os, shutil
@@ -111,8 +136,9 @@ jobs:
           src = next((p for p in candidates if p.exists()), None)
           if src is None:
               raise SystemExit("Built executable not found")
-          dst = Path("release") / artifact
-          dst.parent.mkdir(exist_ok=True)
+          release_dir = Path(os.environ["GITHUB_WORKSPACE"]) / "release"
+          release_dir.mkdir(exist_ok=True)
+          dst = release_dir / artifact
           shutil.copy2(src, dst)
           if os.name != "nt":
               dst.chmod(0o755)
@@ -128,6 +154,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
         run: |
           set -euxo pipefail
+          cd "$GITHUB_WORKSPACE"
           python - <<'PY'
           import os, pathlib, subprocess, time, urllib.request
           artifact = pathlib.Path("release") / os.environ["ARTIFACT"]
