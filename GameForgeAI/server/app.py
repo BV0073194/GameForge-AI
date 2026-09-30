@@ -572,6 +572,25 @@ def _command_invocation(name: str, args: list[str]) -> tuple[str | list[str], bo
     return [resolved, *args], False
 
 
+def _gameforge_process_env() -> dict[str, str]:
+    """Return a stable child-process environment for local/WSL build tooling.
+
+    When Windows-hosted projects are built through WSL, uv's cache commonly
+    lives on the Linux filesystem while the project/venv is under /mnt/c or
+    /mnt/d. Hardlinks cannot cross those filesystems, so uv repeatedly warns
+    before falling back to copies. Copy mode is the intended safe behavior for
+    that layout; export it into WSL as well as native child processes.
+    """
+    env = os.environ.copy()
+    if os.name == "nt":
+        env.setdefault("UV_LINK_MODE", "copy")
+        entries = [x for x in env.get("WSLENV", "").split(":") if x]
+        if not any(x.split("/", 1)[0] == "UV_LINK_MODE" for x in entries):
+            entries.append("UV_LINK_MODE/u")
+        env["WSLENV"] = ":".join(entries)
+    return env
+
+
 def _codex_process_env() -> dict[str, str]:
     """Give Codex a clean provider-routing environment while preserving credentials.
 
@@ -580,7 +599,7 @@ def _codex_process_env() -> dict[str, str]:
     to api.openai.com/v1/responses, where ChatGPT OAuth is not the API-key auth
     expected by that route. Keep supported credential variables intact.
     """
-    env = os.environ.copy()
+    env = _gameforge_process_env()
     for name in ("OPENAI_BASE_URL", "OPENAI_API_BASE"):
         env.pop(name, None)
     return env
@@ -640,6 +659,7 @@ def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | Non
             text=True,
             errors="replace",
             timeout=timeout,
+            env=_gameforge_process_env(),
         )
         output = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
         result = {
