@@ -893,7 +893,7 @@ def set_agent_activity(state: AgentState, task: str, detail: str = "", kind: str
                 "task": task,
                 "detail": state.current_detail,
             })
-            state.activity_history[:] = state.activity_history[-12:]
+            state.activity_history[:] = state.activity_history[-200:]
     try:
         p = project_path(state.project_id)
         write_json(p / ".gameforge" / "live_activity.json", {
@@ -1418,7 +1418,7 @@ def agent_public(s: AgentState) -> dict[str, Any]:
             "detail": s.current_detail,
             "task_started_at": s.task_started_at,
             "last_activity_at": s.last_activity_at,
-            "history": s.activity_history[-12:],
+            "history": s.activity_history[-100:],
         },
     }
 
