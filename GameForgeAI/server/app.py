@@ -935,15 +935,18 @@ def agent_loop(project_id: str) -> None:
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
             final_path = p / f"logs/codex-iteration-{iteration:04d}.final.txt"
             trace_path.parent.mkdir(parents=True, exist_ok=True)
-            codex_args = ["exec", "--json"]
-            # GameForge projects can be imported/opened before Git metadata exists,
-            # or Git bootstrap can fail when user.name/user.email is not configured.
-            # We already checkpoint when Git is available, so Codex must not refuse
-            # an otherwise valid GameForge workspace solely because it is not a
-            # trusted Git repository.
-            codex_args.append("--skip-git-repo-check")
-            if cfg.get("agent", {}).get("permission_mode", "full-auto") == "full-auto":
-                codex_args += ["--sandbox", "workspace-write", "-c", "approval_policy=never"]
+            codex_args = ["exec", "--json", "--skip-git-repo-check"]
+            permission_mode = cfg.get("agent", {}).get("permission_mode", "full-auto")
+            if permission_mode == "full-auto":
+                # Codex 0.159.x can reject PowerShell itself under the Windows
+                # workspace-write execution policy even when approval_policy=never.
+                # GameForge full-auto explicitly means the autonomous project agent
+                # may run project-local shell/build/test tooling without prompts.
+                codex_args += ["--dangerously-bypass-approvals-and-sandbox"]
+            else:
+                codex_args += ["--sandbox", "workspace-write"]
+            auth_trace("agent_codex_exec", project=str(p), iteration=iteration,
+                       permission_mode=permission_mode, codex_args=codex_args)
             # "-" forces Codex to read the prompt from stdin. This avoids Windows
             # npm .cmd shim execution issues and command-line length limits.
             codex_args.append("-")
