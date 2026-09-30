@@ -36,3 +36,12 @@ $('#rollbackBtn').onclick=async()=>{const rev=$('#rollbackRev').value.trim();if(
 $('#codexLogin').onclick=async()=>{try{$('#codexAuthMessage').textContent='Starting official ChatGPT sign-in…';const r=await api('/api/codex/login',{method:'POST',body:JSON.stringify({save_login:$('#saveLogin').checked})});$('#codexAuthMessage').textContent=r.message||r.error||'Complete sign-in in your browser.';setTimeout(loadSystem,2500)}catch(e){$('#codexAuthMessage').textContent=e.message}};
 $('#codexLogout').onclick=async()=>{try{const r=await api('/api/codex/logout',{method:'POST',body:'{}'});$('#codexAuthMessage').textContent=r.message||'Signed out';await loadSystem()}catch(e){$('#codexAuthMessage').textContent=e.message}};
 setInterval(loadSystem,5000);
+
+
+// Keep the desktop backend tied to the UI lifetime. pagehide also fires on
+// reload/navigation, so the backend waits four seconds; a fresh heartbeat
+// cancels shutdown after an ordinary reload.
+async function sessionHeartbeat(){try{await fetch('/api/session/heartbeat',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',keepalive:true})}catch{}}
+sessionHeartbeat();
+setInterval(sessionHeartbeat,1500);
+window.addEventListener('pagehide',()=>{try{navigator.sendBeacon('/api/session/closing',new Blob(['{}'],{type:'application/json'}))}catch{}});
