@@ -69,6 +69,18 @@
               <p class="tiny">The loop checkpoints → edits → builds → tests → reads logs/visual evidence → fixes → regression-checks → repeats until acceptance is verified or a real blocker stops progress.</p>
             </article>
 
+            <article class="card" id="liveTaskCard">
+              <h3>Live task activity</h3>
+              <div class="badges">
+                <span id="liveTaskState" class="badge">Idle</span>
+                <span id="liveTaskAge" class="badge">No activity yet</span>
+              </div>
+              <p id="liveTaskTitle"><strong>Nothing is running right now.</strong></p>
+              <pre id="liveTaskDetail" class="compact">Start or resume the autonomous developer to see what GameForge is doing on the computer.</pre>
+              <div id="liveTaskHistory"></div>
+              <p class="tiny">Updates from actual AI/tool/build/test activity. Long WSL installs, compiler runs, file edits, research, and self-repair steps will stay visible here so a busy task does not look frozen.</p>
+            </article>
+
             <article class="card">
               <h3>OpenCV visual debugger</h3>
               <p id="cvMessage" class="muted">Idle</p>
