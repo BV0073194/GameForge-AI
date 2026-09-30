@@ -793,22 +793,23 @@ def agent_loop(project_id: str) -> None:
             if state.stop_event.is_set():
                 break
             state.status = "running"
+
+            # A local "login status" is insufficient: affected Codex builds can
+            # report logged in yet send Responses requests with no Authorization
+            # header. Verify the real request path before consuming an iteration.
+            # Run this before incrementing so a failed auth check remains iteration 0.
+            auth_check = codex_auth_preflight(p)
+            if not auth_check.get("ok"):
+                state.status = "blocked"
+                state.message = auth_check.get("message", "Codex authentication preflight failed")
+                RUNTIME_STATE["codex_login_message"] = state.message
+                return
+
             state.iteration += 1
             if max_iter and state.iteration > max_iter:
                 state.status = "paused"
                 state.message = f"Reached configured max_iterations={max_iter}"
                 return
-
-            # A local "login status" is insufficient: affected Codex builds can
-            # report logged in yet send Responses requests with no Authorization
-            # header. Verify the real request path before consuming iteration 1.
-            if state.iteration == 0:
-                auth_check = codex_auth_preflight(p)
-                if not auth_check.get("ok"):
-                    state.status = "blocked"
-                    state.message = auth_check.get("message", "Codex authentication preflight failed")
-                    RUNTIME_STATE["codex_login_message"] = state.message
-                    return
 
             iteration = state.iteration
             state.last_update = now_iso()
@@ -845,7 +846,7 @@ def agent_loop(project_id: str) -> None:
                     lower = combined.lower()
                     if "401 unauthorized" in lower:
                         state.status = "blocked"
-                        state.message = "Codex authentication was rejected (401). GameForge removed API-key environment overrides and preserved the project; sign out/in once if this persists, then Resume."
+                        state.message = "Codex authentication was rejected (401). Project state is preserved. GameForge will not retry-loop; repair/re-authenticate the Codex runtime, then Resume."
                         RUNTIME_STATE["codex_login_message"] = "Codex request rejected (401); re-authentication may be required."
                         return
                     if any(x in lower for x in ["usage limit", "rate limit", "sign in", "login", "authentication"]):
