@@ -1106,6 +1106,28 @@ def agent_loop(project_id: str) -> None:
             state.message = f"Iteration {iteration}: running configured tests"
             test_result = run_shell(commands.get("test", ""), p, timeout, p / f"logs/test-{iteration:04d}.log")
 
+            failed_steps = []
+            if build_result.get("configured") and not build_result.get("ok"):
+                failed_steps.append({"step": "build", "exit_code": build_result.get("exit_code"), "output_tail": build_result.get("output", "")[-12000:]})
+            if test_result.get("configured") and not test_result.get("ok"):
+                failed_steps.append({"step": "test", "exit_code": test_result.get("exit_code"), "output_tail": test_result.get("output", "")[-12000:]})
+            if failed_steps:
+                recovery_context = {
+                    "kind": "build_or_test_failure",
+                    "attempt": 1,
+                    "failed_steps": failed_steps,
+                    "instruction": "Diagnose each failure from the exact output, repair it safely, rerun the failed step, verify it passes, then continue.",
+                }
+                write_json(p / ".gameforge" / "last_self_heal.json", {
+                    "timestamp": now_iso(),
+                    "iteration": iteration,
+                    **recovery_context,
+                })
+                state.status = "self-healing"
+                state.message = f"Iteration {iteration}: build/test evidence found a recoverable failure; continuing into automatic diagnosis"
+            else:
+                recovery_context = None
+
             evidence = {
                 "iteration": iteration,
                 "timestamp": now_iso(),
