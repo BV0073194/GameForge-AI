@@ -16,16 +16,26 @@ function renderInputRequest(r){
    const input=document.createElement('input');input.type='file';input.id='requestedFile';
    if(r.accept_extensions?.length)input.accept=r.accept_extensions.join(',');
    const b=document.createElement('button');b.className='primary';b.textContent='Upload required file';
-   b.onclick=async()=>{const file=input.files?.[0];if(!file)return alert('Choose the requested file.');
+   const upload=async(file)=>{
+     if(!file)return;
      const ext='.'+(file.name.split('.').pop()||'').toLowerCase();
-     if(r.accept_extensions?.length&&!r.accept_extensions.map(x=>x.toLowerCase()).includes(ext))return alert('Expected: '+r.accept_extensions.join(', '));
-     $('#inputRequestStatus').textContent='Uploading '+file.name+'…';
-     const url=`/api/project/${current}/upload?category=${encodeURIComponent(r.upload_category||'REFERENCE')}&path=${encodeURIComponent(file.name)}&request_id=${encodeURIComponent(r.id||'request')}`;
-     const up=await fetch(url,{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':file.name},body:file});
-     if(!up.ok)throw new Error(await up.text());
-     await postAction('input-request/respond',{value:file.name});$('#inputRequestStatus').textContent='Received. Resuming agent…';
-     if(r.resume_after_submit!==false)await postAction('agent/resume');await refreshState();
-   };c.append(input,b);
+     if(r.accept_extensions?.length&&!r.accept_extensions.map(x=>x.toLowerCase()).includes(ext)){
+       $('#inputRequestStatus').textContent='Wrong file type. Expected: '+r.accept_extensions.join(', ');input.value='';return;
+     }
+     b.disabled=true;input.disabled=true;$('#inputRequestStatus').textContent='Uploading '+file.name+'…';
+     try{
+       const url=`/api/project/${current}/upload?category=${encodeURIComponent(r.upload_category||'REFERENCE')}&path=${encodeURIComponent(file.name)}&request_id=${encodeURIComponent(r.id||'request')}`;
+       const up=await fetch(url,{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':file.name},body:file});
+       if(!up.ok)throw new Error(await up.text());
+       await postAction('input-request/respond',{value:file.name});
+       $('#inputRequestStatus').textContent='Received '+file.name+'. Resuming agent…';
+       if(r.resume_after_submit!==false)await postAction('agent/resume');
+       await refreshState();
+     }catch(e){$('#inputRequestStatus').textContent=e.message;b.disabled=false;input.disabled=false;}
+   };
+   input.addEventListener('change',()=>{const file=input.files?.[0];if(file)upload(file)});
+   b.onclick=()=>{const file=input.files?.[0];if(file)upload(file);else input.click()};
+   c.append(input,b);
  }else if(r.kind==='choice'){
    const sel=document.createElement('select');(r.choices||[]).forEach(x=>{const o=document.createElement('option');o.value=x;o.textContent=x;sel.appendChild(o)});
    const b=document.createElement('button');b.className='primary';b.textContent='Submit';b.onclick=()=>submitRequestedValue(r,sel.value);c.append(sel,b);
