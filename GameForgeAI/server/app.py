@@ -429,7 +429,10 @@ def codex_auth_preflight(cwd: Path | None = None) -> dict[str, Any]:
         if proc.returncode == 0:
             return {"ok": True, "kind": "ready", "message": "Codex authenticated and ready"}
         if "401 unauthorized" in lower or "missing bearer or basic authentication" in lower:
-            return {"ok": False, "kind": "transport_401", "message": "Codex login is stored locally, but Codex sent the request without usable authentication (401). Sign out and sign in again; if it persists, the installed Codex runtime has an authentication transport failure."}
+            diag = _codex_config_diagnostics()
+            if "api.openai.com/v1/responses" in lower and (diag.get("provider_override") or diag.get("base_url_override")):
+                return {"ok": False, "kind": "provider_mismatch", "message": "ChatGPT sign-in succeeded, but Codex is being routed to api.openai.com by a Codex provider/base-URL override. Remove the custom provider/openai_base_url override from the reported Codex config, then Resume.", "diagnostics": diag}
+            return {"ok": False, "kind": "transport_401", "message": "ChatGPT sign-in succeeded, but the installed Codex runtime sent the inference request without usable authentication (401). Project state is preserved; GameForge will not consume an agent iteration.", "diagnostics": diag}
         return {"ok": False, "kind": "exec_failed", "message": combined[-2000:] or f"Codex preflight exited with {proc.returncode}"}
     except Exception as exc:
         return {"ok": False, "kind": "preflight_error", "message": str(exc)}
@@ -481,13 +484,37 @@ def _command_invocation(name: str, args: list[str]) -> tuple[str | list[str], bo
 
 
 def _codex_process_env() -> dict[str, str]:
-    """Preserve Codex's normal auth selection.
+    """Give Codex a clean provider-routing environment while preserving credentials.
 
-    Do not strip OPENAI_API_KEY/CODEX_API_KEY here: doing so can turn a valid
-    API-key session into an unauthenticated request. Codex itself owns auth
-    precedence between its supported login mechanisms.
+    ChatGPT OAuth must be allowed to select Codex's ChatGPT backend. A stale
+    OPENAI_BASE_URL or provider override can incorrectly route the OAuth session
+    to api.openai.com/v1/responses, where ChatGPT OAuth is not the API-key auth
+    expected by that route. Keep supported credential variables intact.
     """
-    return os.environ.copy()
+    env = os.environ.copy()
+    for name in ("OPENAI_BASE_URL", "OPENAI_API_BASE"):
+        env.pop(name, None)
+    return env
+
+
+def _codex_config_diagnostics() -> dict[str, Any]:
+    """Report provider-routing overrides without reading or returning secrets."""
+    home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    config = home / "config.toml"
+    result: dict[str, Any] = {
+        "config_path": str(config),
+        "config_exists": config.exists(),
+        "provider_override": False,
+        "base_url_override": False,
+    }
+    try:
+        if config.exists():
+            text = config.read_text(encoding="utf-8", errors="replace")
+            result["provider_override"] = bool(re.search(r"(?m)^\\s*model_provider\\s*=", text))
+            result["base_url_override"] = bool(re.search(r"(?m)^\\s*(?:openai_base_url|base_url)\\s*=.*api\\.openai\\.com", text, re.I))
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
 
 
 def run_codex(
@@ -1322,6 +1349,7 @@ def system_status() -> dict[str, Any]:
         "codex_install_error": RUNTIME_STATE["codex_install_error"],
         "codex_login_in_progress": bool(RUNTIME_STATE.get("codex_login_in_progress")),
         "codex_login_message": RUNTIME_STATE.get("codex_login_message", ""),
+        "codex_config": _codex_config_diagnostics(),
         "codex_auth": codex_auth_status() if codex_ok else {"available": codex_ok, "authenticated": False, "message": "Codex install required"},
         "opencv": deps["cv2"],
         "mss": deps["mss"],
