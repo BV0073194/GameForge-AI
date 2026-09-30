@@ -56,7 +56,7 @@ GLOBAL_LOGS = USER_DATA / "logs"
 REGISTRY_FILE = USER_DATA / "project_registry.json"
 RUNTIME = USER_DATA / "runtime"
 CODEX_RUNTIME = RUNTIME / "codex"
-RUNTIME_STATE = {"codex_installing": False, "codex_install_error": "", "codex_install_message": "", "session_login": False}
+RUNTIME_STATE = {"codex_installing": False, "codex_install_error": "", "codex_install_message": "", "session_login": False, "codex_login_in_progress": False, "codex_login_message": "", "codex_login_process": None}
 
 for p in (USER_DATA, PROJECTS, GLOBAL_UPLOAD, GLOBAL_LOGS, RUNTIME, CODEX_RUNTIME):
     p.mkdir(parents=True, exist_ok=True)
@@ -374,18 +374,41 @@ def codex_auth_status() -> dict[str, Any]:
         return {"available": True, "authenticated": False, "message": str(exc)}
 
 
+def _watch_codex_login(proc: subprocess.Popen, save_login: bool) -> None:
+    try:
+        code = proc.wait()
+        status = codex_auth_status()
+        if status.get("authenticated"):
+            RUNTIME_STATE["codex_login_message"] = "Authenticated"
+            RUNTIME_STATE["session_login"] = not save_login
+        else:
+            RUNTIME_STATE["codex_login_message"] = status.get("message") or f"Sign-in exited with code {code}"
+    except Exception as exc:
+        RUNTIME_STATE["codex_login_message"] = str(exc)
+    finally:
+        RUNTIME_STATE["codex_login_in_progress"] = False
+        RUNTIME_STATE["codex_login_process"] = None
+
 def start_codex_login(save_login: bool = True) -> dict[str, Any]:
+    if RUNTIME_STATE.get("codex_login_in_progress"):
+        return {"ok": True, "in_progress": True, "message": "ChatGPT sign-in is already in progress."}
+    status = codex_auth_status()
+    if status.get("authenticated"):
+        return {"ok": True, "authenticated": True, "message": "Already authenticated"}
     if not command_exists("codex"):
         result = install_codex()
-        if not result.get("ok"):
-            return result
-    args = ["login", "-c", 'cli_auth_credentials_store="auto"']
+        if not result.get("ok"): return result
     try:
-        command, use_shell = _command_invocation("codex", args)
-        subprocess.Popen(command, shell=use_shell, cwd=str(USER_DATA))
-        RUNTIME_STATE["session_login"] = not save_login
-        return {"ok": True, "started": True, "save_login": save_login, "message": "Complete the official ChatGPT sign-in in your browser."}
+        command, use_shell = _command_invocation("codex", ["login", "-c", 'cli_auth_credentials_store="auto"'])
+        proc = subprocess.Popen(command, shell=use_shell, cwd=str(USER_DATA))
+        RUNTIME_STATE["codex_login_process"] = proc
+        RUNTIME_STATE["codex_login_in_progress"] = True
+        RUNTIME_STATE["codex_login_message"] = "Complete the official ChatGPT sign-in in your browser."
+        threading.Thread(target=_watch_codex_login, args=(proc, save_login), daemon=True, name="codex-login-watch").start()
+        return {"ok": True, "started": True, "save_login": save_login, "message": RUNTIME_STATE["codex_login_message"]}
     except Exception as exc:
+        RUNTIME_STATE["codex_login_in_progress"] = False
+        RUNTIME_STATE["codex_login_message"] = str(exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -752,7 +775,7 @@ def agent_loop(project_id: str) -> None:
             trace_path.parent.mkdir(parents=True, exist_ok=True)
             codex_args = ["exec", "--json"]
             if cfg.get("agent", {}).get("permission_mode", "full-auto") == "full-auto":
-                codex_args.append("--full-auto")
+                codex_args += ["--sandbox", "workspace-write", "-c", "approval_policy=never"]
             # "-" forces Codex to read the prompt from stdin. This avoids Windows
             # npm .cmd shim execution issues and command-line length limits.
             codex_args.append("-")
@@ -1240,6 +1263,8 @@ def system_status() -> dict[str, Any]:
         "codex_installing": bool(RUNTIME_STATE["codex_installing"]),
         "codex_install_message": RUNTIME_STATE["codex_install_message"],
         "codex_install_error": RUNTIME_STATE["codex_install_error"],
+        "codex_login_in_progress": bool(RUNTIME_STATE.get("codex_login_in_progress")),
+        "codex_login_message": RUNTIME_STATE.get("codex_login_message", ""),
         "codex_auth": codex_auth_status() if codex_ok else {"available": codex_ok, "authenticated": False, "message": "Codex install required"},
         "opencv": deps["cv2"],
         "mss": deps["mss"],
