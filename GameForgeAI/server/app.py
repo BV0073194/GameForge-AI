@@ -944,6 +944,9 @@ def agent_loop(project_id: str) -> None:
     max_iter = int(cfg.get("agent", {}).get("max_iterations", 0) or 0)
     cooldown = float(cfg.get("agent", {}).get("cooldown_sec", 3) or 3)
     timeout = int(cfg.get("command_timeout_sec", 1800) or 1800)
+    max_auto_recovery = int(cfg.get("agent", {}).get("max_auto_recovery_attempts", 8) or 8)
+    recovery_failures = 0
+    recovery_context: dict[str, Any] | None = None
     build_result = test_result = None
     state.status = "running"
     state.started_at = now_iso()
