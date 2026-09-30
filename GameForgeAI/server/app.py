@@ -186,6 +186,7 @@ def open_gfai_file(path: str | Path) -> tuple[str, Path, dict[str, Any]]:
         raise ValueError("Unsupported .gfai format version")
     root_value = str(manifest.get("root", "."))
     project_root = (manifest_path.parent / root_value).resolve()
+    repair_project_layout(project_root)
     cfg_path = project_root / str(manifest.get("config", "gameforge.json"))
     cfg = read_json(cfg_path, {})
     if not cfg:
@@ -412,14 +413,23 @@ def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | Non
     return result
 
 
+def repair_project_layout(p: Path) -> None:
+    for rel in ("logs", "research", "workspace", "captures", ".gameforge", "UPLOAD"):
+        (p / rel).mkdir(parents=True, exist_ok=True)
+
+
 def project_path(project_id: str) -> Path:
     pid = slugify(project_id)
     registry = load_project_registry()
     if pid in registry:
         p = Path(registry[pid]).expanduser().resolve()
         if p.exists():
+            repair_project_layout(p)
             return p
-    return safe_child(PROJECTS, pid)
+    p = safe_child(PROJECTS, pid)
+    if p.exists():
+        repair_project_layout(p)
+    return p
 
 
 def project_config(project_id: str) -> dict[str, Any]:
@@ -658,6 +668,7 @@ def agent_loop(project_id: str) -> None:
             prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result)
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
             final_path = p / f"logs/codex-iteration-{iteration:04d}.final.txt"
+            trace_path.parent.mkdir(parents=True, exist_ok=True)
             codex_args = ["exec", "--json"]
             if cfg.get("agent", {}).get("permission_mode", "full-auto") == "full-auto":
                 codex_args.append("--full-auto")
@@ -1062,6 +1073,7 @@ Research broadly but use only public/authorized sources. Prioritize official/pri
         timeout=max(3600, int(cfg.get("command_timeout_sec", 1800))),
     )
     log = p / "logs" / f"research-{int(time.time())}.jsonl"
+    log.parent.mkdir(parents=True, exist_ok=True)
     log.write_text((proc.stdout or "") + "\n" + (proc.stderr or ""), encoding="utf-8")
     return {"ok": proc.returncode == 0, "exit_code": proc.returncode, "log": str(log.relative_to(p)).replace("\\", "/"), "output": ((proc.stdout or "") + "\n" + (proc.stderr or ""))[-30000:]}
 
@@ -1103,7 +1115,7 @@ def system_status() -> dict[str, Any]:
     codex_ver = ""
     codex_ok = False
     codex_error = ""
-    codex_path = shutil.which("codex") or ""
+    codex_path = resolve_command("codex") or ""
     if codex_path:
         try:
             proc = run_codex(["--version"], timeout=10)
@@ -1128,6 +1140,10 @@ def system_status() -> dict[str, Any]:
         "codex_path": codex_path,
         "codex_version": codex_ver,
         "codex_error": codex_error,
+        "codex_installing": bool(RUNTIME_STATE["codex_installing"]),
+        "codex_install_message": RUNTIME_STATE["codex_install_message"],
+        "codex_install_error": RUNTIME_STATE["codex_install_error"],
+        "codex_auth": codex_auth_status() if codex_ok else {"available": codex_ok, "authenticated": False, "message": "Codex install required"},
         "opencv": deps["cv2"],
         "mss": deps["mss"],
         "psutil": deps["psutil"],
@@ -1259,6 +1275,13 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/api/codex/install":
+                return self.send_json(install_codex())
+            if path == "/api/codex/login":
+                body = self.body_json()
+                return self.send_json(start_codex_login(bool(body.get("save_login", True))))
+            if path == "/api/codex/logout":
+                return self.send_json(codex_logout())
             if path == "/api/projects/open-gfai":
                 body = self.body_json()
                 pid, p, cfg = open_gfai_file(body.get("path", ""))
@@ -1372,6 +1395,7 @@ def main() -> None:
     if args.project_file:
         selected_project, _, _ = open_gfai_file(args.project_file)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    ensure_codex_async()
     url = f"http://127.0.0.1:{args.port}"
     if selected_project:
         url += f"/?project={urllib.parse.quote(selected_project)}"
