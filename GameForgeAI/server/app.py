@@ -216,7 +216,11 @@ def _codex_candidates() -> list[Path]:
     ]
     if os.name == "nt":
         candidates += [
-            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "codex" / exe,
+            # Official OpenAI standalone installer visible launcher.
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "OpenAI" / "Codex" / "bin" / exe,
+            # Current managed standalone payload.
+            Path.home() / ".codex" / "packages" / "standalone" / "current" / "bin" / exe,
+            # Legacy npm shim is last-resort only and requires Node.
             Path(os.environ.get("APPDATA", "")) / "npm" / "codex.cmd",
         ]
     return [p for p in candidates if p.exists()]
