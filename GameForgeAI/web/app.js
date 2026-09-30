@@ -1,4 +1,4 @@
-const $=s=>document.querySelector(s);let current=null;let pollTimer=null;let inputRequestBusy=false;let inputRequestDirty=false;let inputRequestPending=false;
+const $=s=>document.querySelector(s);let current=null;let pollTimer=null;let inputRequestBusy=false;let inputRequestDirty=false;let inputRequestPending=false;let acceptanceVisibleCount=5;let activityVisibleCount=5;let lastAcceptance=null;let lastLiveAgent=null;let lastManagedProcess=null;
 function stopProjectPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
 function startProjectPolling(){if(current&&!inputRequestPending&&!pollTimer)pollTimer=setInterval(refreshState,1800)}
 async function api(path,opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const t=await r.text();let data;try{data=JSON.parse(t)}catch{data={error:t}}if(!r.ok)throw new Error(data.error||r.statusText);return data}
@@ -6,7 +6,7 @@ function badge(text,ok){return `<span class="badge" style="border-color:${ok?'#3
 async function loadSystem(){try{const s=await api('/api/status');const codexText=s.codex?`Codex ${s.codex_version||''}`:(s.codex_installing?'Codex installing…':'Codex unavailable');$('#systemBadges').innerHTML=badge(`Python ${s.python}`,true)+badge(s.git?'Git':'Git missing',s.git)+badge(codexText,s.codex)+badge(s.opencv&&s.mss?'OpenCV ready':'OpenCV deps missing',s.opencv&&s.mss);const auth=!!s.codex_auth?.authenticated;const loggingIn=!!s.codex_login_in_progress;$('#codexLogin').hidden=auth;$('#codexLogout').hidden=!auth;$('#codexLogin').disabled=loggingIn||s.codex_installing;$('#saveLogin').disabled=auth||loggingIn;$('#codexLogin').textContent=loggingIn?'Signing in…':'Sign in with ChatGPT';$('#codexAuthMessage').textContent=auth?'Authenticated':(loggingIn?(s.codex_login_message||'Complete sign-in in your browser…'):(s.codex_install_error||s.codex_login_message||s.codex_auth?.message||s.codex_install_message||'Sign in required'));}catch(e){$('#systemBadges').textContent=e.message}}
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-async function selectProject(id){stopProjectPolling();current=id;inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();startProjectPolling()}
+async function selectProject(id){stopProjectPolling();current=id;inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;acceptanceVisibleCount=5;activityVisibleCount=5;lastAcceptance=null;lastLiveAgent=null;lastManagedProcess=null;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();startProjectPolling()}
 async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
 function activityAge(iso){
  if(!iso)return 'No activity yet';
@@ -29,6 +29,7 @@ function liveStateLabel(status){
  return 'Idle';
 }
 function renderLiveTask(agent,managed){
+ lastLiveAgent=agent;lastManagedProcess=managed;
  const a=agent?.activity||{};
  $('#liveTaskState').textContent=liveStateLabel(agent?.status||'idle');
  $('#liveTaskAge').textContent=activityAge(a.last_activity_at||agent?.last_update);
@@ -40,10 +41,21 @@ function renderLiveTask(agent,managed){
    detail=detail+'\n\n'+proc;
  }
  $('#liveTaskDetail').textContent=detail;
- const history=(a.history||[]).slice(-6).reverse();
- $('#liveTaskHistory').innerHTML=history.length
-  ? '<h4>Recent activity</h4>'+history.map(x=>`<div class="criterion"><strong>${esc(x.task||x.kind||'Activity')}</strong>${x.detail?' — '+esc(x.detail):''}<br><small>${esc(x.at||'')}</small></div>`).join('')
-  : '';
+ const all=(a.history||[]).slice().reverse();
+ const shown=all.slice(0,activityVisibleCount);
+ let html=shown.length
+   ? '<h4>Recent activity</h4>'+shown.map(x=>`<div class="criterion"><strong>${esc(x.task||x.kind||'Activity')}</strong>${x.detail?' — '+esc(x.detail):''}<br><small>${esc(x.at||'')}</small></div>`).join('')
+   : '';
+ if(all.length>5){
+   const remaining=Math.max(0,all.length-shown.length);
+   html+='<div class="actions">';
+   if(remaining>0)html+=`<button id="showMoreActivity">Show 5 more${remaining?' ('+remaining+' remaining)':''}</button>`;
+   if(activityVisibleCount>5)html+='<button id="collapseActivity">Collapse to latest 5</button>';
+   html+='</div>';
+ }
+ $('#liveTaskHistory').innerHTML=html;
+ const more=$('#showMoreActivity');if(more)more.onclick=()=>{activityVisibleCount=Math.min(all.length,activityVisibleCount+5);renderLiveTask(lastLiveAgent,lastManagedProcess)};
+ const collapse=$('#collapseActivity');if(collapse)collapse.onclick=()=>{activityVisibleCount=5;renderLiveTask(lastLiveAgent,lastManagedProcess);$('#liveTaskHistory').scrollIntoView({block:'nearest'})};
 }
 function renderInputRequest(r){
  const box=$('#inputRequest');if(!r){box.hidden=true;inputRequestBusy=false;inputRequestPending=false;return}inputRequestPending=true;stopProjectPolling();box.hidden=false;
@@ -115,7 +127,24 @@ async function continueAfterReview(){
    try{await postAction('agent/start')}catch{}
  }
 }
-function renderAcceptance(a){const box=$('#acceptance');box.innerHTML=`<p><strong>Project complete:</strong> ${a?.project_complete?'YES':'Not yet'}</p>`+(a?.criteria||[]).map(c=>`<div class="criterion ${c.status==='pass'?'pass':'pending'}"><strong>${esc(c.id)}</strong> — ${esc(c.description)}<br><small>${esc(c.status)}${c.evidence?` • ${esc(c.evidence)}`:''}</small></div>`).join('')}
+function renderAcceptance(a){
+ lastAcceptance=a;
+ const box=$('#acceptance');
+ const all=a?.criteria||[];
+ const shown=all.slice(0,acceptanceVisibleCount);
+ let html=`<p><strong>Project complete:</strong> ${a?.project_complete?'YES':'Not yet'}</p>`;
+ html+=shown.map(c=>`<div class="criterion ${c.status==='pass'?'pass':'pending'}"><strong>${esc(c.id)}</strong> — ${esc(c.description)}<br><small>${esc(c.status)}${c.evidence?` • ${esc(c.evidence)}`:''}</small></div>`).join('');
+ if(all.length>5){
+   const remaining=Math.max(0,all.length-shown.length);
+   html+='<div class="actions">';
+   if(remaining>0)html+=`<button id="showMoreAcceptance">Show 5 more${remaining?' ('+remaining+' remaining)':''}</button>`;
+   if(acceptanceVisibleCount>5)html+='<button id="collapseAcceptance">Collapse to first 5</button>';
+   html+='</div>';
+ }
+ box.innerHTML=html;
+ const more=$('#showMoreAcceptance');if(more)more.onclick=()=>{acceptanceVisibleCount=Math.min(all.length,acceptanceVisibleCount+5);renderAcceptance(lastAcceptance)};
+ const collapse=$('#collapseAcceptance');if(collapse)collapse.onclick=()=>{acceptanceVisibleCount=5;renderAcceptance(lastAcceptance);box.scrollIntoView({block:'nearest'})};
+}
 function renderUploads(u){$('#uploadList').innerHTML=`<p>${u?.count||0} scanned items</p>`+(u?.items||[]).slice(0,100).map(x=>`<div class="criterion"><strong>${esc(x.path)}</strong><br><small>${x.bytes||0} bytes • ${esc(x.sha256||x.error||'')}</small></div>`).join('')}
 async function postAction(action,body={}){if(!current)return;return api(`/api/project/${current}/${action}`,{method:'POST',body:JSON.stringify(body)})}
 $('#createBtn').onclick=async()=>{const goal=$('#newGoal').value.trim();if(!goal)return alert('Describe the playable result first.');try{const p=await api('/api/projects/create',{method:'POST',body:JSON.stringify({name:$('#newName').value||'Game Project',goal,research_mode:$('#newResearch').value})});$('#newGoal').value='';await loadProjects(p.id)}catch(e){alert(e.message)}};
