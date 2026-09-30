@@ -251,12 +251,12 @@ def install_codex() -> dict[str, Any]:
             ps = shutil.which("powershell") or shutil.which("pwsh")
             if not ps:
                 raise RuntimeError("PowerShell is required to install Codex on Windows")
-            cmd = [ps, "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", "irm https://chatgpt.com/codex/install.ps1 | iex"]
+            cmd = [ps, "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", "irm https://github.com/openai/codex/releases/latest/download/install.ps1 | iex"]
         elif system in {"Linux", "Darwin"}:
             shell = shutil.which("sh") or "/bin/sh"
             if not shutil.which("curl"):
                 raise RuntimeError("curl is required for the official Codex installer")
-            cmd = [shell, "-c", "curl -fsSL https://chatgpt.com/codex/install.sh | sh"]
+            cmd = [shell, "-c", "curl -fsSL https://github.com/openai/codex/releases/latest/download/install.sh | sh"]
         else:
             raise RuntimeError(f"Automatic Codex install is not supported on {system}")
         proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=900)
@@ -272,7 +272,7 @@ def install_codex() -> dict[str, Any]:
         return {"ok": True, "path": resolved}
     except Exception as exc:
         RUNTIME_STATE["codex_install_error"] = str(exc)
-        RUNTIME_STATE["codex_install_message"] = "Codex installation failed"
+        RUNTIME_STATE["codex_install_message"] = "Codex installation failed: " + str(exc)
         return {"ok": False, "error": str(exc)}
     finally:
         RUNTIME_STATE["codex_installing"] = False
