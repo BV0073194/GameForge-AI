@@ -381,8 +381,8 @@ def command_exists(name: str) -> bool:
     return resolve_command(name) is not None
 
 
-def install_codex() -> dict[str, Any]:
-    if command_exists("codex"):
+def install_codex(force: bool = False) -> dict[str, Any]:
+    if command_exists("codex") and not force:
         return {"ok": True, "already_installed": True, "path": resolve_command("codex")}
     if RUNTIME_STATE["codex_installing"]:
         return {"ok": False, "installing": True}
@@ -422,10 +422,10 @@ def install_codex() -> dict[str, Any]:
         RUNTIME_STATE["codex_installing"] = False
 
 
-def ensure_codex_async() -> None:
-    if command_exists("codex") or RUNTIME_STATE["codex_installing"]:
+def ensure_codex_async(force: bool = False) -> None:
+    if (command_exists("codex") and not force) or RUNTIME_STATE["codex_installing"]:
         return
-    threading.Thread(target=install_codex, daemon=True, name="codex-installer").start()
+    threading.Thread(target=install_codex, args=(force,), daemon=True, name="codex-installer").start()
 
 
 def codex_auth_status() -> dict[str, Any]:
