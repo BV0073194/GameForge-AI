@@ -231,14 +231,42 @@ def refresh_windows_environment() -> dict[str, Any]:
         entries, seen = [], set()
         for raw in (machine, user):
             for item in raw.split(";"):
-                item = os.path.expandvars(item.strip().strip('"'))
+                # A single unmatched quote anywhere in PATH can make cmd.exe fail
+                # to execute programs that 'where' can still locate. Sanitize each
+                # registry entry independently for GameForge's process only.
+                item = os.path.expandvars(item.strip().replace('"', "").strip())
                 key = item.rstrip("\\/").lower()
                 if item and key not in seen:
                     seen.add(key)
                     entries.append(item)
+
+        # Known Windows tool locations are process-local fallbacks only. Never
+        # rewrite the user's Machine/User PATH from GameForge.
+        fallbacks = [
+            Path(os.environ.get("ProgramFiles", r"C:\\Program Files")) / "nodejs",
+            Path(os.environ.get("ProgramFiles", r"C:\\Program Files")) / "Git" / "cmd",
+            Path(os.environ.get("ProgramFiles", r"C:\\Program Files")) / "CMake" / "bin",
+            Path(os.environ.get("APPDATA", "")) / "npm",
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "OpenAI" / "Codex" / "bin",
+        ]
+        prepend = []
+        for p in fallbacks:
+            if p and p.exists():
+                key = str(p).rstrip("\\/").lower()
+                if key not in seen:
+                    seen.add(key)
+                    prepend.append(str(p))
+        entries = prepend + entries
+
         if entries:
             os.environ["PATH"] = os.pathsep.join(entries)
-        return {"refreshed": True, "path_entries": len(entries)}
+
+        # Report actual executable health, not merely whether a PATH entry exists.
+        health = {}
+        for command in ("node", "git", "python", "py", "cmake"):
+            resolved = shutil.which(command)
+            health[command] = resolved or ""
+        return {"refreshed": True, "path_entries": len(entries), "commands": health}
     except Exception as exc:
         return {"refreshed": False, "error": str(exc)}
 
