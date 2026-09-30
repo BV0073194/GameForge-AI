@@ -1,0 +1,3 @@
+# Project Goal
+
+Create a professional-quality single-player campaign continuation for an existing game. Preserve the original game's tone, controls, systems, visual identity, and existing content unless the user explicitly asks otherwise. Deep-research verified game history, official/public developer commentary, cut or abandoned concepts, public source/modding tools, current engine capabilities, and relevant lore. Build new missions incrementally, launch and playtest them, collect logs/crash data/OpenCV evidence, regression-test completed missions, and continue repairing until the complete campaign is playable or a genuine blocker is documented.

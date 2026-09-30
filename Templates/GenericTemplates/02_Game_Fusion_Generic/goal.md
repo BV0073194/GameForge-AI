@@ -1,0 +1,3 @@
+# Project Goal
+
+Recreate the requested gameplay systems, player experience, mechanics, UI, world interaction, and art-direction elements of one game inside another feasible base engine/project. Treat 'merge' as a systems-integration problem rather than binary executable fusion. Deep-research both games/engines, identify which systems can be recreated or integrated legally/technically, build a vertical slice first, then expand. Use automated builds, runtime logs, crash data, OpenCV visual checks, scripted inputs, performance tests, and regression protection until the requested fused gameplay is playable and stable or a genuine blocker is documented.

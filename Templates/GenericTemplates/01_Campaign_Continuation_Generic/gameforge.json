@@ -1,0 +1,38 @@
+{
+  "id": "campaign-continuation-generic",
+  "name": "Campaign_Continuation_Generic",
+  "project_type": "campaign_continuation",
+  "goal": "Create a professional-quality single-player campaign continuation for an existing game. Preserve the original game's tone, controls, systems, visual identity, and existing content unless the user explicitly asks otherwise. Deep-research verified game history, official/public developer commentary, cut or abandoned concepts, public source/modding tools, current engine capabilities, and relevant lore. Build new missions incrementally, launch and playtest them, collect logs/crash data/OpenCV evidence, regression-test completed missions, and continue repairing until the complete campaign is playable or a genuine blocker is documented.",
+  "research_mode": "exhaustive",
+  "internet_research": true,
+  "auto_source_discovery": true,
+  "source_urls": [],
+  "commands": {
+    "build": "",
+    "test": "",
+    "launch": ""
+  },
+  "command_timeout_sec": 3600,
+  "agent": {
+    "permission_mode": "full-auto",
+    "max_iterations": 0,
+    "cooldown_sec": 3,
+    "stop_on_real_blocker": true,
+    "require_regression_pass": true
+  },
+  "visual": {
+    "enabled": true,
+    "window_title": "",
+    "monitor": 1,
+    "interval_sec": 1.0,
+    "freeze_seconds": 8,
+    "black_mean_threshold": 8.0
+  },
+  "log_globs": [
+    "logs/**/*",
+    "*.log",
+    "**/*.log",
+    "**/*.dmp",
+    "**/crash*.txt"
+  ]
+}

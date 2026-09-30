@@ -1,0 +1,38 @@
+{
+  "id": "decomp-rom-transformation-generic",
+  "name": "Decomp_ROM_Transformation_Generic",
+  "project_type": "decomp_rom_transformation",
+  "goal": "Transform a decomp/homebrew/ROM-based game project into a substantially different playable experience while preserving technical compatibility with the target platform. Prefer open decomp/recomp/homebrew source when available. Allow local use of the user's legally obtained ROM for extraction/build verification, but do not redistribute the commercial ROM. Deep-research the current source tree, platform constraints, asset formats, modding tools, emulator behavior, and proven public examples. Adapt uploaded assets to the original game's art style and hardware budget. Build ROM/output artifacts locally, launch in an emulator, use logs/OpenCV/input replay/regression testing, and keep fixing until the requested experience is playable or a genuine blocker is proven.",
+  "research_mode": "exhaustive",
+  "internet_research": true,
+  "auto_source_discovery": true,
+  "source_urls": [],
+  "commands": {
+    "build": "",
+    "test": "",
+    "launch": ""
+  },
+  "command_timeout_sec": 3600,
+  "agent": {
+    "permission_mode": "full-auto",
+    "max_iterations": 0,
+    "cooldown_sec": 3,
+    "stop_on_real_blocker": true,
+    "require_regression_pass": true
+  },
+  "visual": {
+    "enabled": true,
+    "window_title": "",
+    "monitor": 1,
+    "interval_sec": 1.0,
+    "freeze_seconds": 8,
+    "black_mean_threshold": 8.0
+  },
+  "log_globs": [
+    "logs/**/*",
+    "*.log",
+    "**/*.log",
+    "**/*.dmp",
+    "**/crash*.txt"
+  ]
+}

@@ -1,0 +1,11 @@
+{
+  "format": "GameForgeAI.Project",
+  "format_version": 1,
+  "project_id": "decomp-rom-transformation-generic",
+  "name": "Decomp_ROM_Transformation_Generic",
+  "root": ".",
+  "config": "gameforge.json",
+  "goal": "goal.md",
+  "uploads": "UPLOAD",
+  "project_index": ".gameforge/project_index.json"
+}

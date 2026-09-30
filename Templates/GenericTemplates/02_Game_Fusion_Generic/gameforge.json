@@ -1,0 +1,38 @@
+{
+  "id": "game-fusion-generic",
+  "name": "Game_Fusion_Generic",
+  "project_type": "game_fusion",
+  "goal": "Recreate the requested gameplay systems, player experience, mechanics, UI, world interaction, and art-direction elements of one game inside another feasible base engine/project. Treat 'merge' as a systems-integration problem rather than binary executable fusion. Deep-research both games/engines, identify which systems can be recreated or integrated legally/technically, build a vertical slice first, then expand. Use automated builds, runtime logs, crash data, OpenCV visual checks, scripted inputs, performance tests, and regression protection until the requested fused gameplay is playable and stable or a genuine blocker is documented.",
+  "research_mode": "exhaustive",
+  "internet_research": true,
+  "auto_source_discovery": true,
+  "source_urls": [],
+  "commands": {
+    "build": "",
+    "test": "",
+    "launch": ""
+  },
+  "command_timeout_sec": 3600,
+  "agent": {
+    "permission_mode": "full-auto",
+    "max_iterations": 0,
+    "cooldown_sec": 3,
+    "stop_on_real_blocker": true,
+    "require_regression_pass": true
+  },
+  "visual": {
+    "enabled": true,
+    "window_title": "",
+    "monitor": 1,
+    "interval_sec": 1.0,
+    "freeze_seconds": 8,
+    "black_mean_threshold": 8.0
+  },
+  "log_globs": [
+    "logs/**/*",
+    "*.log",
+    "**/*.log",
+    "**/*.dmp",
+    "**/crash*.txt"
+  ]
+}
