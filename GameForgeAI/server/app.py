@@ -743,6 +743,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
             "permission_mode": "full-auto",
             "max_iterations": 0,
             "cooldown_sec": 3,
+            "max_auto_recovery_attempts": 8,
         },
         "visual": {
             "monitor": 1,
