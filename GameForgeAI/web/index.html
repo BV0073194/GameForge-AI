@@ -89,6 +89,44 @@
               <div id="acceptance"></div>
             </article>
           </div>
+
+          <article class="card" id="userReviewCard">
+            <h3>Your review & satisfaction</h3>
+            <p class="muted">Tell the autonomous developer what you actually see, what you expected instead, or anything you want fixed, changed, added, removed, polished, or improved.</p>
+            <div class="grid two">
+              <label>Feedback type
+                <select id="feedbackCategory">
+                  <option value="general">General feedback</option>
+                  <option value="bug">Something is broken</option>
+                  <option value="visual">Visual / UI change</option>
+                  <option value="gameplay">Gameplay / behavior change</option>
+                  <option value="performance">Performance</option>
+                  <option value="missing">Missing feature / content</option>
+                  <option value="polish">Polish / improvement</option>
+                </select>
+              </label>
+              <label>Satisfaction
+                <select id="userSatisfaction">
+                  <option value="">Not rated yet</option>
+                  <option value="1">1 — Not satisfied</option>
+                  <option value="2">2 — Needs major work</option>
+                  <option value="3">3 — Getting there</option>
+                  <option value="4">4 — Satisfied</option>
+                  <option value="5">5 — Exactly what I wanted</option>
+                </select>
+              </label>
+            </div>
+            <label>What do you see vs. what would you like?
+              <textarea id="userFeedback" rows="5" placeholder="Example: The rifle is visible now, but the aim animation is too fast and the ammo counter overlaps the hearts. Slow the aim transition down, move the ammo UI lower-right, and keep the original HUD readable."></textarea>
+            </label>
+            <div class="actions">
+              <button id="submitFeedback" class="primary">Send feedback & continue improving</button>
+              <button id="markUserDone">I believe this is done</button>
+              <button id="reopenUserDone" hidden>Reopen & continue from here</button>
+            </div>
+            <p id="userReviewStatus" class="muted"></p>
+            <div id="userReviewHistory"></div>
+          </article>
         </div>
 
         <div id="tab-uploads" class="tab">
