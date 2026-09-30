@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GameForge AI Desktop</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div>
+    <h1>GameForge AI</h1>
+    <p>Autonomous game creation, modding, merging, debugging & playtesting</p>
+  </div>
+  <div id="systemBadges" class="badges"></div>
+</header>
+<main>
+  <section class="panel create-panel">
+    <h2>New playable project</h2>
+    <div class="grid two">
+      <label>Project name<input id="newName" placeholder="Titanfall: Protocol 4"></label>
+      <label>Research depth<select id="newResearch"><option value="normal">Normal</option><option value="deep" selected>Deep</option><option value="exhaustive">Exhaustive / professional</option><option value="off">Off</option></select></label>
+    </div>
+    <label>What should the AI make?<textarea id="newGoal" rows="4" placeholder="Make a full playable game/mod/mission/ROM project. Describe the desired result, not implementation details."></textarea></label>
+    <button id="createBtn" class="primary">Create project</button>
+  </section>
+
+  <div class="layout">
+    <aside class="panel projects-panel">
+      <div class="row between"><h2>Projects</h2><button id="refreshBtn">Refresh</button></div>
+      <div id="projectList" class="project-list"></div>
+    </aside>
+
+    <section class="panel workspace-panel">
+      <div id="emptyState"><h2>Select or create a project</h2><p>The project goal persists across autonomous iterations.</p></div>
+      <div id="workspace" hidden>
+        <div class="row between wrap">
+          <div><h2 id="projectTitle"></h2><p id="projectGoal" class="muted"></p></div>
+          <div class="badges"><span id="agentBadge" class="badge"></span><span id="iterationBadge" class="badge"></span></div>
+        </div>
+
+        <nav class="tabs">
+          <button data-tab="control" class="active">Control</button>
+          <button data-tab="uploads">Uploads</button>
+          <button data-tab="research">Research</button>
+          <button data-tab="runtime">Runtime / QA</button>
+          <button data-tab="settings">Settings</button>
+          <button data-tab="logs">Logs</button>
+        </nav>
+
+        <div id="tab-control" class="tab active">
+          <div class="cards">
+            <article class="card">
+              <h3>Autonomous developer</h3>
+              <p id="agentMessage" class="muted">Idle</p>
+              <div class="actions">
+                <button id="startAgent" class="primary">Start / continue</button>
+                <button id="pauseAgent">Pause</button>
+                <button id="resumeAgent">Resume</button>
+                <button id="stopAgent" class="danger">Stop</button>
+              </div>
+              <p class="tiny">The loop checkpoints → edits → builds → tests → reads logs/visual evidence → fixes → regression-checks → repeats until acceptance is verified or a real blocker stops progress.</p>
+            </article>
+
+            <article class="card">
+              <h3>OpenCV visual debugger</h3>
+              <p id="cvMessage" class="muted">Idle</p>
+              <div class="actions"><button id="startCv">Start capture</button><button id="stopCv">Stop capture</button></div>
+              <img id="capture" class="capture" alt="Latest captured game/display frame" hidden>
+              <pre id="visualMetrics" class="compact"></pre>
+            </article>
+          </div>
+
+          <div class="cards">
+            <article class="card">
+              <h3>Build / test / launch</h3>
+              <div class="actions"><button id="runBuild">Build</button><button id="runTest">Test</button><button id="runLaunch">Launch</button><button id="checkpoint">Git checkpoint</button></div>
+              <pre id="runOutput" class="console"></pre>
+            </article>
+            <article class="card">
+              <h3>Acceptance</h3>
+              <div id="acceptance"></div>
+            </article>
+          </div>
+        </div>
+
+        <div id="tab-uploads" class="tab">
+          <h3>UPLOAD intake</h3>
+          <p>Drop source trees, repos, models, textures, animations, audio, mods, docs, reference material or local-only ROM inputs. The AI is instructed to adapt assets to the target game's style and technical limits.</p>
+          <div class="grid two">
+            <label>Category<select id="uploadCategory"><option>MODELS</option><option>TEXTURES</option><option>ANIMATIONS</option><option>AUDIO</option><option>UI</option><option>REFERENCE</option><option>MODS</option><option>SOURCE</option><option>REPOS</option><option>TOOLS</option><option>DOCS</option><option>ROMS_LOCAL</option></select></label>
+            <label>Files<input id="uploadFiles" type="file" multiple></label>
+          </div>
+          <div class="actions"><button id="uploadBtn" class="primary">Upload selected files</button><button id="scanUploads">Scan & hash uploads</button></div>
+          <p id="uploadStatus" class="muted"></p>
+          <div id="uploadList"></div>
+        </div>
+
+
+        <div id="tab-research" class="tab">
+          <h3>Deep research</h3>
+          <p>Run a dedicated research pass over public/authorized technical, historical, code, dev-log and game-design sources. Results are written into the project research folder.</p>
+          <label>Research question / objective<textarea id="researchQuestion" rows="4" placeholder="Research everything needed to determine the most authentic and technically feasible implementation of..."></textarea></label>
+          <div class="actions"><button id="runResearch" class="primary">Run research pass</button></div>
+          <pre id="researchOutput" class="console"></pre>
+        </div>
+
+        <div id="tab-runtime" class="tab">
+          <h3>Game runtime & automated QA</h3>
+          <div class="cards">
+            <article class="card"><h3>Managed game process</h3><p id="processStatus" class="muted"></p><div class="actions"><button id="managedLaunch" class="primary">Launch configured game</button><button id="managedStop" class="danger">Stop game</button><button id="refreshProcesses">List processes</button></div><pre id="processList" class="console"></pre></article>
+            <article class="card"><h3>Input replay</h3><p class="tiny">JSON sequence. Keep tests short and deterministic.</p><textarea id="inputSequence" rows="8">[
+  {"type":"sleep","seconds":1},
+  {"type":"key","key":"enter"}
+]</textarea><div class="actions"><button id="runInput">Run input test</button></div><pre id="inputOutput" class="compact"></pre></article>
+          </div>
+          <div class="cards">
+            <article class="card"><h3>Asset intelligence</h3><p>Analyze uploaded models/textures so the agent can plan optimization, conversion and art-style adaptation.</p><div class="actions"><button id="analyzeAssets">Analyze assets</button></div><pre id="assetOutput" class="console"></pre></article>
+            <article class="card"><h3>Git safety</h3><div class="actions"><button id="gitStatusBtn">Refresh Git</button></div><pre id="gitOutput" class="console"></pre><label>Rollback revision<input id="rollbackRev" placeholder="commit hash"></label><button id="rollbackBtn" class="danger">Rollback to revision</button></article>
+          </div>
+        </div>
+
+        <div id="tab-settings" class="tab">
+          <h3>Project controls</h3>
+          <div class="grid two">
+            <label>Research depth<select id="researchMode"><option value="off">Off</option><option value="normal">Normal</option><option value="deep">Deep</option><option value="exhaustive">Exhaustive / professional</option></select></label>
+            <label class="check"><input id="internetResearch" type="checkbox"> Request internet research whenever useful</label>
+          </div>
+          <label>Build command<input id="buildCmd" placeholder="e.g. npm run build / cmake --build build / make"></label>
+          <label>Test command<input id="testCmd" placeholder="automated tests / emulator smoke test / mod validation"></label>
+          <label>Launch command<input id="launchCmd" placeholder="game, emulator, editor, or test harness command"></label>
+          <div class="grid two">
+            <label>OpenCV monitor #<input id="monitorNum" type="number" min="0" value="1"></label>
+            <label>Freeze detection seconds<input id="freezeSeconds" type="number" min="2" value="8"></label>
+            <label>Game window title (Windows)<input id="windowTitle" placeholder="Titanfall 2 / Project64 / BeamNG"></label>
+          </div>
+          <button id="saveSettings" class="primary">Save settings</button>
+          <p class="tiny">For best results, configure build/test/launch commands after the AI establishes the target toolchain. The AI may also update gameforge.json itself.</p>
+        </div>
+
+        <div id="tab-logs" class="tab">
+          <div class="row between"><h3>Recent logs</h3><button id="refreshLogs">Refresh logs</button></div>
+          <div id="logs"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+</main>
+<footer>GameForge AI Desktop • .gfai project workflow</footer>
+<script src="/app.js"></script>
+</body>
+</html>
