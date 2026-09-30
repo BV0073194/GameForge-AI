@@ -53,6 +53,8 @@ WEB = RESOURCE_ROOT / "web"
 PROJECTS = USER_DATA / "projects"
 GLOBAL_UPLOAD = USER_DATA / "UPLOAD"
 GLOBAL_LOGS = USER_DATA / "logs"
+AUTH_TRACE = GLOBAL_LOGS / "codex-auth-live.jsonl"
+AUTH_TRACE_LOCK = threading.Lock()
 REGISTRY_FILE = USER_DATA / "project_registry.json"
 RUNTIME = USER_DATA / "runtime"
 CODEX_RUNTIME = RUNTIME / "codex"
@@ -64,6 +66,67 @@ for p in (USER_DATA, PROJECTS, GLOBAL_UPLOAD, GLOBAL_LOGS, RUNTIME, CODEX_RUNTIM
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+_AUTH_SECRET_RE = re.compile(r'(?i)(bearer\\s+)[^\\s,"]+|(sk-[A-Za-z0-9_-]{8,})|("(?:access_token|refresh_token|id_token|api_key|cookie|authorization)"\\s*:\\s*")[^"]+(")')
+
+def _auth_redact(value: Any) -> Any:
+    """Recursively redact auth material before it can touch the live trace."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if re.search(r"(?i)(token|secret|password|cookie|authorization|api.?key)", str(k)):
+                out[k] = "<REDACTED:PRESENT>" if v else "<EMPTY>"
+            else:
+                out[k] = _auth_redact(v)
+        return out
+    if isinstance(value, list):
+        return [_auth_redact(v) for v in value]
+    if isinstance(value, str):
+        return _AUTH_SECRET_RE.sub(lambda m: (m.group(1) or "") + "<REDACTED>" + (m.group(4) or ""), value)
+    return value
+
+def auth_trace(event: str, **fields: Any) -> None:
+    """Append a secret-safe, line-buffered event for live Codex auth debugging."""
+    try:
+        AUTH_TRACE.parent.mkdir(parents=True, exist_ok=True)
+        record = {"ts": now_iso(), "event": event, "pid": os.getpid(), "thread": threading.current_thread().name, **fields}
+        line = json.dumps(_auth_redact(record), ensure_ascii=False, default=str)
+        with AUTH_TRACE_LOCK:
+            with AUTH_TRACE.open("a", encoding="utf-8", buffering=1) as fp:
+                fp.write(line + "\\n")
+                fp.flush()
+        print("[AUTH-TRACE] " + line, flush=True)
+    except Exception:
+        pass
+
+def _auth_store_snapshot() -> dict[str, Any]:
+    home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    auth = home / "auth.json"
+    snap: dict[str, Any] = {"codex_home": str(home), "auth_path": str(auth), "auth_exists": auth.exists()}
+    if auth.exists():
+        try:
+            st = auth.stat()
+            snap.update({"auth_size": st.st_size, "auth_mtime_ns": st.st_mtime_ns})
+            data = json.loads(auth.read_text(encoding="utf-8", errors="replace"))
+            snap["auth_top_level_keys"] = sorted(data.keys()) if isinstance(data, dict) else [type(data).__name__]
+        except Exception as exc:
+            snap["auth_metadata_error"] = repr(exc)
+    return snap
+
+def _auth_env_snapshot(env: dict[str, str] | None = None) -> dict[str, Any]:
+    env = env or os.environ
+    names = ("CODEX_HOME","OPENAI_BASE_URL","OPENAI_API_BASE","OPENAI_API_KEY","CODEX_API_KEY","CODEX_ACCESS_TOKEN","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY")
+    return {name: ("SET" if env.get(name) else "unset") for name in names}
+
+def _watch_auth_store(stop: threading.Event) -> None:
+    previous = None
+    while not stop.wait(0.25):
+        current = _auth_store_snapshot()
+        signature = (current.get("auth_exists"), current.get("auth_size"), current.get("auth_mtime_ns"))
+        if signature != previous:
+            auth_trace("credential_store_changed", **current)
+            previous = signature
 
 
 def slugify(value: str) -> str:
@@ -374,23 +437,33 @@ def codex_auth_status() -> dict[str, Any]:
         return {"available": True, "authenticated": False, "message": str(exc)}
 
 
-def _watch_codex_login(proc: subprocess.Popen, save_login: bool) -> None:
+def _watch_codex_login(proc: subprocess.Popen, save_login: bool, store_stop: threading.Event) -> None:
     try:
+        auth_trace("oauth_process_waiting", child_pid=proc.pid, save_login=save_login)
         code = proc.wait()
+        auth_trace("oauth_process_exited", child_pid=proc.pid, exit_code=code, **_auth_store_snapshot())
         status = codex_auth_status()
+        auth_trace("post_oauth_login_status", status=status, **_auth_store_snapshot())
+        # Doctor is diagnostic-only and its output is redacted before logging.
+        try:
+            doctor = run_codex(["doctor", "--json"], timeout=30)
+            auth_trace("post_oauth_doctor", exit_code=doctor.returncode,
+                       output=((doctor.stdout or "") + "\\n" + (doctor.stderr or ""))[-12000:])
+        except Exception as exc:
+            auth_trace("post_oauth_doctor_error", error=repr(exc))
         if status.get("authenticated"):
             RUNTIME_STATE["codex_login_message"] = "Authenticated"
-            # Never schedule a global Codex logout merely because GameForge's
-            # "Save login" UI option is off. Codex owns ~/.codex/auth.json and
-            # deleting it breaks both GameForge and the user's standalone CLI.
             RUNTIME_STATE["session_login"] = False
         else:
             RUNTIME_STATE["codex_login_message"] = status.get("message") or f"Sign-in exited with code {code}"
     except Exception as exc:
+        auth_trace("oauth_watcher_exception", error=repr(exc))
         RUNTIME_STATE["codex_login_message"] = str(exc)
     finally:
+        store_stop.set()
         RUNTIME_STATE["codex_login_in_progress"] = False
         RUNTIME_STATE["codex_login_process"] = None
+        auth_trace("oauth_watch_finished", **_auth_store_snapshot())
 
 def start_codex_login(save_login: bool = True) -> dict[str, Any]:
     if RUNTIME_STATE.get("codex_login_in_progress"):
@@ -403,12 +476,21 @@ def start_codex_login(save_login: bool = True) -> dict[str, Any]:
         if not result.get("ok"): return result
     try:
         command, use_shell = _command_invocation("codex", ["login", "-c", 'cli_auth_credentials_store="auto"'])
-        proc = subprocess.Popen(command, shell=use_shell, cwd=str(USER_DATA), env=_codex_process_env())
+        env = _codex_process_env()
+        auth_trace("oauth_start_requested", save_login=save_login, codex=resolve_command("codex"),
+                   command=command, use_shell=use_shell, cwd=str(USER_DATA),
+                   env=_auth_env_snapshot(env), config=_codex_config_diagnostics(), **_auth_store_snapshot())
+        store_stop = threading.Event()
+        threading.Thread(target=_watch_auth_store, args=(store_stop,), daemon=True, name="codex-auth-store-watch").start()
+        # Keep stdout/stderr attached so Codex's local-login-server and browser
+        # messages remain visible live in the GameForge console.
+        proc = subprocess.Popen(command, shell=use_shell, cwd=str(USER_DATA), env=env)
+        auth_trace("oauth_process_started", child_pid=proc.pid)
         RUNTIME_STATE["codex_login_process"] = proc
         RUNTIME_STATE["codex_login_in_progress"] = True
         RUNTIME_STATE["codex_login_message"] = "Complete the official ChatGPT sign-in in your browser."
-        threading.Thread(target=_watch_codex_login, args=(proc, save_login), daemon=True, name="codex-login-watch").start()
-        return {"ok": True, "started": True, "save_login": save_login, "message": RUNTIME_STATE["codex_login_message"]}
+        threading.Thread(target=_watch_codex_login, args=(proc, save_login, store_stop), daemon=True, name="codex-login-watch").start()
+        return {"ok": True, "started": True, "save_login": save_login, "trace_path": str(AUTH_TRACE), "message": RUNTIME_STATE["codex_login_message"]}
     except Exception as exc:
         RUNTIME_STATE["codex_login_in_progress"] = False
         RUNTIME_STATE["codex_login_message"] = str(exc)
@@ -1553,7 +1635,12 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(install_codex())
             if path == "/api/codex/login":
                 body = self.body_json()
-                return self.send_json(start_codex_login(bool(body.get("save_login", True))))
+                auth_trace("web_login_api_called", client=self.client_address[0], save_login=bool(body.get("save_login", True)),
+                           user_agent=self.headers.get("User-Agent", "")[:300], origin=self.headers.get("Origin", ""),
+                           referer=self.headers.get("Referer", ""))
+                result = start_codex_login(bool(body.get("save_login", True)))
+                auth_trace("web_login_api_result", result=result)
+                return self.send_json(result)
             if path == "/api/codex/logout":
                 return self.send_json(codex_logout())
             if path == "/api/projects/open-gfai":
