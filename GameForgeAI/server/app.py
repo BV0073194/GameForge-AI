@@ -380,7 +380,10 @@ def _watch_codex_login(proc: subprocess.Popen, save_login: bool) -> None:
         status = codex_auth_status()
         if status.get("authenticated"):
             RUNTIME_STATE["codex_login_message"] = "Authenticated"
-            RUNTIME_STATE["session_login"] = not save_login
+            # Never schedule a global Codex logout merely because GameForge's
+            # "Save login" UI option is off. Codex owns ~/.codex/auth.json and
+            # deleting it breaks both GameForge and the user's standalone CLI.
+            RUNTIME_STATE["session_login"] = False
         else:
             RUNTIME_STATE["codex_login_message"] = status.get("message") or f"Sign-in exited with code {code}"
     except Exception as exc:
@@ -451,11 +454,13 @@ def codex_logout() -> dict[str, Any]:
 
 
 def _logout_session_auth() -> None:
-    if RUNTIME_STATE.get("session_login"):
-        try:
-            codex_logout()
-        except Exception:
-            pass
+    """Do not mutate the user's global Codex credential store on GameForge exit.
+
+    Explicit Sign out remains available through /api/codex/logout. Historically
+    this function called codex logout for a session-only GameForge login, which
+    deleted ~/.codex/auth.json and made a successful OAuth flow appear broken.
+    """
+    return
 
 
 atexit.register(_logout_session_auth)
