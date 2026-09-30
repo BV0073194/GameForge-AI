@@ -7,7 +7,44 @@ async function loadSystem(){try{const s=await api('/api/status');const codexText
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function selectProject(id){stopProjectPolling();current=id;inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();startProjectPolling()}
-async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+function activityAge(iso){
+ if(!iso)return 'No activity yet';
+ const ms=Date.now()-Date.parse(iso);if(!Number.isFinite(ms))return '';
+ const sec=Math.max(0,Math.floor(ms/1000));
+ if(sec<5)return 'active now';
+ if(sec<60)return sec+'s ago';
+ const min=Math.floor(sec/60);if(min<60)return min+'m ago';
+ const hr=Math.floor(min/60);return hr+'h ago';
+}
+function liveStateLabel(status){
+ if(status==='running')return 'Working';
+ if(status==='self-healing')return 'Self-healing';
+ if(status==='waiting_for_user')return 'Waiting for you';
+ if(status==='paused')return 'Paused';
+ if(status==='complete')return 'Verified complete';
+ if(status==='user-complete')return 'Held as done';
+ if(status==='blocked'||status==='error')return 'Needs attention';
+ if(status==='stopped')return 'Stopped';
+ return 'Idle';
+}
+function renderLiveTask(agent,managed){
+ const a=agent?.activity||{};
+ $('#liveTaskState').textContent=liveStateLabel(agent?.status||'idle');
+ $('#liveTaskAge').textContent=activityAge(a.last_activity_at||agent?.last_update);
+ const title=a.task||((agent?.status==='running')?'Working…':'Nothing is running right now.');
+ $('#liveTaskTitle').innerHTML='<strong>'+esc(title)+'</strong>';
+ let detail=a.detail||agent?.message||'Start or resume the autonomous developer to see what GameForge is doing on the computer.';
+ if(managed?.running){
+   const proc='Managed process active'+(managed.pid?' • PID '+managed.pid:'')+(managed.command?'\n'+managed.command:'');
+   detail=detail+'\n\n'+proc;
+ }
+ $('#liveTaskDetail').textContent=detail;
+ const history=(a.history||[]).slice(-6).reverse();
+ $('#liveTaskHistory').innerHTML=history.length
+  ? '<h4>Recent activity</h4>'+history.map(x=>`<div class="criterion"><strong>${esc(x.task||x.kind||'Activity')}</strong>${x.detail?' — '+esc(x.detail):''}<br><small>${esc(x.at||'')}</small></div>`).join('')
+  : '';
+}
 function renderInputRequest(r){
  const box=$('#inputRequest');if(!r){box.hidden=true;inputRequestBusy=false;inputRequestPending=false;return}inputRequestPending=true;stopProjectPolling();box.hidden=false;
  $('#inputRequestTitle').textContent=r.title||'GameForge needs input';
