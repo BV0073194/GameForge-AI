@@ -125,6 +125,7 @@ jobs:
         shell: bash
         env:
           PYNPUT_BACKEND: dummy
+          ARTIFACT: ${{ matrix.artifact }}
         run: |
           set -euxo pipefail
           python - <<'PY'
@@ -161,8 +162,6 @@ jobs:
                   p.kill()
           print("FROZEN_SMOKE_OK")
           PY
-        env:
-          ARTIFACT: ${{ matrix.artifact }}
 
       - name: Upload executable
         uses: actions/upload-artifact@v4
