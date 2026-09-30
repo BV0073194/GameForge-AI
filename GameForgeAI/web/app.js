@@ -1,11 +1,41 @@
 const $=s=>document.querySelector(s);let current=null;let pollTimer=null;
 async function api(path,opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const t=await r.text();let data;try{data=JSON.parse(t)}catch{data={error:t}}if(!r.ok)throw new Error(data.error||r.statusText);return data}
 function badge(text,ok){return `<span class="badge" style="border-color:${ok?'#3c8':'#a66'}">${text}</span>`}
-async function loadSystem(){try{const s=await api('/api/status');const codexText=s.codex?`Codex ${s.codex_version||''}`:(s.codex_installing?'Codex installing…':'Codex unavailable');$('#systemBadges').innerHTML=badge(`Python ${s.python}`,true)+badge(s.git?'Git':'Git missing',s.git)+badge(codexText,s.codex)+badge(s.opencv&&s.mss?'OpenCV ready':'OpenCV deps missing',s.opencv&&s.mss);const auth=!!s.codex_auth?.authenticated;$('#codexLogin').hidden=auth;$('#codexLogout').hidden=!auth;$('#saveLogin').disabled=auth;$('#codexAuthMessage').textContent=auth?'Authenticated':(s.codex_install_message||s.codex_auth?.message||s.codex_install_error||'Sign in required');}catch(e){$('#systemBadges').textContent=e.message}}
+async function loadSystem(){try{const s=await api('/api/status');const codexText=s.codex?`Codex ${s.codex_version||''}`:(s.codex_installing?'Codex installing…':'Codex unavailable');$('#systemBadges').innerHTML=badge(`Python ${s.python}`,true)+badge(s.git?'Git':'Git missing',s.git)+badge(codexText,s.codex)+badge(s.opencv&&s.mss?'OpenCV ready':'OpenCV deps missing',s.opencv&&s.mss);const auth=!!s.codex_auth?.authenticated;const loggingIn=!!s.codex_login_in_progress;$('#codexLogin').hidden=auth;$('#codexLogout').hidden=!auth;$('#codexLogin').disabled=loggingIn||s.codex_installing;$('#saveLogin').disabled=auth||loggingIn;$('#codexLogin').textContent=loggingIn?'Signing in…':'Sign in with ChatGPT';$('#codexAuthMessage').textContent=auth?'Authenticated':(loggingIn?(s.codex_login_message||'Complete sign-in in your browser…'):(s.codex_install_error||s.codex_login_message||s.codex_auth?.message||s.codex_install_message||'Sign in required'));}catch(e){$('#systemBadges').textContent=e.message}}
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function selectProject(id){current=id;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();clearInterval(pollTimer);pollTimer=setInterval(refreshState,1800)}
-async function refreshState(){if(!current)return;try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUploads(d.uploads);$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+async function refreshState(){if(!current)return;try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUploads(d.uploads);renderInputRequest(d.input_request);$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+function renderInputRequest(r){
+ const box=$('#inputRequest');if(!r){box.hidden=true;return}box.hidden=false;
+ $('#inputRequestTitle').textContent=r.title||'GameForge needs input';
+ $('#inputRequestMessage').textContent=r.message||'The agent needs additional input.';
+ $('#inputRequestWhy').textContent=r.why_user_required||'';
+ const c=$('#inputRequestControl');c.innerHTML='';
+ if(r.kind==='file'){
+   const input=document.createElement('input');input.type='file';input.id='requestedFile';
+   if(r.accept_extensions?.length)input.accept=r.accept_extensions.join(',');
+   const b=document.createElement('button');b.className='primary';b.textContent='Upload required file';
+   b.onclick=async()=>{const file=input.files?.[0];if(!file)return alert('Choose the requested file.');
+     const ext='.'+(file.name.split('.').pop()||'').toLowerCase();
+     if(r.accept_extensions?.length&&!r.accept_extensions.map(x=>x.toLowerCase()).includes(ext))return alert('Expected: '+r.accept_extensions.join(', '));
+     $('#inputRequestStatus').textContent='Uploading '+file.name+'…';
+     const url=`/api/project/${current}/upload?category=${encodeURIComponent(r.upload_category||'REFERENCE')}&path=${encodeURIComponent(file.name)}&request_id=${encodeURIComponent(r.id||'request')}`;
+     const up=await fetch(url,{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':file.name},body:file});
+     if(!up.ok)throw new Error(await up.text());
+     await postAction('input-request/respond',{value:file.name});$('#inputRequestStatus').textContent='Received. Resuming agent…';
+     if(r.resume_after_submit!==false)await postAction('agent/resume');await refreshState();
+   };c.append(input,b);
+ }else if(r.kind==='choice'){
+   const sel=document.createElement('select');(r.choices||[]).forEach(x=>{const o=document.createElement('option');o.value=x;o.textContent=x;sel.appendChild(o)});
+   const b=document.createElement('button');b.className='primary';b.textContent='Submit';b.onclick=()=>submitRequestedValue(r,sel.value);c.append(sel,b);
+ }else if(r.kind==='confirm'){
+   const b=document.createElement('button');b.className='primary';b.textContent='Confirm and continue';b.onclick=()=>submitRequestedValue(r,true);c.append(b);
+ }else{
+   const input=document.createElement('input');input.type=r.kind==='url'?'url':'text';input.placeholder=r.placeholder||'Enter requested information';
+   const b=document.createElement('button');b.className='primary';b.textContent='Submit';b.onclick=()=>submitRequestedValue(r,input.value);c.append(input,b);
+ }}
+async function submitRequestedValue(r,value){try{await postAction('input-request/respond',{value});if(r.resume_after_submit!==false)await postAction('agent/resume');await refreshState()}catch(e){alert(e.message)}}
 function renderAcceptance(a){const box=$('#acceptance');box.innerHTML=`<p><strong>Project complete:</strong> ${a?.project_complete?'YES':'Not yet'}</p>`+(a?.criteria||[]).map(c=>`<div class="criterion ${c.status==='pass'?'pass':'pending'}"><strong>${esc(c.id)}</strong> — ${esc(c.description)}<br><small>${esc(c.status)}${c.evidence?` • ${esc(c.evidence)}`:''}</small></div>`).join('')}
 function renderUploads(u){$('#uploadList').innerHTML=`<p>${u?.count||0} scanned items</p>`+(u?.items||[]).slice(0,100).map(x=>`<div class="criterion"><strong>${esc(x.path)}</strong><br><small>${x.bytes||0} bytes • ${esc(x.sha256||x.error||'')}</small></div>`).join('')}
 async function postAction(action,body={}){if(!current)return;return api(`/api/project/${current}/${action}`,{method:'POST',body:JSON.stringify(body)})}
@@ -33,6 +63,15 @@ $('#analyzeAssets').onclick=async()=>{try{const r=await postAction('assets/analy
 $('#gitStatusBtn').onclick=async()=>{try{const r=await postAction('git/status',{});$('#gitOutput').textContent=`HEAD ${r.head||''}\n\n${r.status||''}\n${r.log||''}`}catch(e){$('#gitOutput').textContent=e.message}};
 $('#rollbackBtn').onclick=async()=>{const rev=$('#rollbackRev').value.trim();if(!rev)return alert('Enter a commit hash.');if(!confirm(`Hard-reset this project to ${rev}? A safety checkpoint will be attempted first.`))return;try{const r=await postAction('git/rollback',{revision:rev});$('#gitOutput').textContent=JSON.stringify(r,null,2);await refreshState()}catch(e){$('#gitOutput').textContent=e.message}};
 
-$('#codexLogin').onclick=async()=>{try{$('#codexAuthMessage').textContent='Starting official ChatGPT sign-in…';const r=await api('/api/codex/login',{method:'POST',body:JSON.stringify({save_login:$('#saveLogin').checked})});$('#codexAuthMessage').textContent=r.message||r.error||'Complete sign-in in your browser.';setTimeout(loadSystem,2500)}catch(e){$('#codexAuthMessage').textContent=e.message}};
+$('#codexLogin').onclick=async()=>{try{$('#codexLogin').disabled=true;$('#codexAuthMessage').textContent='Starting official ChatGPT sign-in…';const r=await api('/api/codex/login',{method:'POST',body:JSON.stringify({save_login:$('#saveLogin').checked})});$('#codexAuthMessage').textContent=r.message||r.error||'Complete sign-in in your browser.';await loadSystem()}catch(e){$('#codexAuthMessage').textContent=e.message;$('#codexLogin').disabled=false}};
 $('#codexLogout').onclick=async()=>{try{const r=await api('/api/codex/logout',{method:'POST',body:'{}'});$('#codexAuthMessage').textContent=r.message||'Signed out';await loadSystem()}catch(e){$('#codexAuthMessage').textContent=e.message}};
 setInterval(loadSystem,5000);
+
+
+// Keep the desktop backend tied to the UI lifetime. pagehide also fires on
+// reload/navigation, so the backend waits four seconds; a fresh heartbeat
+// cancels shutdown after an ordinary reload.
+async function sessionHeartbeat(){try{await fetch('/api/session/heartbeat',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}',keepalive:true})}catch{}}
+sessionHeartbeat();
+setInterval(sessionHeartbeat,1500);
+window.addEventListener('pagehide',()=>{try{navigator.sendBeacon('/api/session/closing',new Blob(['{}'],{type:'application/json'}))}catch{}});

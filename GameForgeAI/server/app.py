@@ -53,10 +53,12 @@ WEB = RESOURCE_ROOT / "web"
 PROJECTS = USER_DATA / "projects"
 GLOBAL_UPLOAD = USER_DATA / "UPLOAD"
 GLOBAL_LOGS = USER_DATA / "logs"
+AUTH_TRACE = GLOBAL_LOGS / "codex-auth-live.jsonl"
+AUTH_TRACE_LOCK = threading.Lock()
 REGISTRY_FILE = USER_DATA / "project_registry.json"
 RUNTIME = USER_DATA / "runtime"
 CODEX_RUNTIME = RUNTIME / "codex"
-RUNTIME_STATE = {"codex_installing": False, "codex_install_error": "", "codex_install_message": "", "session_login": False}
+RUNTIME_STATE = {"codex_installing": False, "codex_install_error": "", "codex_install_message": "", "session_login": False, "codex_login_in_progress": False, "codex_login_message": "", "codex_login_process": None}
 
 for p in (USER_DATA, PROJECTS, GLOBAL_UPLOAD, GLOBAL_LOGS, RUNTIME, CODEX_RUNTIME):
     p.mkdir(parents=True, exist_ok=True)
@@ -64,6 +66,69 @@ for p in (USER_DATA, PROJECTS, GLOBAL_UPLOAD, GLOBAL_LOGS, RUNTIME, CODEX_RUNTIM
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+_AUTH_SECRET_RE = re.compile(r'(?i)(bearer\\s+)[^\\s,"]+|(sk-[A-Za-z0-9_-]{8,})|("(?:access_token|refresh_token|id_token|api_key|cookie|authorization)"\\s*:\\s*")[^"]+(")')
+
+def _auth_redact(value: Any) -> Any:
+    """Recursively redact auth material before it can touch the live trace."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if re.search(r"(?i)(token|secret|password|cookie|authorization|api.?key)", str(k)):
+                # Presence-only diagnostic fields deliberately contain only
+                # SET/unset. Preserve those labels; redact every other value.
+                out[k] = v if v in ("SET", "unset") else ("<REDACTED:PRESENT>" if v else "<EMPTY>")
+            else:
+                out[k] = _auth_redact(v)
+        return out
+    if isinstance(value, list):
+        return [_auth_redact(v) for v in value]
+    if isinstance(value, str):
+        return _AUTH_SECRET_RE.sub(lambda m: (m.group(1) or "") + "<REDACTED>" + (m.group(4) or ""), value)
+    return value
+
+def auth_trace(event: str, **fields: Any) -> None:
+    """Append a secret-safe, line-buffered event for live Codex auth debugging."""
+    try:
+        AUTH_TRACE.parent.mkdir(parents=True, exist_ok=True)
+        record = {"ts": now_iso(), "event": event, "pid": os.getpid(), "thread": threading.current_thread().name, **fields}
+        line = json.dumps(_auth_redact(record), ensure_ascii=False, default=str)
+        with AUTH_TRACE_LOCK:
+            with AUTH_TRACE.open("a", encoding="utf-8", buffering=1) as fp:
+                fp.write(line + "\\n")
+                fp.flush()
+        print("[AUTH-TRACE] " + line, flush=True)
+    except Exception:
+        pass
+
+def _auth_store_snapshot() -> dict[str, Any]:
+    home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    auth = home / "auth.json"
+    snap: dict[str, Any] = {"codex_home": str(home), "auth_path": str(auth), "auth_exists": auth.exists()}
+    if auth.exists():
+        try:
+            st = auth.stat()
+            snap.update({"auth_size": st.st_size, "auth_mtime_ns": st.st_mtime_ns})
+            data = json.loads(auth.read_text(encoding="utf-8", errors="replace"))
+            snap["auth_top_level_keys"] = sorted(data.keys()) if isinstance(data, dict) else [type(data).__name__]
+        except Exception as exc:
+            snap["auth_metadata_error"] = repr(exc)
+    return snap
+
+def _auth_env_snapshot(env: dict[str, str] | None = None) -> dict[str, Any]:
+    env = env or os.environ
+    names = ("CODEX_HOME","OPENAI_BASE_URL","OPENAI_API_BASE","OPENAI_API_KEY","CODEX_API_KEY","CODEX_ACCESS_TOKEN","HTTP_PROXY","HTTPS_PROXY","ALL_PROXY","NO_PROXY")
+    return {name: ("SET" if env.get(name) else "unset") for name in names}
+
+def _watch_auth_store(stop: threading.Event) -> None:
+    previous = None
+    while not stop.wait(0.25):
+        current = _auth_store_snapshot()
+        signature = (current.get("auth_exists"), current.get("auth_size"), current.get("auth_mtime_ns"))
+        if signature != previous:
+            auth_trace("credential_store_changed", **current)
+            previous = signature
 
 
 def slugify(value: str) -> str:
@@ -374,19 +439,90 @@ def codex_auth_status() -> dict[str, Any]:
         return {"available": True, "authenticated": False, "message": str(exc)}
 
 
+def _watch_codex_login(proc: subprocess.Popen, save_login: bool, store_stop: threading.Event) -> None:
+    try:
+        auth_trace("oauth_process_waiting", child_pid=proc.pid, save_login=save_login)
+        code = proc.wait()
+        auth_trace("oauth_process_exited", child_pid=proc.pid, exit_code=code, **_auth_store_snapshot())
+        status = codex_auth_status()
+        auth_trace("post_oauth_login_status", status=status, **_auth_store_snapshot())
+        # Doctor is diagnostic-only and its output is redacted before logging.
+        try:
+            doctor = run_codex(["doctor", "--json"], timeout=30)
+            auth_trace("post_oauth_doctor", exit_code=doctor.returncode,
+                       output=((doctor.stdout or "") + "\\n" + (doctor.stderr or ""))[-12000:])
+        except Exception as exc:
+            auth_trace("post_oauth_doctor_error", error=repr(exc))
+        if status.get("authenticated"):
+            RUNTIME_STATE["codex_login_message"] = "Authenticated"
+            RUNTIME_STATE["session_login"] = False
+        else:
+            RUNTIME_STATE["codex_login_message"] = status.get("message") or f"Sign-in exited with code {code}"
+    except Exception as exc:
+        auth_trace("oauth_watcher_exception", error=repr(exc))
+        RUNTIME_STATE["codex_login_message"] = str(exc)
+    finally:
+        store_stop.set()
+        RUNTIME_STATE["codex_login_in_progress"] = False
+        RUNTIME_STATE["codex_login_process"] = None
+        auth_trace("oauth_watch_finished", **_auth_store_snapshot())
+
 def start_codex_login(save_login: bool = True) -> dict[str, Any]:
+    if RUNTIME_STATE.get("codex_login_in_progress"):
+        return {"ok": True, "in_progress": True, "message": "ChatGPT sign-in is already in progress."}
+    status = codex_auth_status()
+    if status.get("authenticated"):
+        return {"ok": True, "authenticated": True, "message": "Already authenticated"}
     if not command_exists("codex"):
         result = install_codex()
-        if not result.get("ok"):
-            return result
-    args = ["login", "-c", 'cli_auth_credentials_store="auto"']
+        if not result.get("ok"): return result
     try:
-        command, use_shell = _command_invocation("codex", args)
-        subprocess.Popen(command, shell=use_shell, cwd=str(USER_DATA))
-        RUNTIME_STATE["session_login"] = not save_login
-        return {"ok": True, "started": True, "save_login": save_login, "message": "Complete the official ChatGPT sign-in in your browser."}
+        command, use_shell = _command_invocation("codex", ["login", "-c", 'cli_auth_credentials_store="file"'])
+        env = _codex_process_env()
+        auth_trace("oauth_start_requested", save_login=save_login, requested_credentials_store="file", codex=resolve_command("codex"),
+                   command=command, use_shell=use_shell, cwd=str(USER_DATA),
+                   env=_auth_env_snapshot(env), config=_codex_config_diagnostics(), **_auth_store_snapshot())
+        store_stop = threading.Event()
+        threading.Thread(target=_watch_auth_store, args=(store_stop,), daemon=True, name="codex-auth-store-watch").start()
+        # Keep stdout/stderr attached so Codex's local-login-server and browser
+        # messages remain visible live in the GameForge console.
+        proc = subprocess.Popen(command, shell=use_shell, cwd=str(USER_DATA), env=env)
+        auth_trace("oauth_process_started", child_pid=proc.pid)
+        RUNTIME_STATE["codex_login_process"] = proc
+        RUNTIME_STATE["codex_login_in_progress"] = True
+        RUNTIME_STATE["codex_login_message"] = "Complete the official ChatGPT sign-in in your browser."
+        threading.Thread(target=_watch_codex_login, args=(proc, save_login, store_stop), daemon=True, name="codex-login-watch").start()
+        return {"ok": True, "started": True, "save_login": save_login, "trace_path": str(AUTH_TRACE), "message": RUNTIME_STATE["codex_login_message"]}
     except Exception as exc:
+        RUNTIME_STATE["codex_login_in_progress"] = False
+        RUNTIME_STATE["codex_login_message"] = str(exc)
         return {"ok": False, "error": str(exc)}
+
+
+def codex_auth_preflight(cwd: Path | None = None) -> dict[str, Any]:
+    """Verify that Codex can make an authenticated inference, not just read local login state."""
+    status = codex_auth_status()
+    if not status.get("authenticated"):
+        return {"ok": False, "kind": "not_logged_in", "message": status.get("message") or "Sign in to Codex"}
+    try:
+        proc = run_codex(
+            ["exec", "--json", "--skip-git-repo-check", "--sandbox", "read-only", "-"],
+            cwd=cwd or USER_DATA,
+            input_text="Reply with exactly: GAMEFORGE_AUTH_OK",
+            timeout=60,
+        )
+        combined = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        lower = combined.lower()
+        if proc.returncode == 0:
+            return {"ok": True, "kind": "ready", "message": "Codex authenticated and ready"}
+        if "401 unauthorized" in lower or "missing bearer or basic authentication" in lower:
+            diag = _codex_config_diagnostics()
+            if "api.openai.com/v1/responses" in lower and (diag.get("provider_override") or diag.get("base_url_override")):
+                return {"ok": False, "kind": "provider_mismatch", "message": "ChatGPT sign-in succeeded, but Codex is being routed to api.openai.com by a Codex provider/base-URL override. Remove the custom provider/openai_base_url override from the reported Codex config, then Resume.", "diagnostics": diag}
+            return {"ok": False, "kind": "transport_401", "message": "ChatGPT sign-in succeeded, but the installed Codex runtime sent the inference request without usable authentication (401). Project state is preserved; GameForge will not consume an agent iteration.", "diagnostics": diag}
+        return {"ok": False, "kind": "exec_failed", "message": combined[-2000:] or f"Codex preflight exited with {proc.returncode}"}
+    except Exception as exc:
+        return {"ok": False, "kind": "preflight_error", "message": str(exc)}
 
 
 def codex_logout() -> dict[str, Any]:
@@ -402,11 +538,13 @@ def codex_logout() -> dict[str, Any]:
 
 
 def _logout_session_auth() -> None:
-    if RUNTIME_STATE.get("session_login"):
-        try:
-            codex_logout()
-        except Exception:
-            pass
+    """Do not mutate the user's global Codex credential store on GameForge exit.
+
+    Explicit Sign out remains available through /api/codex/logout. Historically
+    this function called codex logout for a session-only GameForge login, which
+    deleted ~/.codex/auth.json and made a successful OAuth flow appear broken.
+    """
+    return
 
 
 atexit.register(_logout_session_auth)
@@ -434,6 +572,40 @@ def _command_invocation(name: str, args: list[str]) -> tuple[str | list[str], bo
     return [resolved, *args], False
 
 
+def _codex_process_env() -> dict[str, str]:
+    """Give Codex a clean provider-routing environment while preserving credentials.
+
+    ChatGPT OAuth must be allowed to select Codex's ChatGPT backend. A stale
+    OPENAI_BASE_URL or provider override can incorrectly route the OAuth session
+    to api.openai.com/v1/responses, where ChatGPT OAuth is not the API-key auth
+    expected by that route. Keep supported credential variables intact.
+    """
+    env = os.environ.copy()
+    for name in ("OPENAI_BASE_URL", "OPENAI_API_BASE"):
+        env.pop(name, None)
+    return env
+
+
+def _codex_config_diagnostics() -> dict[str, Any]:
+    """Report provider-routing overrides without reading or returning secrets."""
+    home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    config = home / "config.toml"
+    result: dict[str, Any] = {
+        "config_path": str(config),
+        "config_exists": config.exists(),
+        "provider_override": False,
+        "base_url_override": False,
+    }
+    try:
+        if config.exists():
+            text = config.read_text(encoding="utf-8", errors="replace")
+            result["provider_override"] = bool(re.search(r"(?m)^\\s*model_provider\\s*=", text))
+            result["base_url_override"] = bool(re.search(r"(?m)^\\s*(?:openai_base_url|base_url)\\s*=.*api\\.openai\\.com", text, re.I))
+    except Exception as exc:
+        result["error"] = str(exc)
+    return result
+
+
 def run_codex(
     args: list[str],
     *,
@@ -451,6 +623,7 @@ def run_codex(
         text=True,
         errors="replace",
         timeout=timeout,
+        env=_codex_process_env(),
     )
 
 
@@ -641,6 +814,7 @@ class AgentState:
     stop_event: threading.Event = field(default_factory=threading.Event)
     pause_event: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
+    input_request: dict[str, Any] | None = None
 
 
 @dataclass
@@ -657,6 +831,8 @@ CVS: dict[str, CVState] = {}
 STATE_LOCK = threading.Lock()
 MANAGED_PROCESSES: dict[str, subprocess.Popen] = {}
 MANAGED_PROCESS_META: dict[str, dict[str, Any]] = {}
+APP_SERVER: ThreadingHTTPServer | None = None
+WEB_SESSION = {"last_heartbeat": time.monotonic(), "closing": False, "shutdown_started": False}
 
 
 
@@ -686,6 +862,30 @@ def collect_logs(p: Path, cfg: dict[str, Any]) -> str:
     return "".join(chunks)[-70000:]
 
 
+def user_input_request_path(p: Path) -> Path:
+    return p / ".gameforge" / "user_input_request.json"
+
+def load_user_input_request(p: Path) -> dict[str, Any] | None:
+    req = read_json(user_input_request_path(p), None)
+    return req if isinstance(req, dict) and req.get("status", "pending") == "pending" else None
+
+def validate_requested_upload(req: dict[str, Any], filename: str) -> None:
+    allowed = [str(x).lower() for x in req.get("accept_extensions", [])]
+    if allowed and Path(filename).suffix.lower() not in allowed:
+        raise ValueError("Expected file type: " + ", ".join(allowed))
+
+def detect_agent_input_request(p: Path) -> dict[str, Any] | None:
+    req = load_user_input_request(p)
+    if not req:
+        return None
+    req.setdefault("id", f"request-{int(time.time())}")
+    req.setdefault("kind", "file")
+    req.setdefault("title", "GameForge needs input")
+    req.setdefault("message", "The autonomous agent needs something only you can provide.")
+    req.setdefault("status", "pending")
+    write_json(user_input_request_path(p), req)
+    return req
+
 def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: dict[str, Any]) -> bool:
     acc = read_json(p / ".gameforge/acceptance.json", {}) or {}
     criteria = acc.get("criteria") or []
@@ -708,7 +908,11 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     if test_result is not None:
         prior += "\nPrevious test result:\n" + json.dumps({k:v for k,v in test_result.items() if k != "output"}, indent=2) + "\n" + test_result.get("output", "")[-12000:]
     research = cfg.get("research_mode", "deep")
-    return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\nRead AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything.\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.\n\nRecent evidence from logs/OpenCV/runtime:\n{evidence[-50000:] if evidence else '(none yet)'}\n{prior[-30000:]}\n'''
+    return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\nRead AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything.\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
+
+Before declaring a blocker, exhaust SAFE, LEGAL, REAL autonomous options: inspect existing project uploads/local files, public/authorized sources, official documentation, and legitimately redistributable dependencies. Never download pirated commercial games/ROMs, leaked credentials, or other unauthorized material. If progress genuinely requires user-only input, DO NOT merely mention the blocker in notes and DO NOT keep burning iterations. Write .gameforge/user_input_request.json and stop the iteration cleanly. Schema:
+{"status":"pending","kind":"file|url|text|choice|confirm","title":"short human title","message":"exactly what is needed and why","why_user_required":"why autonomous acquisition is unavailable/inappropriate","accept_extensions":[".z64"],"upload_category":"ROMS_LOCAL","placeholder":"","choices":[],"resume_after_submit":true}
+For files, list ONLY valid expected extensions. For a copyrighted base ROM, tell the user to provide their own legally obtained copy; never search for unauthorized ROM downloads. For URLs, request a URL only when the user must identify/authorize the source.\n\nRecent evidence from logs/OpenCV/runtime:\n{evidence[-50000:] if evidence else '(none yet)'}\n{prior[-30000:]}\n'''
 
 
 def agent_loop(project_id: str) -> None:
@@ -734,6 +938,18 @@ def agent_loop(project_id: str) -> None:
             if state.stop_event.is_set():
                 break
             state.status = "running"
+
+            # A local "login status" is insufficient: affected Codex builds can
+            # report logged in yet send Responses requests with no Authorization
+            # header. Verify the real request path before consuming an iteration.
+            # Run this before incrementing so a failed auth check remains iteration 0.
+            auth_check = codex_auth_preflight(p)
+            if not auth_check.get("ok"):
+                state.status = "blocked"
+                state.message = auth_check.get("message", "Codex authentication preflight failed")
+                RUNTIME_STATE["codex_login_message"] = state.message
+                return
+
             state.iteration += 1
             if max_iter and state.iteration > max_iter:
                 state.status = "paused"
@@ -748,9 +964,18 @@ def agent_loop(project_id: str) -> None:
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
             final_path = p / f"logs/codex-iteration-{iteration:04d}.final.txt"
             trace_path.parent.mkdir(parents=True, exist_ok=True)
-            codex_args = ["exec", "--json"]
-            if cfg.get("agent", {}).get("permission_mode", "full-auto") == "full-auto":
-                codex_args.append("--full-auto")
+            codex_args = ["exec", "--json", "--skip-git-repo-check"]
+            permission_mode = cfg.get("agent", {}).get("permission_mode", "full-auto")
+            if permission_mode == "full-auto":
+                # Codex 0.159.x can reject PowerShell itself under the Windows
+                # workspace-write execution policy even when approval_policy=never.
+                # GameForge full-auto explicitly means the autonomous project agent
+                # may run project-local shell/build/test tooling without prompts.
+                codex_args += ["--dangerously-bypass-approvals-and-sandbox"]
+            else:
+                codex_args += ["--sandbox", "workspace-write"]
+            auth_trace("agent_codex_exec", project=str(p), iteration=iteration,
+                       permission_mode=permission_mode, codex_args=codex_args)
             # "-" forces Codex to read the prompt from stdin. This avoids Windows
             # npm .cmd shim execution issues and command-line length limits.
             codex_args.append("-")
@@ -764,9 +989,20 @@ def agent_loop(project_id: str) -> None:
                 )
                 trace_path.write_text(proc.stdout or "", encoding="utf-8")
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
-                if proc.returncode != 0:
+                pending_input = detect_agent_input_request(p)
+            if pending_input:
+                state.status = "waiting_for_user"
+                state.message = pending_input.get("message") or "Waiting for required user input"
+                state.input_request = pending_input
+                return
+            if proc.returncode != 0:
                     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
                     lower = combined.lower()
+                    if "401 unauthorized" in lower:
+                        state.status = "blocked"
+                        state.message = "Codex authentication was rejected (401). Project state is preserved. GameForge will not retry-loop; repair/re-authenticate the Codex runtime, then Resume."
+                        RUNTIME_STATE["codex_login_message"] = "Codex request rejected (401); re-authentication may be required."
+                        return
                     if any(x in lower for x in ["usage limit", "rate limit", "sign in", "login", "authentication"]):
                         state.status = "blocked"
                         state.message = "Codex stopped for authentication/usage availability. Project state is preserved; resume after resolving it."
@@ -1027,7 +1263,14 @@ def stop_managed_process(project_id: str) -> dict[str, Any]:
         return {"ok": True, **managed_process_public(project_id)}
     try:
         if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=15)
+            # Managed Windows processes are created in their own process group.
+            # Ask them to stop cleanly first so editors/build tools can flush data.
+            try:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+                proc.wait(timeout=8)
+            except Exception:
+                # Escalate only after the graceful request times out.
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], capture_output=True, timeout=15)
         else:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
         try:
@@ -1231,12 +1474,69 @@ def system_status() -> dict[str, Any]:
         "codex_installing": bool(RUNTIME_STATE["codex_installing"]),
         "codex_install_message": RUNTIME_STATE["codex_install_message"],
         "codex_install_error": RUNTIME_STATE["codex_install_error"],
+        "codex_login_in_progress": bool(RUNTIME_STATE.get("codex_login_in_progress")),
+        "codex_login_message": RUNTIME_STATE.get("codex_login_message", ""),
+        "codex_config": _codex_config_diagnostics(),
         "codex_auth": codex_auth_status() if codex_ok else {"available": codex_ok, "authenticated": False, "message": "Codex install required"},
         "opencv": deps["cv2"],
         "mss": deps["mss"],
         "psutil": deps["psutil"],
         "hostname": socket.gethostname(),
     }
+
+
+def graceful_session_shutdown(reason: str = "web-ui-closed") -> dict[str, Any]:
+    """Checkpoint/pause project work and stop child runtime processes before exit."""
+    if WEB_SESSION.get("shutdown_started"):
+        return {"ok": True, "already_started": True}
+    WEB_SESSION["shutdown_started"] = True
+    report: dict[str, Any] = {"ok": True, "reason": reason, "projects": {}}
+    project_ids = set(AGENTS) | set(CVS) | set(MANAGED_PROCESSES)
+    for pid in project_ids:
+        item: dict[str, Any] = {}
+        try:
+            p = project_path(pid)
+            agent = AGENTS.get(pid)
+            cv = CVS.get(pid)
+            proc_meta = MANAGED_PROCESS_META.get(pid, {})
+            resume = {
+                "saved_at": now_iso(),
+                "reason": reason,
+                "agent_was_running": bool(agent and agent.thread and agent.thread.is_alive() and agent.status == "running"),
+                "agent_iteration": agent.iteration if agent else 0,
+                "cv_was_running": bool(cv and cv.thread and cv.thread.is_alive() and cv.status == "running"),
+                "managed_process_command": proc_meta.get("command", ""),
+            }
+            write_json(p / ".gameforge" / "resume-session.json", resume)
+            if agent and agent.thread and agent.thread.is_alive():
+                agent.pause_event.set()
+                agent.status = "paused"
+                agent.message = "Paused safely because the GameForge web UI closed"
+            if cv:
+                cv.stop_event.set()
+            if MANAGED_PROCESSES.get(pid) and MANAGED_PROCESSES[pid].poll() is None:
+                item["process"] = stop_managed_process(pid)
+            item["checkpoint"] = git_checkpoint(p, "GameForge safe checkpoint on UI exit")
+            item["resume"] = resume
+        except Exception as exc:
+            item["error"] = str(exc)
+            report["ok"] = False
+        report["projects"][pid] = item
+    write_json(USER_DATA / "last_shutdown.json", report)
+    return report
+
+
+def _schedule_web_close_shutdown() -> None:
+    """Give reload/navigation a grace period; a resumed heartbeat cancels exit."""
+    def worker() -> None:
+        time.sleep(4.0)
+        if not WEB_SESSION.get("closing") or WEB_SESSION.get("shutdown_started"):
+            return
+        graceful_session_shutdown("web-ui-closed")
+        server = APP_SERVER
+        if server:
+            threading.Thread(target=server.shutdown, daemon=True, name="server-shutdown").start()
+    threading.Thread(target=worker, daemon=True, name="web-close-grace").start()
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -1306,6 +1606,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "evidence": read_json(p / ".gameforge/last_evidence.json", {}),
                     "uploads": read_json(p / ".gameforge/upload_manifest.json", {"count": 0, "items": []}),
                     "agent": agent_public(st) if st else {"status":"idle","iteration":0,"message":""},
+                    "input_request": load_user_input_request(p),
                     "cv": {"status": cv.status, "message": cv.message} if cv else {"status":"idle","message":""},
                     "visual": read_json(p / "captures/metrics.json", {}),
                     "managed_process": managed_process_public(pid),
@@ -1363,11 +1664,24 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         try:
+            if path == "/api/session/heartbeat":
+                WEB_SESSION["last_heartbeat"] = time.monotonic()
+                WEB_SESSION["closing"] = False
+                return self.send_json({"ok": True})
+            if path == "/api/session/closing":
+                WEB_SESSION["closing"] = True
+                _schedule_web_close_shutdown()
+                return self.send_json({"ok": True, "grace_seconds": 4})
             if path == "/api/codex/install":
                 return self.send_json(install_codex())
             if path == "/api/codex/login":
                 body = self.body_json()
-                return self.send_json(start_codex_login(bool(body.get("save_login", True))))
+                auth_trace("web_login_api_called", client=self.client_address[0], save_login=bool(body.get("save_login", True)),
+                           user_agent=self.headers.get("User-Agent", "")[:300], origin=self.headers.get("Origin", ""),
+                           referer=self.headers.get("Referer", ""))
+                result = start_codex_login(bool(body.get("save_login", True)))
+                auth_trace("web_login_api_result", result=result)
+                return self.send_json(result)
             if path == "/api/codex/logout":
                 return self.send_json(codex_logout())
             if path == "/api/projects/open-gfai":
@@ -1416,6 +1730,10 @@ class Handler(SimpleHTTPRequestHandler):
                 q = urllib.parse.parse_qs(parsed.query)
                 category = slugify((q.get("category") or ["REFERENCE"])[0]).upper()
                 rel = (q.get("path") or [self.headers.get("X-Filename", "upload.bin")])[0]
+                req = load_user_input_request(p)
+                if (q.get("request_id") or [None])[0] and req:
+                    validate_requested_upload(req, rel)
+                    category = slugify(req.get("upload_category") or category).upper()
                 rel = rel.replace("\\", "/").lstrip("/")
                 length = int(self.headers.get("Content-Length", "0") or 0)
                 if length > 2_000_000_000:
@@ -1431,6 +1749,27 @@ class Handler(SimpleHTTPRequestHandler):
                         if not chunk: break
                         f.write(chunk); remaining -= len(chunk)
                 return self.send_json({"ok": True, "path": str(dest.relative_to(p)).replace("\\","/")})
+            if action == "input-request/respond":
+                body = self.body_json()
+                req = load_user_input_request(p)
+                if not req:
+                    return self.send_json({"error": "no pending input request"}, 409)
+                kind = req.get("kind", "text")
+                if kind in {"text","url","choice","confirm"}:
+                    response = body.get("value")
+                    if kind == "url" and response and not re.match(r"^https?://", str(response), re.I):
+                        return self.send_json({"error": "A valid http(s) URL is required"}, 400)
+                    if kind == "choice" and response not in req.get("choices", []):
+                        return self.send_json({"error": "Invalid choice"}, 400)
+                    write_json(p / ".gameforge" / "user_input_response.json",
+                               {"request_id": req.get("id"), "kind": kind, "value": response, "received_at": now_iso()})
+                req["status"] = "fulfilled"
+                req["fulfilled_at"] = now_iso()
+                write_json(user_input_request_path(p), req)
+                st = AGENTS.get(pid)
+                if st and st.status == "waiting_for_user":
+                    st.status = "paused"; st.message = "User input received; ready to resume"
+                return self.send_json({"ok": True, "resume_after_submit": bool(req.get("resume_after_submit", True))})
             if action in {"run/build","run/test","run/launch"}:
                 which = action.split("/")[1]
                 cmd = cfg.get("commands", {}).get(which, "")
@@ -1473,6 +1812,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main() -> None:
+    global APP_SERVER
     parser = argparse.ArgumentParser(description="GameForge AI local game-development studio")
     parser.add_argument("--host", default="127.0.0.1", help="Use 0.0.0.0 for LAN access")
     parser.add_argument("--port", type=int, default=4217)
@@ -1483,6 +1823,7 @@ def main() -> None:
     if args.project_file:
         selected_project, _, _ = open_gfai_file(args.project_file)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    APP_SERVER = server
     refresh_windows_environment()
     ensure_codex_async()
     url = f"http://127.0.0.1:{args.port}"
@@ -1498,7 +1839,9 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nStopping GameForge AI")
     finally:
+        graceful_session_shutdown("server-exit")
         server.server_close()
+        APP_SERVER = None
 
 if __name__ == "__main__":
     main()
