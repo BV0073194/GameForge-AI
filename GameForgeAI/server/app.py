@@ -18,6 +18,7 @@ import time
 import traceback
 import urllib.parse
 import webbrowser
+import atexit
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -53,8 +54,11 @@ PROJECTS = USER_DATA / "projects"
 GLOBAL_UPLOAD = USER_DATA / "UPLOAD"
 GLOBAL_LOGS = USER_DATA / "logs"
 REGISTRY_FILE = USER_DATA / "project_registry.json"
+RUNTIME = USER_DATA / "runtime"
+CODEX_RUNTIME = RUNTIME / "codex"
+RUNTIME_STATE = {"codex_installing": False, "codex_install_error": "", "codex_install_message": "", "session_login": False}
 
-for p in (USER_DATA, PROJECTS, GLOBAL_UPLOAD, GLOBAL_LOGS):
+for p in (USER_DATA, PROJECTS, GLOBAL_UPLOAD, GLOBAL_LOGS, RUNTIME, CODEX_RUNTIME):
     p.mkdir(parents=True, exist_ok=True)
 
 
@@ -202,8 +206,130 @@ def tail_text(path: Path, max_bytes: int = 40000) -> str:
         return ""
 
 
+def _codex_candidates() -> list[Path]:
+    exe = "codex.exe" if os.name == "nt" else "codex"
+    candidates = [
+        CODEX_RUNTIME / exe,
+        Path.home() / ".codex" / "bin" / exe,
+        Path.home() / ".local" / "bin" / exe,
+    ]
+    if os.name == "nt":
+        candidates += [
+            Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "codex" / exe,
+            Path(os.environ.get("APPDATA", "")) / "npm" / "codex.cmd",
+        ]
+    return [p for p in candidates if p.exists()]
+
+
+def resolve_command(name: str) -> str | None:
+    resolved = shutil.which(name)
+    if resolved:
+        return resolved
+    if name == "codex":
+        candidates = _codex_candidates()
+        if candidates:
+            return str(candidates[0])
+    return None
+
+
 def command_exists(name: str) -> bool:
-    return shutil.which(name) is not None
+    return resolve_command(name) is not None
+
+
+def install_codex() -> dict[str, Any]:
+    if command_exists("codex"):
+        return {"ok": True, "already_installed": True, "path": resolve_command("codex")}
+    if RUNTIME_STATE["codex_installing"]:
+        return {"ok": False, "installing": True}
+    RUNTIME_STATE["codex_installing"] = True
+    RUNTIME_STATE["codex_install_error"] = ""
+    RUNTIME_STATE["codex_install_message"] = "Installing official Codex CLI..."
+    try:
+        system = platform.system()
+        if system == "Windows":
+            ps = shutil.which("powershell") or shutil.which("pwsh")
+            if not ps:
+                raise RuntimeError("PowerShell is required to install Codex on Windows")
+            cmd = [ps, "-NoProfile", "-ExecutionPolicy", "ByPass", "-Command", "irm https://chatgpt.com/codex/install.ps1 | iex"]
+        elif system in {"Linux", "Darwin"}:
+            shell = shutil.which("sh") or "/bin/sh"
+            if not shutil.which("curl"):
+                raise RuntimeError("curl is required for the official Codex installer")
+            cmd = [shell, "-c", "curl -fsSL https://chatgpt.com/codex/install.sh | sh"]
+        else:
+            raise RuntimeError(f"Automatic Codex install is not supported on {system}")
+        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=900)
+        if proc.returncode != 0:
+            raise RuntimeError(((proc.stdout or "") + "\n" + (proc.stderr or ""))[-4000:])
+        bin_dir = str(Path.home() / ".codex" / "bin")
+        if bin_dir not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = bin_dir + os.pathsep + os.environ.get("PATH", "")
+        resolved = resolve_command("codex")
+        if not resolved:
+            raise RuntimeError("Codex installer completed, but GameForge could not locate the executable")
+        RUNTIME_STATE["codex_install_message"] = "Codex installed"
+        return {"ok": True, "path": resolved}
+    except Exception as exc:
+        RUNTIME_STATE["codex_install_error"] = str(exc)
+        RUNTIME_STATE["codex_install_message"] = "Codex installation failed"
+        return {"ok": False, "error": str(exc)}
+    finally:
+        RUNTIME_STATE["codex_installing"] = False
+
+
+def ensure_codex_async() -> None:
+    if command_exists("codex") or RUNTIME_STATE["codex_installing"]:
+        return
+    threading.Thread(target=install_codex, daemon=True, name="codex-installer").start()
+
+
+def codex_auth_status() -> dict[str, Any]:
+    if not command_exists("codex"):
+        return {"authenticated": False, "available": False, "message": "Codex is not installed"}
+    try:
+        proc = run_codex(["login", "status"], timeout=15)
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return {"available": True, "authenticated": proc.returncode == 0, "message": output[-2000:] or ("Authenticated" if proc.returncode == 0 else "Sign in required")}
+    except Exception as exc:
+        return {"available": True, "authenticated": False, "message": str(exc)}
+
+
+def start_codex_login(save_login: bool = True) -> dict[str, Any]:
+    if not command_exists("codex"):
+        result = install_codex()
+        if not result.get("ok"):
+            return result
+    args = ["login", "-c", 'cli_auth_credentials_store="auto"']
+    try:
+        command, use_shell = _command_invocation("codex", args)
+        subprocess.Popen(command, shell=use_shell, cwd=str(USER_DATA))
+        RUNTIME_STATE["session_login"] = not save_login
+        return {"ok": True, "started": True, "save_login": save_login, "message": "Complete the official ChatGPT sign-in in your browser."}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def codex_logout() -> dict[str, Any]:
+    if not command_exists("codex"):
+        return {"ok": True, "message": "Codex is not installed"}
+    try:
+        proc = run_codex(["logout"], timeout=30)
+        RUNTIME_STATE["session_login"] = False
+        output = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+        return {"ok": proc.returncode == 0, "message": output[-2000:]}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _logout_session_auth() -> None:
+    if RUNTIME_STATE.get("session_login"):
+        try:
+            codex_logout()
+        except Exception:
+            pass
+
+
+atexit.register(_logout_session_auth)
 
 
 def _command_invocation(name: str, args: list[str]) -> tuple[str | list[str], bool]:
@@ -213,7 +339,7 @@ def _command_invocation(name: str, args: list[str]) -> tuple[str | list[str], bo
     CreateProcess cannot reliably execute those the same way it executes an .exe,
     so route only those shim types through the Windows command processor.
     """
-    resolved = shutil.which(name)
+    resolved = resolve_command(name)
     if not resolved:
         raise FileNotFoundError(f"{name} was not found on PATH")
 
