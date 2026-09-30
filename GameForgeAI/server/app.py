@@ -400,7 +400,7 @@ def start_codex_login(save_login: bool = True) -> dict[str, Any]:
         if not result.get("ok"): return result
     try:
         command, use_shell = _command_invocation("codex", ["login", "-c", 'cli_auth_credentials_store="auto"'])
-        proc = subprocess.Popen(command, shell=use_shell, cwd=str(USER_DATA))
+        proc = subprocess.Popen(command, shell=use_shell, cwd=str(USER_DATA), env=_codex_process_env())
         RUNTIME_STATE["codex_login_process"] = proc
         RUNTIME_STATE["codex_login_in_progress"] = True
         RUNTIME_STATE["codex_login_message"] = "Complete the official ChatGPT sign-in in your browser."
@@ -457,6 +457,17 @@ def _command_invocation(name: str, args: list[str]) -> tuple[str | list[str], bo
     return [resolved, *args], False
 
 
+def _codex_process_env() -> dict[str, str]:
+    """Use Codex's persisted ChatGPT login without stale API-key env overrides."""
+    env = os.environ.copy()
+    # codex exec currently gives these variables precedence over stored ChatGPT
+    # OAuth credentials. A stale/invalid key therefore produces misleading 401s
+    # even while `codex login status` reports a valid ChatGPT login.
+    for name in ("OPENAI_API_KEY", "CODEX_API_KEY"):
+        env.pop(name, None)
+    return env
+
+
 def run_codex(
     args: list[str],
     *,
@@ -474,6 +485,7 @@ def run_codex(
         text=True,
         errors="replace",
         timeout=timeout,
+        env=_codex_process_env(),
     )
 
 
@@ -798,6 +810,11 @@ def agent_loop(project_id: str) -> None:
                 if proc.returncode != 0:
                     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
                     lower = combined.lower()
+                    if "401 unauthorized" in lower:
+                        state.status = "blocked"
+                        state.message = "Codex authentication was rejected (401). GameForge removed API-key environment overrides and preserved the project; sign out/in once if this persists, then Resume."
+                        RUNTIME_STATE["codex_login_message"] = "Codex request rejected (401); re-authentication may be required."
+                        return
                     if any(x in lower for x in ["usage limit", "rate limit", "sign in", "login", "authentication"]):
                         state.status = "blocked"
                         state.message = "Codex stopped for authentication/usage availability. Project state is preserved; resume after resolving it."
