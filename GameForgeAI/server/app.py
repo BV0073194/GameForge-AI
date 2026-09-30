@@ -840,6 +840,11 @@ class AgentState:
     pause_event: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
     input_request: dict[str, Any] | None = None
+    current_task: str = "Idle"
+    current_detail: str = ""
+    task_started_at: str | None = None
+    last_activity_at: str | None = None
+    activity_history: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -859,6 +864,150 @@ MANAGED_PROCESS_META: dict[str, dict[str, Any]] = {}
 APP_SERVER: ThreadingHTTPServer | None = None
 WEB_SESSION = {"last_heartbeat": time.monotonic(), "closing": False, "shutdown_started": False}
 
+
+
+def set_agent_activity(state: AgentState, task: str, detail: str = "", kind: str = "work", *, history: bool = True) -> None:
+    """Publish a concise, user-visible summary of actual autonomous activity."""
+    now = now_iso()
+    changed = task != state.current_task or detail != state.current_detail
+    state.current_task = task
+    state.current_detail = str(_auth_redact(detail or ""))[:1200]
+    state.last_activity_at = now
+    if changed:
+        state.task_started_at = now
+        if history:
+            state.activity_history.append({
+                "at": now,
+                "kind": kind,
+                "task": task,
+                "detail": state.current_detail,
+            })
+            state.activity_history[:] = state.activity_history[-12:]
+    try:
+        p = project_path(state.project_id)
+        write_json(p / ".gameforge" / "live_activity.json", {
+            "status": state.status,
+            "iteration": state.iteration,
+            "task": state.current_task,
+            "detail": state.current_detail,
+            "task_started_at": state.task_started_at,
+            "last_activity_at": state.last_activity_at,
+            "history": state.activity_history,
+        })
+    except Exception:
+        pass
+
+
+def _codex_event_activity(line: str) -> tuple[str, str, str] | None:
+    """Convert Codex JSONL events into safe task summaries without exposing reasoning."""
+    try:
+        event = json.loads(line)
+    except Exception:
+        return None
+    if not isinstance(event, dict):
+        return None
+    etype = str(event.get("type", "") or "")
+    item = event.get("item") if isinstance(event.get("item"), dict) else {}
+    itype = str(item.get("type", "") or "")
+    joined = (etype + " " + itype).lower()
+
+    command = item.get("command") or event.get("command")
+    if command:
+        cmd = str(_auth_redact(str(command))).replace("\r", " ").replace("\n", " ").strip()
+        return ("Running a computer command", cmd[:900], "command")
+    if any(x in joined for x in ("web_search", "search_query", "browser")):
+        return ("Researching", "Checking external technical information needed for the current task.", "research")
+    if any(x in joined for x in ("file_change", "file_write", "apply_patch", "patch")):
+        path_value = item.get("path") or event.get("path") or ""
+        detail = ("Updating " + str(path_value)) if path_value else "Editing project files."
+        return ("Editing project files", detail[:900], "edit")
+    if any(x in joined for x in ("command_execution", "shell", "terminal")):
+        return ("Running project tooling", "A build, diagnostic, install, or test command is active.", "command")
+    if any(x in joined for x in ("agent_message", "message")):
+        text_value = item.get("text") or event.get("text") or ""
+        if text_value:
+            clean = " ".join(str(text_value).split())
+            return ("Reviewing progress", clean[:700], "agent")
+        return ("Reviewing progress", "The AI is evaluating the latest project state.", "agent")
+    if "reasoning" in joined:
+        return ("Analyzing the next step", "The AI is working out what to do next.", "analysis")
+    if "turn.started" in etype:
+        return ("Starting AI work", "Reading the project state and choosing the next concrete action.", "agent")
+    if "turn.completed" in etype:
+        return ("Finishing AI work", "The current AI work pass finished; GameForge is moving to verification.", "agent")
+    return None
+
+
+def run_codex_agent_stream(
+    args: list[str],
+    *,
+    cwd: Path,
+    input_text: str,
+    timeout: int,
+    trace_path: Path,
+    state: AgentState,
+) -> subprocess.CompletedProcess[str]:
+    """Run Codex while streaming JSONL into the live task panel and trace file."""
+    command, use_shell = _command_invocation("codex", args)
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    proc = subprocess.Popen(
+        command,
+        cwd=str(cwd),
+        shell=use_shell,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        errors="replace",
+        env=_codex_process_env(),
+    )
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    trace_lock = threading.Lock()
+
+    def read_stdout() -> None:
+        if proc.stdout is None:
+            return
+        with trace_path.open("a", encoding="utf-8", errors="replace", buffering=1) as trace:
+            for line in proc.stdout:
+                stdout_lines.append(line)
+                if len(stdout_lines) > 5000:
+                    del stdout_lines[:1000]
+                with trace_lock:
+                    trace.write(line)
+                activity = _codex_event_activity(line)
+                if activity:
+                    set_agent_activity(state, *activity)
+
+    def read_stderr() -> None:
+        if proc.stderr is None:
+            return
+        for line in proc.stderr:
+            stderr_lines.append(line)
+            if len(stderr_lines) > 3000:
+                del stderr_lines[:500]
+            # stderr proves the child is still active even when it is not JSONL.
+            state.last_activity_at = now_iso()
+
+    out_thread = threading.Thread(target=read_stdout, daemon=True, name=f"codex-live-out-{state.project_id}")
+    err_thread = threading.Thread(target=read_stderr, daemon=True, name=f"codex-live-err-{state.project_id}")
+    out_thread.start(); err_thread.start()
+    if proc.stdin is not None:
+        proc.stdin.write(input_text)
+        proc.stdin.close()
+    try:
+        returncode = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+        raise
+    finally:
+        out_thread.join(timeout=3)
+        err_thread.join(timeout=3)
+    return subprocess.CompletedProcess(command, returncode, "".join(stdout_lines), "".join(stderr_lines))
 
 
 def git_checkpoint(p: Path, message: str) -> dict[str, Any]:
@@ -1019,6 +1168,7 @@ def agent_loop(project_id: str) -> None:
             # report logged in yet send Responses requests with no Authorization
             # header. Verify the real request path before consuming an iteration.
             # Run this before incrementing so a failed auth check remains iteration 0.
+            set_agent_activity(state, "Checking AI runtime", "Verifying Codex authentication and inference before starting this iteration.", "check")
             auth_check = codex_auth_preflight(p)
             if not auth_check.get("ok"):
                 state.status = "blocked"
@@ -1035,6 +1185,7 @@ def agent_loop(project_id: str) -> None:
             iteration = state.iteration
             state.last_update = now_iso()
             state.message = f"Iteration {iteration}: checkpointing and asking Codex to improve the playable result"
+            set_agent_activity(state, "Saving a safety checkpoint", f"Creating the pre-iteration Git checkpoint for iteration {iteration}.", "checkpoint")
             git_checkpoint(p, f"GameForge pre-iteration {iteration}")
             prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result, recovery_context)
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
@@ -1057,18 +1208,22 @@ def agent_loop(project_id: str) -> None:
             codex_args.append("-")
             started = time.time()
             try:
-                proc = run_codex(
+                trace_path.write_text("", encoding="utf-8")
+                set_agent_activity(state, "AI is working on the project", "Codex is reading, editing, diagnosing, building, or testing. Live command activity will appear here.", "agent")
+                proc = run_codex_agent_stream(
                     codex_args,
                     cwd=p,
                     input_text=prompt,
                     timeout=max(timeout, 3600),
+                    trace_path=trace_path,
+                    state=state,
                 )
-                trace_path.write_text(proc.stdout or "", encoding="utf-8")
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 pending_input = detect_agent_input_request(p)
                 if pending_input:
                     state.status = "waiting_for_user"
                     state.message = pending_input.get("message") or "Waiting for required user input"
+                    set_agent_activity(state, "Waiting for your input", state.message, "waiting")
                     state.input_request = pending_input
                     return
                 if proc.returncode != 0:
@@ -1154,8 +1309,10 @@ def agent_loop(project_id: str) -> None:
             cfg = project_config(project_id)  # reload in case commands changed
             commands = cfg.get("commands", {})
             state.message = f"Iteration {iteration}: running configured build"
+            set_agent_activity(state, "Building the project", commands.get("build", "") or "No custom build command is configured; verifying build state.", "build")
             build_result = run_shell(commands.get("build", ""), p, timeout, p / f"logs/build-{iteration:04d}.log")
             state.message = f"Iteration {iteration}: running configured tests"
+            set_agent_activity(state, "Running tests", commands.get("test", "") or "No custom test command is configured; verifying available evidence.", "test")
             test_result = run_shell(commands.get("test", ""), p, timeout, p / f"logs/test-{iteration:04d}.log")
 
             failed_steps = []
@@ -1194,11 +1351,13 @@ def agent_loop(project_id: str) -> None:
                 git_checkpoint(p, f"GameForge verified completion iteration {iteration}")
                 state.status = "complete"
                 state.message = "Acceptance criteria are marked complete with evidence and configured build/tests pass."
+                set_agent_activity(state, "Project verified complete", state.message, "complete")
                 return
 
             git_checkpoint(p, f"GameForge iteration {iteration} progress")
             state.last_update = now_iso()
             state.message = f"Iteration {iteration} incomplete; continuing after evidence/regression checks"
+            set_agent_activity(state, "Preparing the next improvement pass", state.message, "loop")
             time.sleep(cooldown)
     except Exception as exc:
         state.status = "error"
@@ -1226,7 +1385,21 @@ def start_agent(project_id: str) -> dict[str, Any]:
 
 
 def agent_public(s: AgentState) -> dict[str, Any]:
-    return {"project_id": s.project_id, "status": s.status, "iteration": s.iteration, "message": s.message, "started_at": s.started_at, "last_update": s.last_update}
+    return {
+        "project_id": s.project_id,
+        "status": s.status,
+        "iteration": s.iteration,
+        "message": s.message,
+        "started_at": s.started_at,
+        "last_update": s.last_update,
+        "activity": {
+            "task": s.current_task,
+            "detail": s.current_detail,
+            "task_started_at": s.task_started_at,
+            "last_activity_at": s.last_activity_at,
+            "history": s.activity_history[-12:],
+        },
+    }
 
 
 def cv_loop(project_id: str) -> None:
