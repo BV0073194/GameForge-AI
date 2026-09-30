@@ -767,6 +767,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
         ],
     }
     write_json(p / ".gameforge/acceptance.json", acceptance)
+    save_user_review(p, {"user_done": False, "satisfaction": None, "feedback": []})
     (p / "AGENTS.md").write_text(UNIVERSAL_AGENTS.format(goal=goal.strip(), research=cfg["research_mode"]), encoding="utf-8")
     (p / "UPLOAD/README.txt").write_text(UPLOAD_README, encoding="utf-8")
     if command_exists("git"):
@@ -910,6 +911,39 @@ def detect_agent_input_request(p: Path) -> dict[str, Any] | None:
     write_json(user_input_request_path(p), req)
     return req
 
+def user_review_path(p: Path) -> Path:
+    return p / ".gameforge" / "user_review.json"
+
+
+def load_user_review(p: Path) -> dict[str, Any]:
+    data = read_json(user_review_path(p), {}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("user_done", False)
+    data.setdefault("satisfaction", None)
+    data.setdefault("feedback", [])
+    return data
+
+
+def save_user_review(p: Path, data: dict[str, Any]) -> dict[str, Any]:
+    data["updated_at"] = now_iso()
+    write_json(user_review_path(p), data)
+    return data
+
+
+def append_user_feedback(p: Path, text: str, category: str = "general") -> dict[str, Any]:
+    review = load_user_review(p)
+    feedback = review.setdefault("feedback", [])
+    feedback.append({
+        "id": f"feedback-{int(time.time() * 1000)}",
+        "created_at": now_iso(),
+        "category": category or "general",
+        "text": text.strip(),
+        "addressed": False,
+    })
+    return save_user_review(p, review)
+
+
 def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: dict[str, Any]) -> bool:
     acc = read_json(p / ".gameforge/acceptance.json", {}) or {}
     criteria = acc.get("criteria") or []
@@ -926,7 +960,13 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
 
 def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_result: dict[str, Any] | None, test_result: dict[str, Any] | None, recovery_context: dict[str, Any] | None = None) -> str:
     evidence = collect_logs(p, cfg)
+    review = load_user_review(p)
     prior = ""
+    feedback_items = review.get("feedback", [])[-20:]
+    if feedback_items:
+        prior += "\nLatest user review/feedback (highest priority product direction):\n" + json.dumps(feedback_items, indent=2)[-18000:]
+    if review.get("satisfaction") is not None:
+        prior += f"\nUser satisfaction: {review.get('satisfaction')}/5\n"
     if build_result is not None:
         prior += "\nPrevious build result:\n" + json.dumps({k:v for k,v in build_result.items() if k != "output"}, indent=2) + "\n" + build_result.get("output", "")[-12000:]
     if test_result is not None:
@@ -963,6 +1003,11 @@ def agent_loop(project_id: str) -> None:
             state.message = "Codex CLI not found. Install it and sign in with your ChatGPT account."
             return
         while not state.stop_event.is_set():
+            review = load_user_review(p)
+            if review.get("user_done"):
+                state.status = "user-complete"
+                state.message = "User marked this result done. Reopen it from User Review to continue from this exact state."
+                return
             while state.pause_event.is_set() and not state.stop_event.is_set():
                 state.status = "paused"
                 time.sleep(0.5)
@@ -1705,6 +1750,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({
                     "config": cfg,
                     "acceptance": read_json(p / ".gameforge/acceptance.json", {}),
+                    "user_review": load_user_review(p),
                     "evidence": read_json(p / ".gameforge/last_evidence.json", {}),
                     "uploads": read_json(p / ".gameforge/upload_manifest.json", {"count": 0, "items": []}),
                     "agent": agent_public(st) if st else {"status":"idle","iteration":0,"message":""},
@@ -1872,6 +1918,62 @@ class Handler(SimpleHTTPRequestHandler):
                 if st and st.status == "waiting_for_user":
                     st.status = "paused"; st.message = "User input received; ready to resume"
                 return self.send_json({"ok": True, "resume_after_submit": bool(req.get("resume_after_submit", True))})
+            if action == "review/feedback":
+                body = self.body_json()
+                text_value = str(body.get("text", "") or "").strip()
+                if not text_value:
+                    return self.send_json({"error": "Feedback cannot be empty"}, 400)
+                category = str(body.get("category", "general") or "general")[:80]
+                review = append_user_feedback(p, text_value, category)
+                # New feedback means there is new work to do even if the user previously
+                # considered the project done.
+                if review.get("user_done"):
+                    review["user_done"] = False
+                    review["reopened_at"] = now_iso()
+                    save_user_review(p, review)
+                st = AGENTS.get(pid)
+                if st and st.status == "user-complete":
+                    st.status = "paused"
+                    st.message = "New user feedback received; ready to continue from the current state"
+                return self.send_json(load_user_review(p))
+            if action == "review/satisfaction":
+                body = self.body_json()
+                raw = body.get("value")
+                value = None if raw in (None, "") else int(raw)
+                if value is not None and not 1 <= value <= 5:
+                    return self.send_json({"error": "Satisfaction must be from 1 to 5"}, 400)
+                review = load_user_review(p)
+                review["satisfaction"] = value
+                review["satisfaction_updated_at"] = now_iso()
+                return self.send_json(save_user_review(p, review))
+            if action == "review/done":
+                body = self.body_json()
+                done = bool(body.get("done", True))
+                review = load_user_review(p)
+                review["user_done"] = done
+                if done:
+                    review["marked_done_at"] = now_iso()
+                    review["done_iteration"] = AGENTS.get(pid).iteration if AGENTS.get(pid) else None
+                    checkpoint = git_checkpoint(p, "GameForge user-marked done checkpoint")
+                    review["done_checkpoint"] = checkpoint.get("rev", "")
+                    st = AGENTS.get(pid)
+                    if st:
+                        st.pause_event.set()
+                        st.status = "user-complete"
+                        st.message = "User marked this result done"
+                else:
+                    review["reopened_at"] = now_iso()
+                    st = AGENTS.get(pid)
+                    if st:
+                        st.pause_event.clear()
+                        if st.thread and st.thread.is_alive():
+                            st.status = "running"
+                            st.message = "User reopened the project; continuing from the saved state"
+                    # If the previous agent thread already exited because it was user-complete,
+                    # start a fresh loop against the same files/Git history.
+                    if not st or not st.thread or not st.thread.is_alive():
+                        start_agent(pid)
+                return self.send_json(save_user_review(p, review))
             if action in {"run/build","run/test","run/launch"}:
                 which = action.split("/")[1]
                 cmd = cfg.get("commands", {}).get(which, "")
