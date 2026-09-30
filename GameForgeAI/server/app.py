@@ -649,10 +649,18 @@ def run_codex(
     )
 
 
-def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | None = None) -> dict[str, Any]:
+def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | None = None, activity_state: AgentState | None = None) -> dict[str, Any]:
     if not command.strip():
         return {"configured": False, "ok": True, "exit_code": None, "output": ""}
     started = time.time()
+    heartbeat_stop = threading.Event()
+    heartbeat_thread: threading.Thread | None = None
+    if activity_state is not None:
+        def shell_heartbeat() -> None:
+            while not heartbeat_stop.wait(2.0):
+                set_agent_activity(activity_state, activity_state.current_task or "Running project tooling", activity_state.current_detail or command, "heartbeat", history=False)
+        heartbeat_thread = threading.Thread(target=shell_heartbeat, daemon=True, name=f"shell-heartbeat-{activity_state.project_id}")
+        heartbeat_thread.start()
     try:
         proc = subprocess.run(
             command,
@@ -682,6 +690,9 @@ def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | Non
         }
     except Exception as exc:
         result = {"configured": True, "ok": False, "exit_code": None, "output": repr(exc)}
+    heartbeat_stop.set()
+    if heartbeat_thread:
+        heartbeat_thread.join(timeout=1)
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(result["output"], encoding="utf-8", errors="replace")
@@ -964,6 +975,13 @@ def run_codex_agent_stream(
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     trace_lock = threading.Lock()
+    heartbeat_stop = threading.Event()
+
+    def heartbeat() -> None:
+        while not heartbeat_stop.wait(2.0):
+            if proc.poll() is not None:
+                return
+            set_agent_activity(state, state.current_task or "Working", state.current_detail, "heartbeat", history=False)
 
     def read_stdout() -> None:
         if proc.stdout is None:
@@ -991,7 +1009,8 @@ def run_codex_agent_stream(
 
     out_thread = threading.Thread(target=read_stdout, daemon=True, name=f"codex-live-out-{state.project_id}")
     err_thread = threading.Thread(target=read_stderr, daemon=True, name=f"codex-live-err-{state.project_id}")
-    out_thread.start(); err_thread.start()
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True, name=f"codex-live-heartbeat-{state.project_id}")
+    out_thread.start(); err_thread.start(); heartbeat_thread.start()
     if proc.stdin is not None:
         proc.stdin.write(input_text)
         proc.stdin.close()
@@ -1005,8 +1024,10 @@ def run_codex_agent_stream(
             proc.kill()
         raise
     finally:
+        heartbeat_stop.set()
         out_thread.join(timeout=3)
         err_thread.join(timeout=3)
+        heartbeat_thread.join(timeout=1)
     return subprocess.CompletedProcess(command, returncode, "".join(stdout_lines), "".join(stderr_lines))
 
 
@@ -1310,10 +1331,10 @@ def agent_loop(project_id: str) -> None:
             commands = cfg.get("commands", {})
             state.message = f"Iteration {iteration}: running configured build"
             set_agent_activity(state, "Building the project", commands.get("build", "") or "No custom build command is configured; verifying build state.", "build")
-            build_result = run_shell(commands.get("build", ""), p, timeout, p / f"logs/build-{iteration:04d}.log")
+            build_result = run_shell(commands.get("build", ""), p, timeout, p / f"logs/build-{iteration:04d}.log", activity_state=state)
             state.message = f"Iteration {iteration}: running configured tests"
             set_agent_activity(state, "Running tests", commands.get("test", "") or "No custom test command is configured; verifying available evidence.", "test")
-            test_result = run_shell(commands.get("test", ""), p, timeout, p / f"logs/test-{iteration:04d}.log")
+            test_result = run_shell(commands.get("test", ""), p, timeout, p / f"logs/test-{iteration:04d}.log", activity_state=state)
 
             failed_steps = []
             if build_result.get("configured") and not build_result.get("ok"):
