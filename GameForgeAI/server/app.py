@@ -207,6 +207,42 @@ def tail_text(path: Path, max_bytes: int = 40000) -> str:
         return ""
 
 
+def refresh_windows_environment() -> dict[str, Any]:
+    """Refresh this process from canonical Windows Machine + User environment.
+
+    Long-running Explorer/terminal processes can hand GameForge a stale PATH after
+    installers update the registry. Read the current values directly without
+    mutating the user's configuration.
+    """
+    if os.name != "nt":
+        return {"refreshed": False, "reason": "not-windows"}
+    try:
+        import winreg
+        def reg_value(root, key_path: str, name: str) -> str:
+            try:
+                with winreg.OpenKey(root, key_path) as key:
+                    value, _ = winreg.QueryValueEx(key, name)
+                    return os.path.expandvars(str(value))
+            except OSError:
+                return ""
+        machine = reg_value(winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment", "Path")
+        user = reg_value(winreg.HKEY_CURRENT_USER, r"Environment", "Path")
+        entries, seen = [], set()
+        for raw in (machine, user):
+            for item in raw.split(";"):
+                item = os.path.expandvars(item.strip().strip('"'))
+                key = item.rstrip("\\/").lower()
+                if item and key not in seen:
+                    seen.add(key)
+                    entries.append(item)
+        if entries:
+            os.environ["PATH"] = os.pathsep.join(entries)
+        return {"refreshed": True, "path_entries": len(entries)}
+    except Exception as exc:
+        return {"refreshed": False, "error": str(exc)}
+
+
 def _codex_candidates() -> list[Path]:
     exe = "codex.exe" if os.name == "nt" else "codex"
     candidates = [
@@ -227,6 +263,8 @@ def _codex_candidates() -> list[Path]:
 
 
 def resolve_command(name: str) -> str | None:
+    if os.name == "nt":
+        refresh_windows_environment()
     # Prefer GameForge/native Codex over npm shims. A codex.cmd can exist on
     # Windows while its Node runtime is missing, which otherwise looks installed
     # until every agent iteration fails with '"node" is not recognized'.
@@ -1417,6 +1455,7 @@ def main() -> None:
     if args.project_file:
         selected_project, _, _ = open_gfai_file(args.project_file)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    refresh_windows_environment()
     ensure_codex_async()
     url = f"http://127.0.0.1:{args.port}"
     if selected_project:
