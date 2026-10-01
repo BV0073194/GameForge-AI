@@ -1110,7 +1110,101 @@ def append_user_feedback(p: Path, text: str, category: str = "general") -> dict[
         "category": category or "general",
         "text": text.strip(),
         "addressed": False,
+        "status": "pending",
+        "resolution": "",
+        "evidence": "",
     })
+    return save_user_review(p, review)
+
+
+def pending_user_feedback(p: Path) -> list[dict[str, Any]]:
+    review = load_user_review(p)
+    return [
+        item for item in review.get("feedback", [])
+        if isinstance(item, dict) and not bool(item.get("addressed"))
+    ]
+
+
+def reconcile_feedback_work_orders(
+    p: Path,
+    before: dict[str, Any],
+    build_result: dict[str, Any] | None = None,
+    test_result: dict[str, Any] | None = None,
+    *,
+    verification_complete: bool,
+) -> dict[str, Any]:
+    """Protect user feedback and only accept agent resolutions backed by verification."""
+    review = load_user_review(p)
+    current_items = [x for x in review.get("feedback", []) if isinstance(x, dict)]
+    before_items = [x for x in before.get("feedback", []) if isinstance(x, dict)]
+    before_by_id = {str(x.get("id")): x for x in before_items if x.get("id")}
+    current_by_id = {str(x.get("id")): x for x in current_items if x.get("id")}
+
+    # The autonomous agent may update resolution fields, but it may not silently
+    # delete or rewrite the user's actual request/category/timestamp.
+    for old in before_items:
+        feedback_id = str(old.get("id") or "")
+        if feedback_id and feedback_id not in current_by_id:
+            restored = dict(old)
+            current_items.append(restored)
+            current_by_id[feedback_id] = restored
+
+    build_failed = bool(build_result and build_result.get("configured") and not build_result.get("ok"))
+    test_failed = bool(test_result and test_result.get("configured") and not test_result.get("ok"))
+
+    for item in current_items:
+        feedback_id = str(item.get("id") or "")
+        old = before_by_id.get(feedback_id)
+        if old:
+            for immutable in ("id", "created_at", "category", "text"):
+                if immutable in old:
+                    item[immutable] = old[immutable]
+
+        was_addressed = bool(old and old.get("addressed"))
+        wants_addressed = bool(item.get("addressed"))
+
+        if was_addressed:
+            # Once verified, keep the work order resolved unless the user creates
+            # new feedback describing another change.
+            item["addressed"] = True
+            item["status"] = "addressed"
+            item.setdefault("addressed_at", old.get("addressed_at") or now_iso())
+            if old:
+                item.setdefault("resolution", old.get("resolution", ""))
+                item.setdefault("evidence", old.get("evidence", ""))
+            continue
+
+        if wants_addressed:
+            resolution = str(item.get("resolution", "") or "").strip()
+            evidence = str(item.get("evidence", "") or "").strip()
+            valid = verification_complete and bool(resolution) and bool(evidence) and not build_failed and not test_failed
+            if valid:
+                item["addressed"] = True
+                item["status"] = "addressed"
+                item["addressed_at"] = str(item.get("addressed_at") or now_iso())
+                item.pop("verification_error", None)
+            else:
+                item["addressed"] = False
+                item["status"] = "pending"
+                item.pop("addressed_at", None)
+                reasons = []
+                if not verification_complete:
+                    reasons.append("iteration verification did not complete")
+                if not resolution:
+                    reasons.append("missing resolution summary")
+                if not evidence:
+                    reasons.append("missing concrete evidence")
+                if build_failed:
+                    reasons.append("configured build failed")
+                if test_failed:
+                    reasons.append("configured tests failed")
+                item["verification_error"] = "; ".join(reasons) or "resolution was not verified"
+        else:
+            item["addressed"] = False
+            item["status"] = "pending"
+            item.pop("addressed_at", None)
+
+    review["feedback"] = current_items
     return save_user_review(p, review)
 
 
@@ -1120,6 +1214,10 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
     if not acc.get("project_complete") or not criteria:
         return False
     if any(c.get("status") != "pass" or not str(c.get("evidence", "")).strip() for c in criteria):
+        return False
+    # User feedback is a persistent work-order queue. Technical acceptance alone
+    # cannot complete the project while a user-requested change is still pending.
+    if pending_user_feedback(p):
         return False
     if build_result.get("configured") and not build_result.get("ok"):
         return False
@@ -1132,9 +1230,13 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     evidence = collect_logs(p, cfg)
     review = load_user_review(p)
     prior = ""
-    feedback_items = review.get("feedback", [])[-20:]
-    if feedback_items:
-        prior += "\nLatest user review/feedback (highest priority product direction):\n" + json.dumps(feedback_items, indent=2)[-18000:]
+    feedback_items = [x for x in review.get("feedback", []) if isinstance(x, dict)]
+    pending_feedback = [x for x in feedback_items if not bool(x.get("addressed"))]
+    if pending_feedback:
+        prior += "\nPENDING USER FEEDBACK WORK ORDERS (highest priority; do not silently skip):\n" + json.dumps(pending_feedback[-20:], indent=2)[-18000:]
+    addressed_feedback = [x for x in feedback_items if bool(x.get("addressed"))]
+    if addressed_feedback:
+        prior += "\nRecently addressed user feedback (context only):\n" + json.dumps(addressed_feedback[-8:], indent=2)[-7000:]
     if review.get("satisfaction") is not None:
         prior += f"\nUser satisfaction: {review.get('satisfaction')}/5\n"
     if build_result is not None:
@@ -1145,6 +1247,8 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
         prior += "\nAutomatic recovery context:\n" + json.dumps(recovery_context, indent=2)[-16000:]
     research = cfg.get("research_mode", "deep")
     return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\nRead AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything.\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
+
+USER FEEDBACK WORK-ORDER CONTRACT: Every entry in .gameforge/user_review.json with addressed=false is a persistent requirement and takes priority over lower-value roadmap polish. Do not merely acknowledge it. Implement the requested change, build/run the relevant result, and verify the user's requested behavior or appearance with concrete evidence. Only after verification may you update that same feedback entry to addressed=true and status="addressed". When doing so, preserve id/created_at/category/text exactly and add non-empty "resolution" (what changed), "evidence" (specific test/log/capture/runtime proof), and "addressed_at". If verification is incomplete, a configured build/test fails, or the request is blocked, keep addressed=false/status="pending" and explain the blocker in iteration notes. Never delete a feedback entry. GameForge will reject unsupported resolution claims and will not accept project completion while any feedback work order remains pending.
 
 Treat build/runtime warnings, dependency errors, WSL issues, toolchain failures, crashes, missing packages, configuration mistakes, and environment problems as live diagnostic signals. For every recoverable issue: read the exact output, identify the root cause, apply the smallest safe reversible fix, rerun the exact failed step, verify it, and continue toward the playable result. Install missing dependencies autonomously from official package managers or authoritative upstream sources when allowed. Prefer project-local or user-local installs, unattended/non-interactive flags, and pinned/reproducible versions. Never open terminal windows just to run WSL, PowerShell, package managers, compilers, or tests; keep diagnostics and repairs headless and capture their output. In WSL, prefer non-interactive commands and repair filesystem/tool configuration rather than repeatedly tolerating the same warning. Do not ask the user to perform routine debugging, install ordinary development dependencies, copy files between project folders, edit configs, or rerun commands that you can safely do yourself.
 
@@ -1208,6 +1312,7 @@ def agent_loop(project_id: str) -> None:
             state.message = f"Iteration {iteration}: checkpointing and asking Codex to improve the playable result"
             set_agent_activity(state, "Saving a safety checkpoint", f"Creating the pre-iteration Git checkpoint for iteration {iteration}.", "checkpoint")
             git_checkpoint(p, f"GameForge pre-iteration {iteration}")
+            review_before_iteration = load_user_review(p)
             prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result, recovery_context)
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
             final_path = p / f"logs/codex-iteration-{iteration:04d}.final.txt"
@@ -1242,12 +1347,18 @@ def agent_loop(project_id: str) -> None:
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 pending_input = detect_agent_input_request(p)
                 if pending_input:
+                    reconcile_feedback_work_orders(
+                        p, review_before_iteration, verification_complete=False
+                    )
                     state.status = "waiting_for_user"
                     state.message = pending_input.get("message") or "Waiting for required user input"
                     set_agent_activity(state, "Waiting for your input", state.message, "waiting")
                     state.input_request = pending_input
                     return
                 if proc.returncode != 0:
+                    reconcile_feedback_work_orders(
+                        p, review_before_iteration, verification_complete=False
+                    )
                     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
                     lower = combined.lower()
                     if "401 unauthorized" in lower:
@@ -1298,6 +1409,9 @@ def agent_loop(project_id: str) -> None:
                 recovery_failures = 0
                 recovery_context = None
             except subprocess.TimeoutExpired as exc:
+                reconcile_feedback_work_orders(
+                    p, review_before_iteration, verification_complete=False
+                )
                 recovery_failures += 1
                 recovery_context = {
                     "kind": "codex_timeout",
@@ -1322,6 +1436,9 @@ def agent_loop(project_id: str) -> None:
                 return
 
             if load_user_review(p).get("user_done"):
+                reconcile_feedback_work_orders(
+                    p, review_before_iteration, verification_complete=False
+                )
                 git_checkpoint(p, f"GameForge user-marked done after iteration {iteration}")
                 state.status = "user-complete"
                 state.message = "User marked this result done. Current work is checkpointed; reopen it to continue from here."
@@ -1335,6 +1452,18 @@ def agent_loop(project_id: str) -> None:
             state.message = f"Iteration {iteration}: running configured tests"
             set_agent_activity(state, "Running tests", commands.get("test", "") or "No custom test command is configured; verifying available evidence.", "test")
             test_result = run_shell(commands.get("test", ""), p, timeout, p / f"logs/test-{iteration:04d}.log", activity_state=state)
+
+            review_after_verification = reconcile_feedback_work_orders(
+                p,
+                review_before_iteration,
+                build_result,
+                test_result,
+                verification_complete=True,
+            )
+            pending_feedback_count = sum(
+                1 for item in review_after_verification.get("feedback", [])
+                if isinstance(item, dict) and not bool(item.get("addressed"))
+            )
 
             failed_steps = []
             if build_result.get("configured") and not build_result.get("ok"):
@@ -1365,6 +1494,7 @@ def agent_loop(project_id: str) -> None:
                 "build": {k:v for k,v in build_result.items() if k != "output"},
                 "test": {k:v for k,v in test_result.items() if k != "output"},
                 "visual": read_json(p / "captures/metrics.json", {}),
+                "pending_user_feedback": pending_feedback_count,
             }
             write_json(p / ".gameforge/last_evidence.json", evidence)
 
@@ -1377,7 +1507,10 @@ def agent_loop(project_id: str) -> None:
 
             git_checkpoint(p, f"GameForge iteration {iteration} progress")
             state.last_update = now_iso()
-            state.message = f"Iteration {iteration} incomplete; continuing after evidence/regression checks"
+            if pending_feedback_count:
+                state.message = f"Iteration {iteration} incomplete; {pending_feedback_count} user feedback work order(s) still pending"
+            else:
+                state.message = f"Iteration {iteration} incomplete; continuing after evidence/regression checks"
             set_agent_activity(state, "Preparing the next improvement pass", state.message, "loop")
             time.sleep(cooldown)
     except Exception as exc:
