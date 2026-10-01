@@ -108,15 +108,27 @@ function renderUserReview(r){
  const done=!!r.user_done;
  $('#markUserDone').hidden=done;
  $('#reopenUserDone').hidden=!done;
+ const allFeedback=(r.feedback||[]);
+ const pendingCount=allFeedback.filter(x=>!x?.addressed).length;
  if(done){
    const checkpoint=r.done_checkpoint?(' • checkpoint '+r.done_checkpoint.slice(0,10)):'';
    $('#userReviewStatus').textContent='You marked this result done. GameForge is holding this state'+checkpoint+'. You can reopen it at any time.';
  }else if(!$('#userReviewStatus').dataset.local){
-   $('#userReviewStatus').textContent=r.satisfaction?('Current satisfaction: '+r.satisfaction+'/5'):'Add feedback whenever what you see differs from what you want.';
+   const satisfactionText=r.satisfaction?(' • satisfaction '+r.satisfaction+'/5'):'';
+   $('#userReviewStatus').textContent=pendingCount
+     ? pendingCount+' feedback work order'+(pendingCount===1?' is':'s are')+' still pending'+satisfactionText+'.'
+     : (r.satisfaction?('No pending feedback • satisfaction '+r.satisfaction+'/5'):'Add feedback whenever what you see differs from what you want.');
  }
- const items=(r.feedback||[]).slice(-10).reverse();
+ const items=allFeedback.slice(-10).reverse();
  $('#userReviewHistory').innerHTML=items.length
-   ? '<h4>Recent feedback</h4>'+items.map(x=>`<div class="criterion"><strong>${esc(x.category||'feedback')}</strong> — ${esc(x.text||'')}<br><small>${esc(x.created_at||'')}</small></div>`).join('')
+   ? '<h4>Recent feedback</h4>'+items.map(x=>{
+       const addressed=!!x.addressed;
+       const state=addressed?'Addressed':'Pending';
+       const resolution=addressed&&x.resolution?`<br><small><strong>Resolution:</strong> ${esc(x.resolution)}</small>`:'';
+       const evidence=addressed&&x.evidence?`<br><small><strong>Evidence:</strong> ${esc(x.evidence)}</small>`:'';
+       const validation=!addressed&&x.verification_error?`<br><small><strong>Still pending:</strong> ${esc(x.verification_error)}</small>`:'';
+       return `<div class="criterion ${addressed?'pass':'pending'}"><strong>${esc(x.category||'feedback')}</strong> — ${esc(x.text||'')}<br><small><strong>${state}</strong> • ${esc(x.created_at||'')}</small>${resolution}${evidence}${validation}</div>`;
+     }).join('')
    : '';
 }
 async function continueAfterReview(){
@@ -164,7 +176,7 @@ $('#submitFeedback').onclick=async()=>{
    $('#userFeedback').value='';
    renderUserReview(review);
    await continueAfterReview();
-   status.textContent='Feedback saved. The agent is continuing from the current project state with your feedback as priority direction.';
+   status.textContent='Feedback saved as a pending work order. The agent must implement and verify it before GameForge can mark it addressed.';
    setTimeout(()=>{delete status.dataset.local},2500);
    await refreshState();
  }catch(e){status.textContent=e.message;delete status.dataset.local}
