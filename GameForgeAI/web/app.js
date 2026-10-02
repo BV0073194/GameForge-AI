@@ -7,7 +7,7 @@ async function loadSystem(){try{const s=await api('/api/status');const codexText
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function selectProject(id){stopProjectPolling();current=id;inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;acceptanceVisibleCount=5;activityVisibleCount=5;lastAcceptance=null;lastLiveAgent=null;lastManagedProcess=null;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();startProjectPolling()}
-async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderExperiment(d.experiment);renderUploads(d.uploads);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
 function activityAge(iso){
  if(!iso)return 'No activity yet';
  const ms=Date.now()-Date.parse(iso);if(!Number.isFinite(ms))return '';
@@ -131,6 +131,30 @@ function renderUserReview(r){
      }).join('')
    : '';
 }
+function renderExperiment(e){
+ e=e||{role:'original',active:false,promotion_allowed:false,build:{}};
+ const status=$('#experimentStatus');
+ const create=$('#createExperiment');
+ const open=$('#openExperiment');
+ const promote=$('#promoteExperiment');
+ create.hidden=e.role==='experimental'||!!e.active;
+ open.hidden=!(e.role==='original'&&e.active&&e.experimental_project_id);
+ promote.hidden=e.role!=='experimental';
+ promote.disabled=e.role==='experimental'&&!e.promotion_allowed;
+ if(e.role==='experimental'){
+   const gate=e.promotion_allowed
+     ? 'Promotion is unlocked in this main-channel build.'
+     : 'Promotion is locked until the experimental GameForge branch is merged to main and you run a main-channel build.';
+   status.textContent='Experimental copy • original: '+(e.source_project_path||e.source_project_id||'unknown')+' • initial backup: '+(e.initial_backup_path||'unknown')+'. '+gate;
+   promote.textContent=e.promotion_allowed?'Promote experimental copy to original…':'Promotion locked until main';
+ }else if(e.active){
+   status.textContent='Original project is protected. Experimental copy: '+(e.experimental_project_path||'unknown')+' • initial backup: '+(e.initial_backup_path||'unknown')+'.';
+ }else{
+   const ref=e.build?.ref?(' • build ref '+e.build.ref):'';
+   status.textContent='No experimental copy yet. Creating one will preserve this folder, make a full backup, and register a separate [Experimental] project'+ref+'.';
+ }
+ if(open)open.dataset.projectId=e.experimental_project_id||'';
+}
 async function continueAfterReview(){
  try{
    const r=await postAction('agent/resume');
@@ -207,6 +231,34 @@ $('#reopenUserDone').onclick=async()=>{
    setTimeout(()=>{delete status.dataset.local},2500);
    await refreshState();
  }catch(e){status.textContent=e.message;delete status.dataset.local}
+};
+$('#createExperiment').onclick=async()=>{
+ if(!current)return;
+ if(!confirm('Create a full backup of the current project and a separate experimental copy? The original folder will remain unchanged.'))return;
+ const status=$('#experimentStatus');status.textContent='Creating full backup and experimental copy…';
+ try{
+   const r=await postAction('experiment/create',{});
+   await loadProjects();
+   status.textContent='Experimental copy created. Backup: '+(r.initial_backup_path||'created');
+   if(r.experimental_project_id)await selectProject(r.experimental_project_id);
+ }catch(e){status.textContent=e.message}
+};
+$('#openExperiment').onclick=async()=>{
+ const id=$('#openExperiment').dataset.projectId;
+ if(id)await selectProject(id);
+};
+$('#promoteExperiment').onclick=async()=>{
+ if(!current)return;
+ const first=confirm('Promote this experimental project over the original project folder? GameForge will create a fresh pre-promotion backup first. This action is only available from a main-channel build.');
+ if(!first)return;
+ const second=confirm('Final confirmation: replace the original project folder with the experimental project contents now?');
+ if(!second)return;
+ const status=$('#experimentStatus');status.textContent='Creating pre-promotion backup and replacing the original project…';
+ try{
+   const r=await postAction('experiment/promote',{confirm:true});
+   await loadProjects();
+   if(r.original_project_id)await selectProject(r.original_project_id);
+ }catch(e){status.textContent=e.message}
 };
 $('#scanUploads').onclick=async()=>{try{const r=await postAction('uploads/scan');renderUploads(r)}catch(e){alert(e.message)}};
 $('#uploadBtn').onclick=async()=>{if(!current)return;const files=[...$('#uploadFiles').files];if(!files.length)return alert('Select files.');const cat=$('#uploadCategory').value;for(let i=0;i<files.length;i++){const f=files[i];$('#uploadStatus').textContent=`Uploading ${i+1}/${files.length}: ${f.name}`;const r=await fetch(`/api/project/${current}/upload?category=${encodeURIComponent(cat)}&path=${encodeURIComponent(f.webkitRelativePath||f.name)}`,{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':f.name},body:f});if(!r.ok)throw new Error(await r.text())}$('#uploadStatus').textContent='Upload complete. Scanning…';const m=await postAction('uploads/scan');renderUploads(m);$('#uploadStatus').textContent='Upload intake complete.'};
