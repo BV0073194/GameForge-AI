@@ -1,0 +1,48 @@
+name: Experimental Fast Pipeline Smoke
+
+on:
+  push:
+    branches:
+      - "experimental/**"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd GameForgeAI
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile backend
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd GameForgeAI
+          python -m py_compile server/app.py
+
+      - name: Run source smoke
+        shell: bash
+        env:
+          PYNPUT_BACKEND: dummy
+        run: |
+          set -euxo pipefail
+          cd GameForgeAI
+          python tests/smoke.py
