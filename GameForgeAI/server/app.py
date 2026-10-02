@@ -691,50 +691,155 @@ def run_codex(
     )
 
 
+def _terminate_process_tree(proc: subprocess.Popen | None, *, grace_sec: float = 1.5) -> None:
+    """Stop a subprocess and its descendants, escalating quickly if needed."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            try:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+                proc.wait(timeout=grace_sec)
+                return
+            except Exception:
+                pass
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, text=True, timeout=8,
+                )
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=grace_sec)
+                return
+            except Exception:
+                pass
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    finally:
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+
+
+def _bind_active_process(state: AgentState | None, proc: subprocess.Popen | None, kind: str) -> None:
+    if state is None:
+        return
+    state.active_process = proc
+    state.active_process_kind = kind if proc is not None else ""
+    state.active_process_started_at = now_iso() if proc is not None else None
+
+
+def stop_agent_now(state: AgentState) -> None:
+    """Request stop and immediately interrupt any active Codex/build/test child tree."""
+    state.stop_event.set()
+    state.pause_event.clear()
+    state.status = "stopping"
+    state.message = "Stopping active AI/build/test process…"
+    set_agent_activity(state, "Stopping", state.message, "stop")
+    _terminate_process_tree(state.active_process, grace_sec=1.0)
+
+
 def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | None = None, activity_state: AgentState | None = None) -> dict[str, Any]:
     if not command.strip():
         return {"configured": False, "ok": True, "exit_code": None, "output": ""}
     started = time.time()
-    heartbeat_stop = threading.Event()
-    heartbeat_thread: threading.Thread | None = None
-    if activity_state is not None:
-        def shell_heartbeat() -> None:
-            while not heartbeat_stop.wait(2.0):
-                set_agent_activity(activity_state, activity_state.current_task or "Running project tooling", activity_state.current_detail or command, "heartbeat", history=False)
-        heartbeat_thread = threading.Thread(target=shell_heartbeat, daemon=True, name=f"shell-heartbeat-{activity_state.project_id}")
-        heartbeat_thread.start()
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    proc: subprocess.Popen | None = None
     try:
-        proc = subprocess.run(
-            command,
-            cwd=str(cwd),
-            shell=True,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-            env=_gameforge_process_env(),
-        )
-        output = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
-        result = {
-            "configured": True,
-            "ok": proc.returncode == 0,
-            "exit_code": proc.returncode,
-            "duration_sec": round(time.time() - started, 2),
-            "output": output[-80000:],
+        kwargs: dict[str, Any] = {
+            "cwd": str(cwd),
+            "shell": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "errors": "replace",
+            "env": _gameforge_process_env(),
         }
-    except subprocess.TimeoutExpired as exc:
-        result = {
-            "configured": True,
-            "ok": False,
-            "exit_code": None,
-            "duration_sec": round(time.time() - started, 2),
-            "output": f"TIMEOUT after {timeout}s\n{(exc.stdout or '')}\n{(exc.stderr or '')}",
-        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen(command, **kwargs)
+        _bind_active_process(activity_state, proc, "project-command")
+
+        def read_pipe(pipe, target: list[str]) -> None:
+            if pipe is None:
+                return
+            for line in pipe:
+                target.append(line)
+                if len(target) > 5000:
+                    del target[:1000]
+
+        out_thread = threading.Thread(target=read_pipe, args=(proc.stdout, stdout_lines), daemon=True)
+        err_thread = threading.Thread(target=read_pipe, args=(proc.stderr, stderr_lines), daemon=True)
+        out_thread.start(); err_thread.start()
+
+        cancelled = False
+        timed_out = False
+        while proc.poll() is None:
+            if activity_state is not None:
+                if activity_state.stop_event.is_set():
+                    cancelled = True
+                    _terminate_process_tree(proc, grace_sec=1.0)
+                    break
+                set_agent_activity(
+                    activity_state,
+                    activity_state.current_task or "Running project tooling",
+                    activity_state.current_detail or command,
+                    "heartbeat",
+                    history=False,
+                )
+            if time.time() - started >= timeout:
+                timed_out = True
+                _terminate_process_tree(proc, grace_sec=1.0)
+                break
+            time.sleep(0.2)
+
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            _terminate_process_tree(proc, grace_sec=0.5)
+        out_thread.join(timeout=2); err_thread.join(timeout=2)
+        output = "".join(stdout_lines) + ("\n" if stdout_lines and stderr_lines else "") + "".join(stderr_lines)
+        if cancelled:
+            result = {
+                "configured": True, "ok": False, "cancelled": True,
+                "exit_code": proc.returncode, "duration_sec": round(time.time() - started, 2),
+                "output": ("STOPPED BY USER\n" + output)[-80000:],
+            }
+        elif timed_out:
+            result = {
+                "configured": True, "ok": False, "timed_out": True,
+                "exit_code": proc.returncode, "duration_sec": round(time.time() - started, 2),
+                "output": (f"TIMEOUT after {timeout}s\n" + output)[-80000:],
+            }
+        else:
+            result = {
+                "configured": True,
+                "ok": proc.returncode == 0,
+                "exit_code": proc.returncode,
+                "duration_sec": round(time.time() - started, 2),
+                "output": output[-80000:],
+            }
     except Exception as exc:
         result = {"configured": True, "ok": False, "exit_code": None, "output": repr(exc)}
-    heartbeat_stop.set()
-    if heartbeat_thread:
-        heartbeat_thread.join(timeout=1)
+    finally:
+        if activity_state is not None and activity_state.active_process is proc:
+            _bind_active_process(activity_state, None, "")
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(result["output"], encoding="utf-8", errors="replace")
@@ -1208,6 +1313,9 @@ class AgentState:
     task_started_at: str | None = None
     last_activity_at: str | None = None
     activity_history: list[dict[str, Any]] = field(default_factory=list)
+    active_process: subprocess.Popen | None = field(default=None, repr=False)
+    active_process_kind: str = ""
+    active_process_started_at: str | None = None
 
 
 @dataclass
@@ -1313,17 +1421,22 @@ def run_codex_agent_stream(
     """Run Codex while streaming JSONL into the live task panel and trace file."""
     command, use_shell = _command_invocation("codex", args)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(
-        command,
-        cwd=str(cwd),
-        shell=use_shell,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-        env=_codex_process_env(),
-    )
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(cwd),
+        "shell": use_shell,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "errors": "replace",
+        "env": _codex_process_env(),
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(command, **popen_kwargs)
+    _bind_active_process(state, proc, "codex")
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     trace_lock = threading.Lock()
@@ -1366,20 +1479,35 @@ def run_codex_agent_stream(
     if proc.stdin is not None:
         proc.stdin.write(input_text)
         proc.stdin.close()
+    timed_out = False
+    cancelled = False
+    deadline = time.time() + timeout
     try:
-        returncode = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        while proc.poll() is None:
+            if state.stop_event.wait(0.15):
+                cancelled = True
+                _terminate_process_tree(proc, grace_sec=1.0)
+                break
+            if time.time() >= deadline:
+                timed_out = True
+                _terminate_process_tree(proc, grace_sec=1.0)
+                break
         try:
-            proc.terminate()
-            proc.wait(timeout=5)
+            returncode = proc.wait(timeout=3)
         except Exception:
-            proc.kill()
-        raise
+            _terminate_process_tree(proc, grace_sec=0.5)
+            returncode = proc.poll() if proc.poll() is not None else -9
+        if timed_out:
+            raise subprocess.TimeoutExpired(command, timeout, output="".join(stdout_lines), stderr="".join(stderr_lines))
     finally:
         heartbeat_stop.set()
         out_thread.join(timeout=3)
         err_thread.join(timeout=3)
         heartbeat_thread.join(timeout=1)
+        if state.active_process is proc:
+            _bind_active_process(state, None, "")
+    if cancelled:
+        stderr_lines.append("\nSTOPPED BY USER\n")
     return subprocess.CompletedProcess(command, returncode, "".join(stdout_lines), "".join(stderr_lines))
 
 
@@ -1752,6 +1880,14 @@ def agent_loop(project_id: str) -> None:
                     state=state,
                 )
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
+                if state.stop_event.is_set():
+                    reconcile_feedback_work_orders(
+                        p, review_before_iteration, verification_complete=False
+                    )
+                    state.status = "stopped"
+                    state.message = "Stopped by user; active Codex work was interrupted and project state was preserved."
+                    set_agent_activity(state, "Stopped", state.message, "stopped")
+                    return
                 pending_input = detect_agent_input_request(p)
                 if pending_input:
                     reconcile_feedback_work_orders(
@@ -1799,14 +1935,16 @@ def agent_loop(project_id: str) -> None:
                         repair = install_codex(force=True)
                         recovery_context["runtime_repair"] = repair
                         if repair.get("ok"):
-                            time.sleep(min(cooldown, 3))
+                            if state.stop_event.wait(min(cooldown, 3)):
+                                return
                             continue
 
                     if recovery_failures < max_auto_recovery:
                         state.status = "self-healing"
                         state.message = f"Iteration {iteration} hit a recoverable tooling/runtime failure; auto-diagnosing and retrying ({recovery_failures}/{max_auto_recovery})"
                         git_checkpoint(p, f"GameForge self-heal checkpoint {iteration}")
-                        time.sleep(min(30.0, max(cooldown, recovery_failures * 2.0)))
+                        if state.stop_event.wait(min(30.0, max(cooldown, recovery_failures * 2.0))):
+                            return
                         continue
 
                     state.status = "blocked"
@@ -1836,7 +1974,8 @@ def agent_loop(project_id: str) -> None:
                 if recovery_failures < max_auto_recovery:
                     state.status = "self-healing"
                     state.message = f"Iteration {iteration} timed out; automatically diagnosing and retrying ({recovery_failures}/{max_auto_recovery})"
-                    time.sleep(min(30.0, max(cooldown, recovery_failures * 2.0)))
+                    if state.stop_event.wait(min(30.0, max(cooldown, recovery_failures * 2.0))):
+                        return
                     continue
                 state.status = "blocked"
                 state.message = f"Automatic recovery exhausted {recovery_failures} timeout attempts. Project state and diagnostics are preserved."
@@ -1856,9 +1995,22 @@ def agent_loop(project_id: str) -> None:
             state.message = f"Iteration {iteration}: running configured build"
             set_agent_activity(state, "Building the project", commands.get("build", "") or "No custom build command is configured; verifying build state.", "build")
             build_result = run_shell(commands.get("build", ""), p, timeout, p / f"logs/build-{iteration:04d}.log", activity_state=state)
+            if state.stop_event.is_set():
+                state.status = "stopped"
+                state.message = "Stopped by user during build; project state preserved."
+                set_agent_activity(state, "Stopped", state.message, "stopped")
+                return
             state.message = f"Iteration {iteration}: running configured tests"
             set_agent_activity(state, "Running tests", commands.get("test", "") or "No custom test command is configured; verifying available evidence.", "test")
             test_result = run_shell(commands.get("test", ""), p, timeout, p / f"logs/test-{iteration:04d}.log", activity_state=state)
+            if state.stop_event.is_set():
+                reconcile_feedback_work_orders(
+                    p, review_before_iteration, build_result, test_result, verification_complete=False
+                )
+                state.status = "stopped"
+                state.message = "Stopped by user during test; project state preserved."
+                set_agent_activity(state, "Stopped", state.message, "stopped")
+                return
 
             review_after_verification = reconcile_feedback_work_orders(
                 p,
@@ -1919,7 +2071,8 @@ def agent_loop(project_id: str) -> None:
             else:
                 state.message = f"Iteration {iteration} incomplete; continuing after evidence/regression checks"
             set_agent_activity(state, "Preparing the next improvement pass", state.message, "loop")
-            time.sleep(cooldown)
+            if state.stop_event.wait(cooldown):
+                return
     except Exception as exc:
         state.status = "error"
         state.message = f"{exc}\n{traceback.format_exc()[-4000:]}"
@@ -1953,6 +2106,12 @@ def agent_public(s: AgentState) -> dict[str, Any]:
         "message": s.message,
         "started_at": s.started_at,
         "last_update": s.last_update,
+        "stop_requested": s.stop_event.is_set(),
+        "active_process": {
+            "kind": s.active_process_kind,
+            "pid": s.active_process.pid if s.active_process and s.active_process.poll() is None else None,
+            "started_at": s.active_process_started_at,
+        },
         "activity": {
             "task": s.current_task,
             "detail": s.current_detail,
@@ -2612,7 +2771,17 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(agent_public(s))
             if action == "agent/stop":
                 s = AGENTS.get(pid)
-                if s: s.stop_event.set(); s.pause_event.clear(); s.message="Stop requested"
+                if s:
+                    stop_agent_now(s)
+                    # Give the loop a brief chance to observe cancellation so the
+                    # response normally returns "stopped" rather than lingering at
+                    # "Stop requested" for an entire Codex/test timeout.
+                    if s.thread and s.thread.is_alive():
+                        s.thread.join(timeout=2.5)
+                    if not s.thread or not s.thread.is_alive():
+                        s.status = "stopped"
+                        s.message = "Stopped by user; project state preserved."
+                        set_agent_activity(s, "Stopped", s.message, "stopped")
                 return self.send_json(agent_public(s) if s else {"status":"idle"})
             if action == "cv/start":
                 return self.send_json(start_cv(pid))
