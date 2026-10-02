@@ -140,6 +140,17 @@
             <div id="userReviewHistory"></div>
           </article>
 
+          <article class="card" id="experimentCard">
+            <h3>Experimental project safety</h3>
+            <p id="experimentStatus" class="muted">This project is not currently isolated for experimental GameForge changes.</p>
+            <div class="actions">
+              <button id="createExperiment" class="primary">Create backup + experimental copy</button>
+              <button id="openExperiment" hidden>Open experimental copy</button>
+              <button id="promoteExperiment" class="danger" hidden>Promote experimental copy to original…</button>
+            </div>
+            <p class="tiny">This control is available only on the experimental GameForge branch. It makes a full backup first, then a separate sibling project folder. Promotion still requires explicit confirmation and a fresh pre-promotion backup.</p>
+          </article>
+
         </div>
 
         <div id="tab-uploads" class="tab">
