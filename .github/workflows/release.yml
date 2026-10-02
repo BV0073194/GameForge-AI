@@ -105,6 +105,31 @@ jobs:
           print("pynput import OK")
           PY
 
+      - name: Stamp build channel
+        shell: bash
+        run: |
+          set -euxo pipefail
+          cd "$GAMEFORGE_ROOT"
+          git fetch origin main --depth=1 || true
+          CHANNEL="${GITHUB_REF_NAME}"
+          if git rev-parse --verify origin/main >/dev/null 2>&1 && git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            CHANNEL="main"
+          elif [[ "$GITHUB_REF_NAME" == experimental/* ]]; then
+            CHANNEL="experimental"
+          fi
+          export CHANNEL
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          Path("build_info.json").write_text(json.dumps({
+              "channel": os.environ["CHANNEL"],
+              "ref": os.environ.get("GITHUB_REF_NAME", ""),
+              "commit": os.environ.get("GITHUB_SHA", ""),
+              "workflow_ref": os.environ.get("GITHUB_REF", ""),
+          }, indent=2), encoding="utf-8")
+          print(Path("build_info.json").read_text())
+          PY
+
       - name: Smoke test source
         shell: bash
         env:

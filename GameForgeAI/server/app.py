@@ -60,6 +60,10 @@ RUNTIME = USER_DATA / "runtime"
 CODEX_RUNTIME = RUNTIME / "codex"
 RUNTIME_STATE = {"codex_installing": False, "codex_install_error": "", "codex_install_message": "", "session_login": False, "codex_login_in_progress": False, "codex_login_message": "", "codex_login_process": None}
 
+EXPERIMENT_FORMAT = "GameForgeAI.Experiment"
+EXPERIMENT_FORMAT_VERSION = 1
+EXPERIMENT_BRANCH = "experimental/fast-iteration-pipeline"
+
 for p in (USER_DATA, PROJECTS, GLOBAL_UPLOAD, GLOBAL_LOGS, RUNTIME, CODEX_RUNTIME):
     p.mkdir(parents=True, exist_ok=True)
 
@@ -157,6 +161,44 @@ def write_json(path: Path, data: Any) -> None:
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
+
+def runtime_build_info() -> dict[str, Any]:
+    """Describe the source/release channel so experimental promotion can be gated safely."""
+    info = read_json(RESOURCE_ROOT / "build_info.json", {}) or {}
+    if not isinstance(info, dict):
+        info = {}
+    branch = str(os.environ.get("GAMEFORGE_BUILD_REF") or info.get("ref") or "").strip()
+    channel = str(os.environ.get("GAMEFORGE_BUILD_CHANNEL") or info.get("channel") or "").strip()
+    commit = str(info.get("commit") or "").strip()
+
+    # Source checkouts can determine their branch directly. Frozen builds use the
+    # build_info.json stamped by CI and bundled by PyInstaller.
+    if not branch and not getattr(sys, "frozen", False) and command_exists("git"):
+        for candidate in (RESOURCE_ROOT, RESOURCE_ROOT.parent):
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", str(candidate), "branch", "--show-current"],
+                    capture_output=True, text=True, timeout=4,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    branch = proc.stdout.strip()
+                    break
+            except Exception:
+                pass
+
+    if not channel:
+        if branch == "main":
+            channel = "main"
+        elif branch.startswith("experimental/"):
+            channel = "experimental"
+        else:
+            channel = branch or "unknown"
+    return {
+        "channel": channel,
+        "ref": branch or info.get("ref") or "",
+        "commit": commit,
+        "experimental_branch": EXPERIMENT_BRANCH,
+    }
 
 
 def load_project_registry() -> dict[str, str]:
@@ -649,50 +691,172 @@ def run_codex(
     )
 
 
+def _terminate_process_tree(proc: subprocess.Popen | None, *, grace_sec: float = 1.5) -> None:
+    """Stop a subprocess and its descendants, escalating quickly if needed."""
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            try:
+                proc.send_signal(signal.CTRL_BREAK_EVENT)
+                proc.wait(timeout=grace_sec)
+                return
+            except Exception:
+                pass
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True, text=True, timeout=8,
+                )
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=grace_sec)
+                return
+            except Exception:
+                pass
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    finally:
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            pass
+
+
+def _bind_active_process(state: AgentState | None, proc: subprocess.Popen | None, kind: str) -> None:
+    if state is None:
+        return
+    state.active_process = proc
+    state.active_process_kind = kind if proc is not None else ""
+    state.active_process_started_at = now_iso() if proc is not None else None
+
+
+def stop_agent_now(state: AgentState) -> None:
+    """Request stop immediately; kill an active child tree without blocking the UI request."""
+    state.stop_event.set()
+    state.pause_event.clear()
+    state.status = "stopping"
+    state.message = "Stopping active AI/build/test process…"
+    set_agent_activity(state, "Stopping", state.message, "stop")
+    proc = state.active_process
+    if proc is not None and proc.poll() is None:
+        threading.Thread(
+            target=_terminate_process_tree,
+            args=(proc,),
+            kwargs={"grace_sec": 1.0},
+            daemon=True,
+            name=f"agent-stop-{state.project_id}",
+        ).start()
+
+
 def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | None = None, activity_state: AgentState | None = None) -> dict[str, Any]:
     if not command.strip():
         return {"configured": False, "ok": True, "exit_code": None, "output": ""}
     started = time.time()
-    heartbeat_stop = threading.Event()
-    heartbeat_thread: threading.Thread | None = None
-    if activity_state is not None:
-        def shell_heartbeat() -> None:
-            while not heartbeat_stop.wait(2.0):
-                set_agent_activity(activity_state, activity_state.current_task or "Running project tooling", activity_state.current_detail or command, "heartbeat", history=False)
-        heartbeat_thread = threading.Thread(target=shell_heartbeat, daemon=True, name=f"shell-heartbeat-{activity_state.project_id}")
-        heartbeat_thread.start()
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    proc: subprocess.Popen | None = None
     try:
-        proc = subprocess.run(
-            command,
-            cwd=str(cwd),
-            shell=True,
-            capture_output=True,
-            text=True,
-            errors="replace",
-            timeout=timeout,
-            env=_gameforge_process_env(),
-        )
-        output = (proc.stdout or "") + ("\n" if proc.stdout and proc.stderr else "") + (proc.stderr or "")
-        result = {
-            "configured": True,
-            "ok": proc.returncode == 0,
-            "exit_code": proc.returncode,
-            "duration_sec": round(time.time() - started, 2),
-            "output": output[-80000:],
+        kwargs: dict[str, Any] = {
+            "cwd": str(cwd),
+            "shell": True,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+            "errors": "replace",
+            "env": _gameforge_process_env(),
         }
-    except subprocess.TimeoutExpired as exc:
-        result = {
-            "configured": True,
-            "ok": False,
-            "exit_code": None,
-            "duration_sec": round(time.time() - started, 2),
-            "output": f"TIMEOUT after {timeout}s\n{(exc.stdout or '')}\n{(exc.stderr or '')}",
-        }
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            kwargs["start_new_session"] = True
+        proc = subprocess.Popen(command, **kwargs)
+        _bind_active_process(activity_state, proc, "project-command")
+
+        def read_pipe(pipe, target: list[str]) -> None:
+            if pipe is None:
+                return
+            for line in pipe:
+                target.append(line)
+                if len(target) > 5000:
+                    del target[:1000]
+
+        out_thread = threading.Thread(target=read_pipe, args=(proc.stdout, stdout_lines), daemon=True)
+        err_thread = threading.Thread(target=read_pipe, args=(proc.stderr, stderr_lines), daemon=True)
+        out_thread.start(); err_thread.start()
+
+        cancelled = False
+        timed_out = False
+        while proc.poll() is None:
+            if activity_state is not None:
+                if activity_state.stop_event.is_set():
+                    cancelled = True
+                    _terminate_process_tree(proc, grace_sec=1.0)
+                    break
+                set_agent_activity(
+                    activity_state,
+                    activity_state.current_task or "Running project tooling",
+                    activity_state.current_detail or command,
+                    "heartbeat",
+                    history=False,
+                )
+            if time.time() - started >= timeout:
+                timed_out = True
+                _terminate_process_tree(proc, grace_sec=1.0)
+                break
+            time.sleep(0.2)
+
+        try:
+            proc.wait(timeout=3)
+        except Exception:
+            _terminate_process_tree(proc, grace_sec=0.5)
+        out_thread.join(timeout=2); err_thread.join(timeout=2)
+
+        # stop_agent_now() terminates the child tree from a separate thread so the
+        # UI remains responsive. On fast exits (notably Windows CTRL_BREAK_EVENT,
+        # which commonly returns 0xC000013A / 3221225786) the process can disappear
+        # before this polling loop gets another chance to set cancelled=True.
+        # The stop_event is therefore the authoritative cancellation signal.
+        if activity_state is not None and activity_state.stop_event.is_set() and not timed_out:
+            cancelled = True
+
+        output = "".join(stdout_lines) + ("\n" if stdout_lines and stderr_lines else "") + "".join(stderr_lines)
+        if cancelled:
+            result = {
+                "configured": True, "ok": False, "cancelled": True,
+                "exit_code": proc.returncode, "duration_sec": round(time.time() - started, 2),
+                "output": ("STOPPED BY USER\n" + output)[-80000:],
+            }
+        elif timed_out:
+            result = {
+                "configured": True, "ok": False, "timed_out": True,
+                "exit_code": proc.returncode, "duration_sec": round(time.time() - started, 2),
+                "output": (f"TIMEOUT after {timeout}s\n" + output)[-80000:],
+            }
+        else:
+            result = {
+                "configured": True,
+                "ok": proc.returncode == 0,
+                "exit_code": proc.returncode,
+                "duration_sec": round(time.time() - started, 2),
+                "output": output[-80000:],
+            }
     except Exception as exc:
         result = {"configured": True, "ok": False, "exit_code": None, "output": repr(exc)}
-    heartbeat_stop.set()
-    if heartbeat_thread:
-        heartbeat_thread.join(timeout=1)
+    finally:
+        if activity_state is not None and activity_state.active_process is proc:
+            _bind_active_process(activity_state, None, "")
     if log_path:
         log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text(result["output"], encoding="utf-8", errors="replace")
@@ -724,6 +888,316 @@ def project_config(project_id: str) -> dict[str, Any]:
     if not cfg:
         raise FileNotFoundError(project_id)
     return cfg
+
+
+def _experiment_meta_path(p: Path) -> Path:
+    return p / ".gameforge" / "experiment.json"
+
+
+def _experiment_link_path(p: Path) -> Path:
+    return p / ".gameforge" / "experimental_link.json"
+
+
+def _tree_size_bytes(root: Path) -> int:
+    total = 0
+    for base, dirs, files in os.walk(root, followlinks=False):
+        for name in files:
+            f = Path(base) / name
+            try:
+                if not f.is_symlink():
+                    total += f.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _copy_project_tree(src: Path, dst: Path) -> None:
+    if dst.exists():
+        raise FileExistsError(str(dst))
+    shutil.copytree(src, dst, symlinks=True, ignore_dangling_symlinks=True)
+
+
+def _snapshot_ready(project_id: str) -> tuple[bool, str]:
+    state = AGENTS.get(project_id)
+    if state and state.thread and state.thread.is_alive() and state.status not in {
+        "paused", "blocked", "complete", "user-complete", "stopped", "error"
+    }:
+        return False, "Pause the autonomous developer between iterations before creating or promoting an experimental snapshot."
+    cv = CVS.get(project_id)
+    if cv and cv.thread and cv.thread.is_alive():
+        cv.stop_event.set()
+        cv.thread.join(timeout=3)
+    proc = managed_process_public(project_id)
+    if proc.get("running"):
+        stopped = stop_managed_process(project_id)
+        if not stopped.get("ok"):
+            return False, "Could not stop the managed game/process safely before snapshotting."
+    return True, ""
+
+
+def experiment_status(p: Path) -> dict[str, Any]:
+    build = runtime_build_info()
+    override = os.environ.get("GAMEFORGE_ALLOW_EXPERIMENT_PROMOTION") == "1"
+    promotion_allowed = build.get("channel") == "main" or override
+    meta = read_json(_experiment_meta_path(p), {}) or {}
+    link = read_json(_experiment_link_path(p), {}) or {}
+    if isinstance(meta, dict) and meta.get("format") == EXPERIMENT_FORMAT:
+        source = Path(str(meta.get("source_project_path", ""))).expanduser()
+        return {
+            "role": "experimental",
+            "active": True,
+            "state": meta.get("state", "active"),
+            "source_project_id": meta.get("source_project_id", ""),
+            "source_project_path": str(source),
+            "initial_backup_path": meta.get("initial_backup_path", ""),
+            "created_at": meta.get("created_at", ""),
+            "promotion_allowed": promotion_allowed,
+            "promotion_gate": "main",
+            "build": build,
+        }
+    if isinstance(link, dict) and link.get("format") == EXPERIMENT_FORMAT:
+        experimental = Path(str(link.get("experimental_project_path", ""))).expanduser()
+        return {
+            "role": "original",
+            "active": experimental.exists(),
+            "experimental_project_id": link.get("experimental_project_id", ""),
+            "experimental_project_path": str(experimental),
+            "initial_backup_path": link.get("initial_backup_path", ""),
+            "created_at": link.get("created_at", ""),
+            "promotion_allowed": False,
+            "promotion_gate": "main",
+            "build": build,
+        }
+    return {
+        "role": "original",
+        "active": False,
+        "promotion_allowed": False,
+        "promotion_gate": "main",
+        "build": build,
+    }
+
+
+def create_experimental_copy(project_id: str) -> dict[str, Any]:
+    p = project_path(project_id).resolve()
+    cfg = project_config(project_id)
+    status = experiment_status(p)
+    if status.get("role") == "experimental":
+        return {"ok": False, "status": 409, "error": "This project is already the experimental copy."}
+    if status.get("active"):
+        return {
+            "ok": True,
+            "existing": True,
+            "experimental_project_id": status.get("experimental_project_id"),
+            "experimental_project_path": status.get("experimental_project_path"),
+            "initial_backup_path": status.get("initial_backup_path"),
+        }
+
+    ready, reason = _snapshot_ready(project_id)
+    if not ready:
+        return {"ok": False, "status": 409, "error": reason}
+
+    source_id = slugify(cfg.get("id") or project_id)
+    exp_id = slugify(f"{source_id}-experimental")
+    exp_root = p.parent / f"{p.name}-experimental"
+    if exp_root.exists():
+        return {"ok": False, "status": 409, "error": f"Experimental folder already exists: {exp_root}"}
+
+    size = _tree_size_bytes(p)
+    free = shutil.disk_usage(p.parent).free
+    required = max(size * 2 + 512 * 1024 * 1024, 1024 * 1024 * 1024)
+    if free < required:
+        return {
+            "ok": False,
+            "status": 507,
+            "error": f"Not enough free disk space for a full backup plus experimental copy. Need about {required // (1024**2)} MiB free.",
+        }
+
+    git_checkpoint(p, "GameForge pre-experimental-copy checkpoint")
+    token = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_root = p.parent / f"{p.name}.gameforge-backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup = backup_root / f"pre-experimental-{token}"
+
+    try:
+        _copy_project_tree(p, backup)
+        _copy_project_tree(p, exp_root)
+    except Exception as exc:
+        if exp_root.exists():
+            shutil.rmtree(exp_root, ignore_errors=True)
+        return {
+            "ok": False,
+            "status": 500,
+            "error": f"Snapshot copy failed. The original project was not modified. {exc}",
+            "backup_path": str(backup) if backup.exists() else "",
+        }
+
+    exp_cfg = read_json(exp_root / "gameforge.json", {}) or {}
+    original_name = str(cfg.get("name") or p.name)
+    exp_cfg["id"] = exp_id
+    exp_cfg["name"] = f"{original_name} [Experimental]"
+    exp_cfg["experimental"] = {
+        "enabled": True,
+        "branch": EXPERIMENT_BRANCH,
+        "source_project_id": source_id,
+        "source_project_path": str(p),
+    }
+    exp_cfg["experimental_pipeline"] = {
+        "enabled": True,
+        "quality_mode": "strict-original",
+        "strict_original_quality": True,
+        "compact_context": True,
+        "targeted_tests_during_ai_turn": True,
+        "targeted_tests_are_diagnostic_only": True,
+        "gameforge_full_verification_after_turn": True,
+        "full_configured_build_required": True,
+        "full_configured_test_required": True,
+        "allow_savestate_for_trusted_evidence": False,
+        "allow_direct_warp_for_trusted_evidence": False,
+        "allow_fast_forward_for_trusted_evidence": False,
+        "batch_related_feedback": True,
+    }
+    write_json(exp_root / "gameforge.json", exp_cfg)
+    for manifest in exp_root.glob("*.gfai"):
+        try:
+            manifest.unlink()
+        except OSError:
+            pass
+    write_gfai_manifest(exp_root, exp_cfg)
+
+    meta = {
+        "format": EXPERIMENT_FORMAT,
+        "format_version": EXPERIMENT_FORMAT_VERSION,
+        "state": "active",
+        "branch": EXPERIMENT_BRANCH,
+        "created_at": now_iso(),
+        "source_project_id": source_id,
+        "source_project_name": original_name,
+        "source_project_path": str(p),
+        "experimental_project_id": exp_id,
+        "experimental_project_path": str(exp_root),
+        "initial_backup_path": str(backup),
+        "created_by_build": runtime_build_info(),
+        "promotion_requires_channel": "main",
+    }
+    write_json(_experiment_meta_path(exp_root), meta)
+    write_json(_experiment_link_path(p), meta)
+    register_project_root(exp_root, exp_id)
+    scan_project_tree(exp_root)
+    return {
+        "ok": True,
+        "experimental_project_id": exp_id,
+        "experimental_project_path": str(exp_root),
+        "initial_backup_path": str(backup),
+        "size_bytes": size,
+    }
+
+
+def promote_experimental_copy(project_id: str, confirmed: bool) -> dict[str, Any]:
+    exp_root = project_path(project_id).resolve()
+    meta = read_json(_experiment_meta_path(exp_root), {}) or {}
+    if not isinstance(meta, dict) or meta.get("format") != EXPERIMENT_FORMAT:
+        return {"ok": False, "status": 409, "error": "This project is not an experimental copy."}
+    if not confirmed:
+        return {"ok": False, "status": 400, "error": "Promotion requires explicit user confirmation."}
+
+    build = runtime_build_info()
+    if build.get("channel") != "main" and os.environ.get("GAMEFORGE_ALLOW_EXPERIMENT_PROMOTION") != "1":
+        return {
+            "ok": False,
+            "status": 403,
+            "error": "Promotion is locked until the experimental GameForge branch is merged and you run a main-channel build.",
+        }
+
+    source_id = slugify(str(meta.get("source_project_id") or ""))
+    source_root = Path(str(meta.get("source_project_path") or "")).expanduser().resolve()
+    if not source_id or not source_root.exists() or not (source_root / "gameforge.json").exists():
+        return {"ok": False, "status": 409, "error": "The original project folder could not be found."}
+
+    for pid in (project_id, source_id):
+        ready, reason = _snapshot_ready(pid)
+        if not ready:
+            return {"ok": False, "status": 409, "error": reason}
+
+    git_checkpoint(exp_root, "GameForge pre-promotion experimental checkpoint")
+    git_checkpoint(source_root, "GameForge pre-promotion original checkpoint")
+
+    size = _tree_size_bytes(exp_root) + _tree_size_bytes(source_root)
+    free = shutil.disk_usage(source_root.parent).free
+    required = size + 512 * 1024 * 1024
+    if free < required:
+        return {"ok": False, "status": 507, "error": "Not enough free disk space to create the mandatory pre-promotion backup and staging copy."}
+
+    token = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_root = source_root.parent / f"{source_root.name}.gameforge-backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup = backup_root / f"pre-promotion-{token}"
+    staging = source_root.parent / f".{source_root.name}.promotion-staging-{token}"
+    displaced = source_root.parent / f".{source_root.name}.promotion-old-{token}"
+
+    try:
+        _copy_project_tree(source_root, backup)
+        _copy_project_tree(exp_root, staging)
+
+        promoted_cfg = read_json(staging / "gameforge.json", {}) or {}
+        promoted_cfg["id"] = source_id
+        promoted_cfg["name"] = str(meta.get("source_project_name") or promoted_cfg.get("name") or source_root.name).replace(" [Experimental]", "")
+        promoted_cfg.pop("experimental", None)
+        write_json(staging / "gameforge.json", promoted_cfg)
+        for manifest in staging.glob("*.gfai"):
+            try:
+                manifest.unlink()
+            except OSError:
+                pass
+        write_gfai_manifest(staging, promoted_cfg)
+        for marker in (_experiment_meta_path(staging), _experiment_link_path(staging)):
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+        write_json(staging / ".gameforge" / "promotion_receipt.json", {
+            "promoted_at": now_iso(),
+            "from_experimental_project": str(exp_root),
+            "from_branch": EXPERIMENT_BRANCH,
+            "pre_promotion_backup": str(backup),
+            "accepted_by_user": True,
+            "build": build,
+        })
+
+        source_root.rename(displaced)
+        try:
+            staging.rename(source_root)
+        except Exception:
+            displaced.rename(source_root)
+            raise
+        shutil.rmtree(displaced, ignore_errors=True)
+    except Exception as exc:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        return {
+            "ok": False,
+            "status": 500,
+            "error": f"Promotion failed and the original project was preserved/restored where possible: {exc}",
+            "backup_path": str(backup) if backup.exists() else "",
+        }
+
+    registry = load_project_registry()
+    registry[source_id] = str(source_root)
+    registry.pop(slugify(project_id), None)
+    save_project_registry(registry)
+
+    meta["state"] = "promoted"
+    meta["promoted_at"] = now_iso()
+    meta["pre_promotion_backup_path"] = str(backup)
+    meta["promoted_build"] = build
+    write_json(_experiment_meta_path(exp_root), meta)
+    scan_project_tree(source_root)
+    return {
+        "ok": True,
+        "original_project_id": source_id,
+        "original_project_path": str(source_root),
+        "pre_promotion_backup_path": str(backup),
+        "experimental_project_path": str(exp_root),
+    }
 
 
 def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[str, Any]:
@@ -856,6 +1330,9 @@ class AgentState:
     task_started_at: str | None = None
     last_activity_at: str | None = None
     activity_history: list[dict[str, Any]] = field(default_factory=list)
+    active_process: subprocess.Popen | None = field(default=None, repr=False)
+    active_process_kind: str = ""
+    active_process_started_at: str | None = None
 
 
 @dataclass
@@ -961,17 +1438,22 @@ def run_codex_agent_stream(
     """Run Codex while streaming JSONL into the live task panel and trace file."""
     command, use_shell = _command_invocation("codex", args)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
-    proc = subprocess.Popen(
-        command,
-        cwd=str(cwd),
-        shell=use_shell,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-        env=_codex_process_env(),
-    )
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(cwd),
+        "shell": use_shell,
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "errors": "replace",
+        "env": _codex_process_env(),
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(command, **popen_kwargs)
+    _bind_active_process(state, proc, "codex")
     stdout_lines: list[str] = []
     stderr_lines: list[str] = []
     trace_lock = threading.Lock()
@@ -1014,20 +1496,35 @@ def run_codex_agent_stream(
     if proc.stdin is not None:
         proc.stdin.write(input_text)
         proc.stdin.close()
+    timed_out = False
+    cancelled = False
+    deadline = time.time() + timeout
     try:
-        returncode = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
+        while proc.poll() is None:
+            if state.stop_event.wait(0.15):
+                cancelled = True
+                _terminate_process_tree(proc, grace_sec=1.0)
+                break
+            if time.time() >= deadline:
+                timed_out = True
+                _terminate_process_tree(proc, grace_sec=1.0)
+                break
         try:
-            proc.terminate()
-            proc.wait(timeout=5)
+            returncode = proc.wait(timeout=3)
         except Exception:
-            proc.kill()
-        raise
+            _terminate_process_tree(proc, grace_sec=0.5)
+            returncode = proc.poll() if proc.poll() is not None else -9
+        if timed_out:
+            raise subprocess.TimeoutExpired(command, timeout, output="".join(stdout_lines), stderr="".join(stderr_lines))
     finally:
         heartbeat_stop.set()
         out_thread.join(timeout=3)
         err_thread.join(timeout=3)
         heartbeat_thread.join(timeout=1)
+        if state.active_process is proc:
+            _bind_active_process(state, None, "")
+    if cancelled:
+        stderr_lines.append("\nSTOPPED BY USER\n")
     return subprocess.CompletedProcess(command, returncode, "".join(stdout_lines), "".join(stderr_lines))
 
 
@@ -1111,6 +1608,7 @@ def append_user_feedback(p: Path, text: str, category: str = "general") -> dict[
         "text": text.strip(),
         "addressed": False,
         "status": "pending",
+        "ready_for_verification": False,
         "resolution": "",
         "evidence": "",
     })
@@ -1151,6 +1649,11 @@ def reconcile_feedback_work_orders(
 
     build_failed = bool(build_result and build_result.get("configured") and not build_result.get("ok"))
     test_failed = bool(test_result and test_result.get("configured") and not test_result.get("ok"))
+    cfg = read_json(p / "gameforge.json", {}) or {}
+    pipeline = cfg.get("experimental_pipeline", {}) if isinstance(cfg.get("experimental_pipeline", {}), dict) else {}
+    strict_quality = bool(pipeline.get("enabled") and pipeline.get("strict_original_quality"))
+    build_configured = bool(build_result and build_result.get("configured"))
+    test_configured = bool(test_result and test_result.get("configured"))
 
     for item in current_items:
         feedback_id = str(item.get("id") or "")
@@ -1162,6 +1665,7 @@ def reconcile_feedback_work_orders(
 
         was_addressed = bool(old and old.get("addressed"))
         wants_addressed = bool(item.get("addressed"))
+        ready_for_verification = bool(item.get("ready_for_verification"))
 
         if was_addressed:
             # Once verified, keep the work order resolved unless the user creates
@@ -1174,14 +1678,24 @@ def reconcile_feedback_work_orders(
                 item.setdefault("evidence", old.get("evidence", ""))
             continue
 
-        if wants_addressed:
+        if wants_addressed or ready_for_verification:
             resolution = str(item.get("resolution", "") or "").strip()
             evidence = str(item.get("evidence", "") or "").strip()
             valid = verification_complete and bool(resolution) and bool(evidence) and not build_failed and not test_failed
+            if strict_quality:
+                # In strict experimental mode, targeted/savestate/warp/fast-forward
+                # checks may guide development but cannot close a user requirement.
+                # A successful configured build AND the unchanged configured full
+                # regression are mandatory before GameForge closes the work order.
+                valid = valid and build_configured and test_configured
             if valid:
                 item["addressed"] = True
                 item["status"] = "addressed"
+                item["ready_for_verification"] = False
                 item["addressed_at"] = str(item.get("addressed_at") or now_iso())
+                if strict_quality:
+                    item["verification_class"] = "targeted-plus-original-full-regression"
+                    item["full_regression_verified_at"] = now_iso()
                 item.pop("verification_error", None)
             else:
                 item["addressed"] = False
@@ -1194,6 +1708,10 @@ def reconcile_feedback_work_orders(
                     reasons.append("missing resolution summary")
                 if not evidence:
                     reasons.append("missing concrete evidence")
+                if strict_quality and not build_configured:
+                    reasons.append("strict quality requires the configured full build")
+                if strict_quality and not test_configured:
+                    reasons.append("strict quality requires the configured original full regression")
                 if build_failed:
                     reasons.append("configured build failed")
                 if test_failed:
@@ -1219,6 +1737,13 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
     # cannot complete the project while a user-requested change is still pending.
     if pending_user_feedback(p):
         return False
+    cfg = read_json(p / "gameforge.json", {}) or {}
+    pipeline = cfg.get("experimental_pipeline", {}) if isinstance(cfg.get("experimental_pipeline", {}), dict) else {}
+    strict_quality = bool(pipeline.get("enabled") and pipeline.get("strict_original_quality"))
+    if strict_quality and not build_result.get("configured"):
+        return False
+    if strict_quality and not test_result.get("configured"):
+        return False
     if build_result.get("configured") and not build_result.get("ok"):
         return False
     if test_result.get("configured") and not test_result.get("ok"):
@@ -1227,8 +1752,25 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
 
 
 def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_result: dict[str, Any] | None, test_result: dict[str, Any] | None, recovery_context: dict[str, Any] | None = None) -> str:
-    evidence = collect_logs(p, cfg)
+    pipeline = cfg.get("experimental_pipeline", {}) if isinstance(cfg.get("experimental_pipeline", {}), dict) else {}
+    fast_pipeline = bool(pipeline.get("enabled"))
     review = load_user_review(p)
+    if fast_pipeline and pipeline.get("compact_context", True):
+        compact = {
+            "generated_at": now_iso(),
+            "iteration": iteration,
+            "goal": str(cfg.get("goal", "")),
+            "acceptance": read_json(p / ".gameforge/acceptance.json", {}),
+            "user_review": review,
+            "last_evidence": read_json(p / ".gameforge/last_evidence.json", {}),
+            "last_self_heal": read_json(p / ".gameforge/last_self_heal.json", {}),
+            "iteration_notes_tail": tail_text(p / ".gameforge/iteration_notes.md", 14000),
+            "git": git_status(p),
+        }
+        write_json(p / ".gameforge" / "compact_state.json", compact)
+        evidence = json.dumps(compact, indent=2, ensure_ascii=False)[-42000:]
+    else:
+        evidence = collect_logs(p, cfg)
     prior = ""
     feedback_items = [x for x in review.get("feedback", []) if isinstance(x, dict)]
     pending_feedback = [x for x in feedback_items if not bool(x.get("addressed"))]
@@ -1246,9 +1788,19 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     if recovery_context:
         prior += "\nAutomatic recovery context:\n" + json.dumps(recovery_context, indent=2)[-16000:]
     research = cfg.get("research_mode", "deep")
-    return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\nRead AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything.\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
+    if fast_pipeline:
+        startup = """EXPERIMENTAL FAST PIPELINE: Start with .gameforge/compact_state.json, goal.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
 
-USER FEEDBACK WORK-ORDER CONTRACT: Every entry in .gameforge/user_review.json with addressed=false is a persistent requirement and takes priority over lower-value roadmap polish. Do not merely acknowledge it. Implement the requested change, build/run the relevant result, and verify the user's requested behavior or appearance with concrete evidence. Only after verification may you update that same feedback entry to addressed=true and status="addressed". When doing so, preserve id/created_at/category/text exactly and add non-empty "resolution" (what changed), "evidence" (specific test/log/capture/runtime proof), and "addressed_at". If verification is incomplete, a configured build/test fails, or the request is blocked, keep addressed=false/status="pending" and explain the blocker in iteration notes. Never delete a feedback entry. GameForge will reject unsupported resolution claims and will not accept project completion while any feedback work order remains pending.
+During the AI turn, prefer short targeted tests for the code you are actively changing. Do not rerun the configured full build/regression merely as an end-of-turn ritual because GameForge will run the configured build and ORIGINAL configured full test once after this turn returns. You MAY run the full suite inside the turn when the change is high-risk (save format, camera/player core, collision/damage, scene transition, object loading, input/render hooks), when diagnosing a failure, or when targeted evidence is insufficient.
+
+STRICT ORIGINAL QUALITY MODE: The original configured build/test commands are the trusted quality gate and must not be weakened, replaced, shortened, fast-forwarded, or rewritten merely to make the experiment look faster. Savestates, direct scene warps, test-only state injection, fast-forward, native-save checkpoints, or other shortcuts may be used ONLY as development diagnostics. They are NEVER trusted acceptance evidence and NEVER sufficient to close a user-feedback work order. After a targeted check looks good, keep addressed=false and set ready_for_verification=true with a concrete resolution and targeted evidence; GameForge will close it only after the unchanged configured full build and full regression pass. Final project completion still requires the original full regression path.
+
+When multiple pending user-feedback work orders are closely related, batch them into one coherent milestone and verify them together instead of spending separate iterations on tiny adjacent changes. This changes workflow efficiency only; it does NOT lower acceptance, regression, evidence, user-feedback completion, visual, physics, audio, gameplay, persistence, or polish requirements."""
+    else:
+        startup = "Read AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything."
+    return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\n{startup}\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
+
+USER FEEDBACK WORK-ORDER CONTRACT: Every entry in .gameforge/user_review.json with addressed=false is a persistent requirement and takes priority over lower-value roadmap polish. Do not merely acknowledge it. Implement the requested change, build/run the relevant result, and verify the user's requested behavior or appearance with concrete evidence. In strict experimental quality mode, after your targeted verification set ready_for_verification=true but keep addressed=false; GameForge itself will mark it addressed only after the configured original full build/regression pass. Outside strict experimental mode, only after verification may you update that same feedback entry to addressed=true and status="addressed". When doing so, preserve id/created_at/category/text exactly and add non-empty "resolution" (what changed), "evidence" (specific test/log/capture/runtime proof), and "addressed_at". If verification is incomplete, a configured build/test fails, or the request is blocked, keep addressed=false/status="pending" and explain the blocker in iteration notes. Never delete a feedback entry. GameForge will reject unsupported resolution claims and will not accept project completion while any feedback work order remains pending.
 
 Treat build/runtime warnings, dependency errors, WSL issues, toolchain failures, crashes, missing packages, configuration mistakes, and environment problems as live diagnostic signals. For every recoverable issue: read the exact output, identify the root cause, apply the smallest safe reversible fix, rerun the exact failed step, verify it, and continue toward the playable result. Install missing dependencies autonomously from official package managers or authoritative upstream sources when allowed. Prefer project-local or user-local installs, unattended/non-interactive flags, and pinned/reproducible versions. Never open terminal windows just to run WSL, PowerShell, package managers, compilers, or tests; keep diagnostics and repairs headless and capture their output. In WSL, prefer non-interactive commands and repair filesystem/tool configuration rather than repeatedly tolerating the same warning. Do not ask the user to perform routine debugging, install ordinary development dependencies, copy files between project folders, edit configs, or rerun commands that you can safely do yourself.
 
@@ -1345,6 +1897,14 @@ def agent_loop(project_id: str) -> None:
                     state=state,
                 )
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
+                if state.stop_event.is_set():
+                    reconcile_feedback_work_orders(
+                        p, review_before_iteration, verification_complete=False
+                    )
+                    state.status = "stopped"
+                    state.message = "Stopped by user; active Codex work was interrupted and project state was preserved."
+                    set_agent_activity(state, "Stopped", state.message, "stopped")
+                    return
                 pending_input = detect_agent_input_request(p)
                 if pending_input:
                     reconcile_feedback_work_orders(
@@ -1392,14 +1952,16 @@ def agent_loop(project_id: str) -> None:
                         repair = install_codex(force=True)
                         recovery_context["runtime_repair"] = repair
                         if repair.get("ok"):
-                            time.sleep(min(cooldown, 3))
+                            if state.stop_event.wait(min(cooldown, 3)):
+                                return
                             continue
 
                     if recovery_failures < max_auto_recovery:
                         state.status = "self-healing"
                         state.message = f"Iteration {iteration} hit a recoverable tooling/runtime failure; auto-diagnosing and retrying ({recovery_failures}/{max_auto_recovery})"
                         git_checkpoint(p, f"GameForge self-heal checkpoint {iteration}")
-                        time.sleep(min(30.0, max(cooldown, recovery_failures * 2.0)))
+                        if state.stop_event.wait(min(30.0, max(cooldown, recovery_failures * 2.0))):
+                            return
                         continue
 
                     state.status = "blocked"
@@ -1429,7 +1991,8 @@ def agent_loop(project_id: str) -> None:
                 if recovery_failures < max_auto_recovery:
                     state.status = "self-healing"
                     state.message = f"Iteration {iteration} timed out; automatically diagnosing and retrying ({recovery_failures}/{max_auto_recovery})"
-                    time.sleep(min(30.0, max(cooldown, recovery_failures * 2.0)))
+                    if state.stop_event.wait(min(30.0, max(cooldown, recovery_failures * 2.0))):
+                        return
                     continue
                 state.status = "blocked"
                 state.message = f"Automatic recovery exhausted {recovery_failures} timeout attempts. Project state and diagnostics are preserved."
@@ -1449,9 +2012,22 @@ def agent_loop(project_id: str) -> None:
             state.message = f"Iteration {iteration}: running configured build"
             set_agent_activity(state, "Building the project", commands.get("build", "") or "No custom build command is configured; verifying build state.", "build")
             build_result = run_shell(commands.get("build", ""), p, timeout, p / f"logs/build-{iteration:04d}.log", activity_state=state)
+            if state.stop_event.is_set():
+                state.status = "stopped"
+                state.message = "Stopped by user during build; project state preserved."
+                set_agent_activity(state, "Stopped", state.message, "stopped")
+                return
             state.message = f"Iteration {iteration}: running configured tests"
             set_agent_activity(state, "Running tests", commands.get("test", "") or "No custom test command is configured; verifying available evidence.", "test")
             test_result = run_shell(commands.get("test", ""), p, timeout, p / f"logs/test-{iteration:04d}.log", activity_state=state)
+            if state.stop_event.is_set():
+                reconcile_feedback_work_orders(
+                    p, review_before_iteration, build_result, test_result, verification_complete=False
+                )
+                state.status = "stopped"
+                state.message = "Stopped by user during test; project state preserved."
+                set_agent_activity(state, "Stopped", state.message, "stopped")
+                return
 
             review_after_verification = reconcile_feedback_work_orders(
                 p,
@@ -1512,7 +2088,8 @@ def agent_loop(project_id: str) -> None:
             else:
                 state.message = f"Iteration {iteration} incomplete; continuing after evidence/regression checks"
             set_agent_activity(state, "Preparing the next improvement pass", state.message, "loop")
-            time.sleep(cooldown)
+            if state.stop_event.wait(cooldown):
+                return
     except Exception as exc:
         state.status = "error"
         state.message = f"{exc}\n{traceback.format_exc()[-4000:]}"
@@ -1546,6 +2123,12 @@ def agent_public(s: AgentState) -> dict[str, Any]:
         "message": s.message,
         "started_at": s.started_at,
         "last_update": s.last_update,
+        "stop_requested": s.stop_event.is_set(),
+        "active_process": {
+            "kind": s.active_process_kind,
+            "pid": s.active_process.pid if s.active_process and s.active_process.poll() is None else None,
+            "started_at": s.active_process_started_at,
+        },
         "activity": {
             "task": s.current_task,
             "detail": s.current_detail,
@@ -2093,6 +2676,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "managed_process": managed_process_public(pid),
                     "assets": read_json(p / ".gameforge/asset_analysis.json", {"count":0,"items":[]}),
                     "git": git_status(p),
+                    "experiment": experiment_status(p),
                 })
             if path.startswith("/api/project/") and path.endswith("/index"):
                 pid = path.split("/")[3]
@@ -2184,6 +2768,13 @@ class Handler(SimpleHTTPRequestHandler):
                     if k in allowed: cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
                 return self.send_json(cfg)
+            if action == "experiment/create":
+                result = create_experimental_copy(pid)
+                return self.send_json(result, 200 if result.get("ok") else int(result.get("status", 409)))
+            if action == "experiment/promote":
+                body = self.body_json()
+                result = promote_experimental_copy(pid, bool(body.get("confirm")))
+                return self.send_json(result, 200 if result.get("ok") else int(result.get("status", 409)))
             if action == "agent/start":
                 return self.send_json(start_agent(pid))
             if action == "agent/pause":
@@ -2197,7 +2788,17 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(agent_public(s))
             if action == "agent/stop":
                 s = AGENTS.get(pid)
-                if s: s.stop_event.set(); s.pause_event.clear(); s.message="Stop requested"
+                if s:
+                    stop_agent_now(s)
+                    # Give the loop a brief chance to observe cancellation so the
+                    # response normally returns "stopped" rather than lingering at
+                    # "Stop requested" for an entire Codex/test timeout.
+                    if s.thread and s.thread.is_alive():
+                        s.thread.join(timeout=2.5)
+                    if not s.thread or not s.thread.is_alive():
+                        s.status = "stopped"
+                        s.message = "Stopped by user; project state preserved."
+                        set_agent_activity(s, "Stopped", s.message, "stopped")
                 return self.send_json(agent_public(s) if s else {"status":"idle"})
             if action == "cv/start":
                 return self.send_json(start_cv(pid))
