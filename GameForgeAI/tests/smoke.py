@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, tempfile, threading, time, urllib.request, sys
+import json, os, tempfile, threading, time, urllib.request, sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +25,31 @@ with tempfile.TemporaryDirectory() as td:
     assert rp == p.resolve()
     idx = app.scan_project_tree(p)
     assert idx["file_count"] > 0
+
+    experiment = app.create_experimental_copy(cfg["id"])
+    assert experiment["ok"], experiment
+    exp_id = experiment["experimental_project_id"]
+    exp_root = app.project_path(exp_id)
+    assert exp_root.exists()
+    assert Path(experiment["initial_backup_path"]).exists()
+    exp_status = app.experiment_status(exp_root)
+    assert exp_status["role"] == "experimental"
+    assert not exp_status["promotion_allowed"]
+
+    old_channel = os.environ.get("GAMEFORGE_BUILD_CHANNEL")
+    os.environ["GAMEFORGE_BUILD_CHANNEL"] = "main"
+    try:
+        promoted = app.promote_experimental_copy(exp_id, True)
+        assert promoted["ok"], promoted
+        restored = app.project_path(cfg["id"])
+        assert (restored / ".gameforge" / "promotion_receipt.json").exists()
+        assert app.project_config(cfg["id"])["id"] == cfg["id"]
+        assert Path(promoted["pre_promotion_backup_path"]).exists()
+    finally:
+        if old_channel is None:
+            os.environ.pop("GAMEFORGE_BUILD_CHANNEL", None)
+        else:
+            os.environ["GAMEFORGE_BUILD_CHANNEL"] = old_channel
 
     server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
     port = server.server_address[1]
