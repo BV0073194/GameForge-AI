@@ -60,6 +60,10 @@ RUNTIME = USER_DATA / "runtime"
 CODEX_RUNTIME = RUNTIME / "codex"
 RUNTIME_STATE = {"codex_installing": False, "codex_install_error": "", "codex_install_message": "", "session_login": False, "codex_login_in_progress": False, "codex_login_message": "", "codex_login_process": None}
 
+EXPERIMENT_FORMAT = "GameForgeAI.Experiment"
+EXPERIMENT_FORMAT_VERSION = 1
+EXPERIMENT_BRANCH = "experimental/fast-iteration-pipeline"
+
 for p in (USER_DATA, PROJECTS, GLOBAL_UPLOAD, GLOBAL_LOGS, RUNTIME, CODEX_RUNTIME):
     p.mkdir(parents=True, exist_ok=True)
 
@@ -157,6 +161,44 @@ def write_json(path: Path, data: Any) -> None:
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
 
+
+def runtime_build_info() -> dict[str, Any]:
+    """Describe the source/release channel so experimental promotion can be gated safely."""
+    info = read_json(RESOURCE_ROOT / "build_info.json", {}) or {}
+    if not isinstance(info, dict):
+        info = {}
+    branch = str(os.environ.get("GAMEFORGE_BUILD_REF") or info.get("ref") or "").strip()
+    channel = str(os.environ.get("GAMEFORGE_BUILD_CHANNEL") or info.get("channel") or "").strip()
+    commit = str(info.get("commit") or "").strip()
+
+    # Source checkouts can determine their branch directly. Frozen builds use the
+    # build_info.json stamped by CI and bundled by PyInstaller.
+    if not branch and not getattr(sys, "frozen", False) and command_exists("git"):
+        for candidate in (RESOURCE_ROOT, RESOURCE_ROOT.parent):
+            try:
+                proc = subprocess.run(
+                    ["git", "-C", str(candidate), "branch", "--show-current"],
+                    capture_output=True, text=True, timeout=4,
+                )
+                if proc.returncode == 0 and proc.stdout.strip():
+                    branch = proc.stdout.strip()
+                    break
+            except Exception:
+                pass
+
+    if not channel:
+        if branch == "main":
+            channel = "main"
+        elif branch.startswith("experimental/"):
+            channel = "experimental"
+        else:
+            channel = branch or "unknown"
+    return {
+        "channel": channel,
+        "ref": branch or info.get("ref") or "",
+        "commit": commit,
+        "experimental_branch": EXPERIMENT_BRANCH,
+    }
 
 
 def load_project_registry() -> dict[str, str]:
@@ -724,6 +766,301 @@ def project_config(project_id: str) -> dict[str, Any]:
     if not cfg:
         raise FileNotFoundError(project_id)
     return cfg
+
+
+def _experiment_meta_path(p: Path) -> Path:
+    return p / ".gameforge" / "experiment.json"
+
+
+def _experiment_link_path(p: Path) -> Path:
+    return p / ".gameforge" / "experimental_link.json"
+
+
+def _tree_size_bytes(root: Path) -> int:
+    total = 0
+    for base, dirs, files in os.walk(root, followlinks=False):
+        for name in files:
+            f = Path(base) / name
+            try:
+                if not f.is_symlink():
+                    total += f.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def _copy_project_tree(src: Path, dst: Path) -> None:
+    if dst.exists():
+        raise FileExistsError(str(dst))
+    shutil.copytree(src, dst, symlinks=True, ignore_dangling_symlinks=True)
+
+
+def _snapshot_ready(project_id: str) -> tuple[bool, str]:
+    state = AGENTS.get(project_id)
+    if state and state.thread and state.thread.is_alive() and state.status not in {
+        "paused", "blocked", "complete", "user-complete", "stopped", "error"
+    }:
+        return False, "Pause the autonomous developer between iterations before creating or promoting an experimental snapshot."
+    cv = CVS.get(project_id)
+    if cv and cv.thread and cv.thread.is_alive():
+        cv.stop_event.set()
+        cv.thread.join(timeout=3)
+    proc = managed_process_public(project_id)
+    if proc.get("running"):
+        stopped = stop_managed_process(project_id)
+        if not stopped.get("ok"):
+            return False, "Could not stop the managed game/process safely before snapshotting."
+    return True, ""
+
+
+def experiment_status(p: Path) -> dict[str, Any]:
+    build = runtime_build_info()
+    override = os.environ.get("GAMEFORGE_ALLOW_EXPERIMENT_PROMOTION") == "1"
+    promotion_allowed = build.get("channel") == "main" or override
+    meta = read_json(_experiment_meta_path(p), {}) or {}
+    link = read_json(_experiment_link_path(p), {}) or {}
+    if isinstance(meta, dict) and meta.get("format") == EXPERIMENT_FORMAT:
+        source = Path(str(meta.get("source_project_path", ""))).expanduser()
+        return {
+            "role": "experimental",
+            "active": True,
+            "state": meta.get("state", "active"),
+            "source_project_id": meta.get("source_project_id", ""),
+            "source_project_path": str(source),
+            "initial_backup_path": meta.get("initial_backup_path", ""),
+            "created_at": meta.get("created_at", ""),
+            "promotion_allowed": promotion_allowed,
+            "promotion_gate": "main",
+            "build": build,
+        }
+    if isinstance(link, dict) and link.get("format") == EXPERIMENT_FORMAT:
+        experimental = Path(str(link.get("experimental_project_path", ""))).expanduser()
+        return {
+            "role": "original",
+            "active": experimental.exists(),
+            "experimental_project_id": link.get("experimental_project_id", ""),
+            "experimental_project_path": str(experimental),
+            "initial_backup_path": link.get("initial_backup_path", ""),
+            "created_at": link.get("created_at", ""),
+            "promotion_allowed": False,
+            "promotion_gate": "main",
+            "build": build,
+        }
+    return {
+        "role": "original",
+        "active": False,
+        "promotion_allowed": False,
+        "promotion_gate": "main",
+        "build": build,
+    }
+
+
+def create_experimental_copy(project_id: str) -> dict[str, Any]:
+    p = project_path(project_id).resolve()
+    cfg = project_config(project_id)
+    status = experiment_status(p)
+    if status.get("role") == "experimental":
+        return {"ok": False, "status": 409, "error": "This project is already the experimental copy."}
+    if status.get("active"):
+        return {
+            "ok": True,
+            "existing": True,
+            "experimental_project_id": status.get("experimental_project_id"),
+            "experimental_project_path": status.get("experimental_project_path"),
+            "initial_backup_path": status.get("initial_backup_path"),
+        }
+
+    ready, reason = _snapshot_ready(project_id)
+    if not ready:
+        return {"ok": False, "status": 409, "error": reason}
+
+    source_id = slugify(cfg.get("id") or project_id)
+    exp_id = slugify(f"{source_id}-experimental")
+    exp_root = p.parent / f"{p.name}-experimental"
+    if exp_root.exists():
+        return {"ok": False, "status": 409, "error": f"Experimental folder already exists: {exp_root}"}
+
+    size = _tree_size_bytes(p)
+    free = shutil.disk_usage(p.parent).free
+    required = max(size * 2 + 512 * 1024 * 1024, 1024 * 1024 * 1024)
+    if free < required:
+        return {
+            "ok": False,
+            "status": 507,
+            "error": f"Not enough free disk space for a full backup plus experimental copy. Need about {required // (1024**2)} MiB free.",
+        }
+
+    git_checkpoint(p, "GameForge pre-experimental-copy checkpoint")
+    token = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_root = p.parent / f"{p.name}.gameforge-backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup = backup_root / f"pre-experimental-{token}"
+
+    try:
+        _copy_project_tree(p, backup)
+        _copy_project_tree(p, exp_root)
+    except Exception as exc:
+        if exp_root.exists():
+            shutil.rmtree(exp_root, ignore_errors=True)
+        return {
+            "ok": False,
+            "status": 500,
+            "error": f"Snapshot copy failed. The original project was not modified. {exc}",
+            "backup_path": str(backup) if backup.exists() else "",
+        }
+
+    exp_cfg = read_json(exp_root / "gameforge.json", {}) or {}
+    original_name = str(cfg.get("name") or p.name)
+    exp_cfg["id"] = exp_id
+    exp_cfg["name"] = f"{original_name} [Experimental]"
+    exp_cfg["experimental"] = {
+        "enabled": True,
+        "branch": EXPERIMENT_BRANCH,
+        "source_project_id": source_id,
+        "source_project_path": str(p),
+    }
+    write_json(exp_root / "gameforge.json", exp_cfg)
+    for manifest in exp_root.glob("*.gfai"):
+        try:
+            manifest.unlink()
+        except OSError:
+            pass
+    write_gfai_manifest(exp_root, exp_cfg)
+
+    meta = {
+        "format": EXPERIMENT_FORMAT,
+        "format_version": EXPERIMENT_FORMAT_VERSION,
+        "state": "active",
+        "branch": EXPERIMENT_BRANCH,
+        "created_at": now_iso(),
+        "source_project_id": source_id,
+        "source_project_name": original_name,
+        "source_project_path": str(p),
+        "experimental_project_id": exp_id,
+        "experimental_project_path": str(exp_root),
+        "initial_backup_path": str(backup),
+        "created_by_build": runtime_build_info(),
+        "promotion_requires_channel": "main",
+    }
+    write_json(_experiment_meta_path(exp_root), meta)
+    write_json(_experiment_link_path(p), meta)
+    register_project_root(exp_root, exp_id)
+    scan_project_tree(exp_root)
+    return {
+        "ok": True,
+        "experimental_project_id": exp_id,
+        "experimental_project_path": str(exp_root),
+        "initial_backup_path": str(backup),
+        "size_bytes": size,
+    }
+
+
+def promote_experimental_copy(project_id: str, confirmed: bool) -> dict[str, Any]:
+    exp_root = project_path(project_id).resolve()
+    meta = read_json(_experiment_meta_path(exp_root), {}) or {}
+    if not isinstance(meta, dict) or meta.get("format") != EXPERIMENT_FORMAT:
+        return {"ok": False, "status": 409, "error": "This project is not an experimental copy."}
+    if not confirmed:
+        return {"ok": False, "status": 400, "error": "Promotion requires explicit user confirmation."}
+
+    build = runtime_build_info()
+    if build.get("channel") != "main" and os.environ.get("GAMEFORGE_ALLOW_EXPERIMENT_PROMOTION") != "1":
+        return {
+            "ok": False,
+            "status": 403,
+            "error": "Promotion is locked until the experimental GameForge branch is merged and you run a main-channel build.",
+        }
+
+    source_id = slugify(str(meta.get("source_project_id") or ""))
+    source_root = Path(str(meta.get("source_project_path") or "")).expanduser().resolve()
+    if not source_id or not source_root.exists() or not (source_root / "gameforge.json").exists():
+        return {"ok": False, "status": 409, "error": "The original project folder could not be found."}
+
+    for pid in (project_id, source_id):
+        ready, reason = _snapshot_ready(pid)
+        if not ready:
+            return {"ok": False, "status": 409, "error": reason}
+
+    git_checkpoint(exp_root, "GameForge pre-promotion experimental checkpoint")
+    git_checkpoint(source_root, "GameForge pre-promotion original checkpoint")
+
+    size = _tree_size_bytes(exp_root) + _tree_size_bytes(source_root)
+    free = shutil.disk_usage(source_root.parent).free
+    required = size + 512 * 1024 * 1024
+    if free < required:
+        return {"ok": False, "status": 507, "error": "Not enough free disk space to create the mandatory pre-promotion backup and staging copy."}
+
+    token = datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup_root = source_root.parent / f"{source_root.name}.gameforge-backups"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    backup = backup_root / f"pre-promotion-{token}"
+    staging = source_root.parent / f".{source_root.name}.promotion-staging-{token}"
+    displaced = source_root.parent / f".{source_root.name}.promotion-old-{token}"
+
+    try:
+        _copy_project_tree(source_root, backup)
+        _copy_project_tree(exp_root, staging)
+
+        promoted_cfg = read_json(staging / "gameforge.json", {}) or {}
+        promoted_cfg["id"] = source_id
+        promoted_cfg["name"] = str(meta.get("source_project_name") or promoted_cfg.get("name") or source_root.name).replace(" [Experimental]", "")
+        promoted_cfg.pop("experimental", None)
+        write_json(staging / "gameforge.json", promoted_cfg)
+        for manifest in staging.glob("*.gfai"):
+            try:
+                manifest.unlink()
+            except OSError:
+                pass
+        write_gfai_manifest(staging, promoted_cfg)
+        for marker in (_experiment_meta_path(staging), _experiment_link_path(staging)):
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+        write_json(staging / ".gameforge" / "promotion_receipt.json", {
+            "promoted_at": now_iso(),
+            "from_experimental_project": str(exp_root),
+            "from_branch": EXPERIMENT_BRANCH,
+            "pre_promotion_backup": str(backup),
+            "accepted_by_user": True,
+            "build": build,
+        })
+
+        source_root.rename(displaced)
+        try:
+            staging.rename(source_root)
+        except Exception:
+            displaced.rename(source_root)
+            raise
+        shutil.rmtree(displaced, ignore_errors=True)
+    except Exception as exc:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        return {
+            "ok": False,
+            "status": 500,
+            "error": f"Promotion failed and the original project was preserved/restored where possible: {exc}",
+            "backup_path": str(backup) if backup.exists() else "",
+        }
+
+    registry = load_project_registry()
+    registry[source_id] = str(source_root)
+    registry.pop(slugify(project_id), None)
+    save_project_registry(registry)
+
+    meta["state"] = "promoted"
+    meta["promoted_at"] = now_iso()
+    meta["pre_promotion_backup_path"] = str(backup)
+    meta["promoted_build"] = build
+    write_json(_experiment_meta_path(exp_root), meta)
+    scan_project_tree(source_root)
+    return {
+        "ok": True,
+        "original_project_id": source_id,
+        "original_project_path": str(source_root),
+        "pre_promotion_backup_path": str(backup),
+        "experimental_project_path": str(exp_root),
+    }
 
 
 def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[str, Any]:
@@ -2093,6 +2430,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "managed_process": managed_process_public(pid),
                     "assets": read_json(p / ".gameforge/asset_analysis.json", {"count":0,"items":[]}),
                     "git": git_status(p),
+                    "experiment": experiment_status(p),
                 })
             if path.startswith("/api/project/") and path.endswith("/index"):
                 pid = path.split("/")[3]
@@ -2184,6 +2522,13 @@ class Handler(SimpleHTTPRequestHandler):
                     if k in allowed: cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
                 return self.send_json(cfg)
+            if action == "experiment/create":
+                result = create_experimental_copy(pid)
+                return self.send_json(result, 200 if result.get("ok") else int(result.get("status", 409)))
+            if action == "experiment/promote":
+                body = self.body_json()
+                result = promote_experimental_copy(pid, bool(body.get("confirm")))
+                return self.send_json(result, 200 if result.get("ok") else int(result.get("status", 409)))
             if action == "agent/start":
                 return self.send_json(start_agent(pid))
             if action == "agent/pause":
