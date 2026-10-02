@@ -743,13 +743,21 @@ def _bind_active_process(state: AgentState | None, proc: subprocess.Popen | None
 
 
 def stop_agent_now(state: AgentState) -> None:
-    """Request stop and immediately interrupt any active Codex/build/test child tree."""
+    """Request stop immediately; kill an active child tree without blocking the UI request."""
     state.stop_event.set()
     state.pause_event.clear()
     state.status = "stopping"
     state.message = "Stopping active AI/build/test process…"
     set_agent_activity(state, "Stopping", state.message, "stop")
-    _terminate_process_tree(state.active_process, grace_sec=1.0)
+    proc = state.active_process
+    if proc is not None and proc.poll() is None:
+        threading.Thread(
+            target=_terminate_process_tree,
+            args=(proc,),
+            kwargs={"grace_sec": 1.0},
+            daemon=True,
+            name=f"agent-stop-{state.project_id}",
+        ).start()
 
 
 def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | None = None, activity_state: AgentState | None = None) -> dict[str, Any]:
