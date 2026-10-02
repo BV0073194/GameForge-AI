@@ -3,6 +3,8 @@ from PyInstaller.utils.hooks import collect_all
 import os
 
 datas = [("web", "web")]
+if os.path.exists("build_info.json"):
+    datas.append(("build_info.json", "."))
 binaries = []
 hiddenimports = []
 
