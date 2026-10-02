@@ -22,6 +22,7 @@ function liveStateLabel(status){
  if(status==='self-healing')return 'Self-healing';
  if(status==='waiting_for_user')return 'Waiting for you';
  if(status==='paused')return 'Paused';
+ if(status==='stopping')return 'Stopping';
  if(status==='complete')return 'Verified complete';
  if(status==='user-complete')return 'Held as done';
  if(status==='blocked'||status==='error')return 'Needs attention';
