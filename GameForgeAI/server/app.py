@@ -919,6 +919,13 @@ def create_experimental_copy(project_id: str) -> dict[str, Any]:
         "source_project_id": source_id,
         "source_project_path": str(p),
     }
+    exp_cfg["experimental_pipeline"] = {
+        "enabled": True,
+        "compact_context": True,
+        "targeted_tests_during_ai_turn": True,
+        "gameforge_full_verification_after_turn": True,
+        "batch_related_feedback": True,
+    }
     write_json(exp_root / "gameforge.json", exp_cfg)
     for manifest in exp_root.glob("*.gfai"):
         try:
@@ -1564,8 +1571,25 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
 
 
 def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_result: dict[str, Any] | None, test_result: dict[str, Any] | None, recovery_context: dict[str, Any] | None = None) -> str:
-    evidence = collect_logs(p, cfg)
+    pipeline = cfg.get("experimental_pipeline", {}) if isinstance(cfg.get("experimental_pipeline", {}), dict) else {}
+    fast_pipeline = bool(pipeline.get("enabled"))
     review = load_user_review(p)
+    if fast_pipeline and pipeline.get("compact_context", True):
+        compact = {
+            "generated_at": now_iso(),
+            "iteration": iteration,
+            "goal": str(cfg.get("goal", "")),
+            "acceptance": read_json(p / ".gameforge/acceptance.json", {}),
+            "user_review": review,
+            "last_evidence": read_json(p / ".gameforge/last_evidence.json", {}),
+            "last_self_heal": read_json(p / ".gameforge/last_self_heal.json", {}),
+            "iteration_notes_tail": tail_text(p / ".gameforge/iteration_notes.md", 14000),
+            "git": git_status(p),
+        }
+        write_json(p / ".gameforge" / "compact_state.json", compact)
+        evidence = json.dumps(compact, indent=2, ensure_ascii=False)[-42000:]
+    else:
+        evidence = collect_logs(p, cfg)
     prior = ""
     feedback_items = [x for x in review.get("feedback", []) if isinstance(x, dict)]
     pending_feedback = [x for x in feedback_items if not bool(x.get("addressed"))]
@@ -1583,7 +1607,15 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     if recovery_context:
         prior += "\nAutomatic recovery context:\n" + json.dumps(recovery_context, indent=2)[-16000:]
     research = cfg.get("research_mode", "deep")
-    return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\nRead AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything.\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
+    if fast_pipeline:
+        startup = """EXPERIMENTAL FAST PIPELINE: Start with .gameforge/compact_state.json, goal.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
+
+During the AI turn, prefer short targeted tests for the code you are actively changing. Do not rerun the configured full build/regression merely as an end-of-turn ritual because GameForge will run the configured build and full test once after this turn returns. You MAY run the full suite inside the turn when the change is high-risk (save format, camera/player core, collision/damage, scene transition, object loading, input/render hooks), when diagnosing a failure, or when targeted evidence is insufficient.
+
+When multiple pending user-feedback work orders are closely related, batch them into one coherent milestone and verify them together instead of spending separate iterations on tiny adjacent changes. This changes workflow efficiency only; it does NOT lower acceptance, regression, evidence, or user-feedback completion requirements."""
+    else:
+        startup = "Read AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything."
+    return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\n{startup}\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
 
 USER FEEDBACK WORK-ORDER CONTRACT: Every entry in .gameforge/user_review.json with addressed=false is a persistent requirement and takes priority over lower-value roadmap polish. Do not merely acknowledge it. Implement the requested change, build/run the relevant result, and verify the user's requested behavior or appearance with concrete evidence. Only after verification may you update that same feedback entry to addressed=true and status="addressed". When doing so, preserve id/created_at/category/text exactly and add non-empty "resolution" (what changed), "evidence" (specific test/log/capture/runtime proof), and "addressed_at". If verification is incomplete, a configured build/test fails, or the request is blocked, keep addressed=false/status="pending" and explain the blocker in iteration notes. Never delete a feedback entry. GameForge will reject unsupported resolution claims and will not accept project completion while any feedback work order remains pending.
 
