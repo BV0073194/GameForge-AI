@@ -19,6 +19,28 @@ with tempfile.TemporaryDirectory() as td:
 
     cfg = app.create_project("Smoke Project", "Make a playable test project.", "off")
     p = app.project_path(cfg["id"])
+
+    # Stop must interrupt an active long-running project command promptly instead
+    # of merely setting a flag that is observed after the command exits.
+    stop_state = app.AgentState(project_id=cfg["id"])
+    def request_stop_when_active():
+        deadline = time.time() + 5
+        while time.time() < deadline and stop_state.active_process is None:
+            time.sleep(0.05)
+        app.stop_agent_now(stop_state)
+    stopper = threading.Thread(target=request_stop_when_active, daemon=True)
+    stopper.start()
+    stop_started = time.time()
+    stopped = app.run_shell(
+        f'"{sys.executable}" -c "import time; time.sleep(30)"',
+        p,
+        timeout=60,
+        activity_state=stop_state,
+    )
+    stopper.join(timeout=2)
+    assert stopped.get("cancelled") is True, stopped
+    assert time.time() - stop_started < 8, stopped
+
     mf = next(p.glob("*.gfai"))
     pid, rp, cfg2 = app.open_gfai_file(mf)
     assert pid == cfg["id"]
