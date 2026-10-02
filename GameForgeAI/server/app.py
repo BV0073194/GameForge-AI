@@ -822,6 +822,15 @@ def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | Non
         except Exception:
             _terminate_process_tree(proc, grace_sec=0.5)
         out_thread.join(timeout=2); err_thread.join(timeout=2)
+
+        # stop_agent_now() terminates the child tree from a separate thread so the
+        # UI remains responsive. On fast exits (notably Windows CTRL_BREAK_EVENT,
+        # which commonly returns 0xC000013A / 3221225786) the process can disappear
+        # before this polling loop gets another chance to set cancelled=True.
+        # The stop_event is therefore the authoritative cancellation signal.
+        if activity_state is not None and activity_state.stop_event.is_set() and not timed_out:
+            cancelled = True
+
         output = "".join(stdout_lines) + ("\n" if stdout_lines and stderr_lines else "") + "".join(stderr_lines)
         if cancelled:
             result = {
