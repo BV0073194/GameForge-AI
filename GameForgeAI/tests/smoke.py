@@ -35,6 +35,37 @@ with tempfile.TemporaryDirectory() as td:
     exp_status = app.experiment_status(exp_root)
     assert exp_status["role"] == "experimental"
     assert not exp_status["promotion_allowed"]
+    exp_cfg = app.project_config(exp_id)
+    assert exp_cfg["experimental_pipeline"]["quality_mode"] == "strict-original"
+    assert exp_cfg["experimental_pipeline"]["full_configured_test_required"] is True
+    assert exp_cfg["experimental_pipeline"]["allow_savestate_for_trusted_evidence"] is False
+
+    # Targeted/shortcut evidence alone must never close feedback in strict mode.
+    before_review = app.append_user_feedback(exp_root, "Strict quality smoke feedback.", "general")
+    candidate = app.load_user_review(exp_root)
+    candidate["feedback"][-1]["ready_for_verification"] = True
+    candidate["feedback"][-1]["resolution"] = "Implemented in smoke fixture."
+    candidate["feedback"][-1]["evidence"] = "Targeted diagnostic passed."
+    app.save_user_review(exp_root, candidate)
+    after_targeted_only = app.reconcile_feedback_work_orders(
+        exp_root,
+        before_review,
+        {"configured": False, "ok": True},
+        {"configured": False, "ok": True},
+        verification_complete=True,
+    )
+    assert after_targeted_only["feedback"][-1]["addressed"] is False
+    assert after_targeted_only["feedback"][-1]["ready_for_verification"] is True
+
+    after_full_gate = app.reconcile_feedback_work_orders(
+        exp_root,
+        before_review,
+        {"configured": True, "ok": True},
+        {"configured": True, "ok": True},
+        verification_complete=True,
+    )
+    assert after_full_gate["feedback"][-1]["addressed"] is True
+    assert after_full_gate["feedback"][-1]["verification_class"] == "targeted-plus-original-full-regression"
 
     old_channel = os.environ.get("GAMEFORGE_BUILD_CHANNEL")
     os.environ["GAMEFORGE_BUILD_CHANNEL"] = "main"
