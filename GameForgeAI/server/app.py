@@ -890,6 +890,35 @@ def project_config(project_id: str) -> dict[str, Any]:
     return cfg
 
 
+DEFAULT_ITERATION_PIPELINE = {
+    "enabled": True,
+    "quality_mode": "strict-original",
+    "strict_original_quality": True,
+    "compact_context": True,
+    "targeted_tests_during_ai_turn": True,
+    "targeted_tests_are_diagnostic_only": True,
+    "gameforge_full_verification_after_turn": True,
+    "full_configured_build_required": True,
+    "full_configured_test_required": True,
+    "allow_savestate_for_trusted_evidence": False,
+    "allow_direct_warp_for_trusted_evidence": False,
+    "allow_fast_forward_for_trusted_evidence": False,
+    "batch_related_feedback": True,
+}
+
+
+def iteration_pipeline_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return the production fast-iteration policy, preserving strict original-quality gates."""
+    settings = dict(DEFAULT_ITERATION_PIPELINE)
+    configured = cfg.get("iteration_pipeline")
+    # Compatibility with project copies created while this pipeline was experimental.
+    if not isinstance(configured, dict):
+        configured = cfg.get("experimental_pipeline")
+    if isinstance(configured, dict):
+        settings.update(configured)
+    return settings
+
+
 def _experiment_meta_path(p: Path) -> Path:
     return p / ".gameforge" / "experiment.json"
 
@@ -1224,6 +1253,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
         "internet_research": True,
         "commands": {"build": "", "test": "", "launch": ""},
         "command_timeout_sec": 1800,
+        "iteration_pipeline": dict(DEFAULT_ITERATION_PIPELINE),
         "agent": {
             "permission_mode": "full-auto",
             "max_iterations": 0,
@@ -1650,7 +1680,7 @@ def reconcile_feedback_work_orders(
     build_failed = bool(build_result and build_result.get("configured") and not build_result.get("ok"))
     test_failed = bool(test_result and test_result.get("configured") and not test_result.get("ok"))
     cfg = read_json(p / "gameforge.json", {}) or {}
-    pipeline = cfg.get("experimental_pipeline", {}) if isinstance(cfg.get("experimental_pipeline", {}), dict) else {}
+    pipeline = iteration_pipeline_settings(cfg)
     strict_quality = bool(pipeline.get("enabled") and pipeline.get("strict_original_quality"))
     build_configured = bool(build_result and build_result.get("configured"))
     test_configured = bool(test_result and test_result.get("configured"))
@@ -1738,7 +1768,7 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
     if pending_user_feedback(p):
         return False
     cfg = read_json(p / "gameforge.json", {}) or {}
-    pipeline = cfg.get("experimental_pipeline", {}) if isinstance(cfg.get("experimental_pipeline", {}), dict) else {}
+    pipeline = iteration_pipeline_settings(cfg)
     strict_quality = bool(pipeline.get("enabled") and pipeline.get("strict_original_quality"))
     if strict_quality and not build_result.get("configured"):
         return False
@@ -1752,7 +1782,7 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
 
 
 def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_result: dict[str, Any] | None, test_result: dict[str, Any] | None, recovery_context: dict[str, Any] | None = None) -> str:
-    pipeline = cfg.get("experimental_pipeline", {}) if isinstance(cfg.get("experimental_pipeline", {}), dict) else {}
+    pipeline = iteration_pipeline_settings(cfg)
     fast_pipeline = bool(pipeline.get("enabled"))
     review = load_user_review(p)
     if fast_pipeline and pipeline.get("compact_context", True):
@@ -1789,7 +1819,7 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
         prior += "\nAutomatic recovery context:\n" + json.dumps(recovery_context, indent=2)[-16000:]
     research = cfg.get("research_mode", "deep")
     if fast_pipeline:
-        startup = """EXPERIMENTAL FAST PIPELINE: Start with .gameforge/compact_state.json, goal.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
+        startup = """FAST STRICT PIPELINE: Start with .gameforge/compact_state.json, goal.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
 
 During the AI turn, prefer short targeted tests for the code you are actively changing. Do not rerun the configured full build/regression merely as an end-of-turn ritual because GameForge will run the configured build and ORIGINAL configured full test once after this turn returns. You MAY run the full suite inside the turn when the change is high-risk (save format, camera/player core, collision/damage, scene transition, object loading, input/render hooks), when diagnosing a failure, or when targeted evidence is insufficient.
 
@@ -1800,7 +1830,7 @@ When multiple pending user-feedback work orders are closely related, batch them 
         startup = "Read AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything."
     return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\n{startup}\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
 
-USER FEEDBACK WORK-ORDER CONTRACT: Every entry in .gameforge/user_review.json with addressed=false is a persistent requirement and takes priority over lower-value roadmap polish. Do not merely acknowledge it. Implement the requested change, build/run the relevant result, and verify the user's requested behavior or appearance with concrete evidence. In strict experimental quality mode, after your targeted verification set ready_for_verification=true but keep addressed=false; GameForge itself will mark it addressed only after the configured original full build/regression pass. Outside strict experimental mode, only after verification may you update that same feedback entry to addressed=true and status="addressed". When doing so, preserve id/created_at/category/text exactly and add non-empty "resolution" (what changed), "evidence" (specific test/log/capture/runtime proof), and "addressed_at". If verification is incomplete, a configured build/test fails, or the request is blocked, keep addressed=false/status="pending" and explain the blocker in iteration notes. Never delete a feedback entry. GameForge will reject unsupported resolution claims and will not accept project completion while any feedback work order remains pending.
+USER FEEDBACK WORK-ORDER CONTRACT: Every entry in .gameforge/user_review.json with addressed=false is a persistent requirement and takes priority over lower-value roadmap polish. Do not merely acknowledge it. Implement the requested change, build/run the relevant result, and verify the user's requested behavior or appearance with concrete evidence. In strict quality mode, after your targeted verification set ready_for_verification=true but keep addressed=false; GameForge itself will mark it addressed only after the configured original full build/regression pass. Outside strict quality mode, only after verification may you update that same feedback entry to addressed=true and status="addressed". When doing so, preserve id/created_at/category/text exactly and add non-empty "resolution" (what changed), "evidence" (specific test/log/capture/runtime proof), and "addressed_at". If verification is incomplete, a configured build/test fails, or the request is blocked, keep addressed=false/status="pending" and explain the blocker in iteration notes. Never delete a feedback entry. GameForge will reject unsupported resolution claims and will not accept project completion while any feedback work order remains pending.
 
 Treat build/runtime warnings, dependency errors, WSL issues, toolchain failures, crashes, missing packages, configuration mistakes, and environment problems as live diagnostic signals. For every recoverable issue: read the exact output, identify the root cause, apply the smallest safe reversible fix, rerun the exact failed step, verify it, and continue toward the playable result. Install missing dependencies autonomously from official package managers or authoritative upstream sources when allowed. Prefer project-local or user-local installs, unattended/non-interactive flags, and pinned/reproducible versions. Never open terminal windows just to run WSL, PowerShell, package managers, compilers, or tests; keep diagnostics and repairs headless and capture their output. In WSL, prefer non-interactive commands and repair filesystem/tool configuration rather than repeatedly tolerating the same warning. Do not ask the user to perform routine debugging, install ordinary development dependencies, copy files between project folders, edit configs, or rerun commands that you can safely do yourself.
 
@@ -2763,7 +2793,7 @@ class Handler(SimpleHTTPRequestHandler):
             p = project_path(pid); cfg = project_config(pid)
             if action == "config":
                 body = self.body_json()
-                allowed = {"research_mode","internet_research","commands","command_timeout_sec","agent","visual","log_globs"}
+                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","agent","visual","log_globs"}
                 for k,v in body.items():
                     if k in allowed: cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
