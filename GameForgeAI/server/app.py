@@ -921,9 +921,17 @@ def create_experimental_copy(project_id: str) -> dict[str, Any]:
     }
     exp_cfg["experimental_pipeline"] = {
         "enabled": True,
+        "quality_mode": "strict-original",
+        "strict_original_quality": True,
         "compact_context": True,
         "targeted_tests_during_ai_turn": True,
+        "targeted_tests_are_diagnostic_only": True,
         "gameforge_full_verification_after_turn": True,
+        "full_configured_build_required": True,
+        "full_configured_test_required": True,
+        "allow_savestate_for_trusted_evidence": False,
+        "allow_direct_warp_for_trusted_evidence": False,
+        "allow_fast_forward_for_trusted_evidence": False,
         "batch_related_feedback": True,
     }
     write_json(exp_root / "gameforge.json", exp_cfg)
@@ -1455,6 +1463,7 @@ def append_user_feedback(p: Path, text: str, category: str = "general") -> dict[
         "text": text.strip(),
         "addressed": False,
         "status": "pending",
+        "ready_for_verification": False,
         "resolution": "",
         "evidence": "",
     })
@@ -1495,6 +1504,11 @@ def reconcile_feedback_work_orders(
 
     build_failed = bool(build_result and build_result.get("configured") and not build_result.get("ok"))
     test_failed = bool(test_result and test_result.get("configured") and not test_result.get("ok"))
+    cfg = read_json(p / "gameforge.json", {}) or {}
+    pipeline = cfg.get("experimental_pipeline", {}) if isinstance(cfg.get("experimental_pipeline", {}), dict) else {}
+    strict_quality = bool(pipeline.get("enabled") and pipeline.get("strict_original_quality"))
+    build_configured = bool(build_result and build_result.get("configured"))
+    test_configured = bool(test_result and test_result.get("configured"))
 
     for item in current_items:
         feedback_id = str(item.get("id") or "")
@@ -1506,6 +1520,7 @@ def reconcile_feedback_work_orders(
 
         was_addressed = bool(old and old.get("addressed"))
         wants_addressed = bool(item.get("addressed"))
+        ready_for_verification = bool(item.get("ready_for_verification"))
 
         if was_addressed:
             # Once verified, keep the work order resolved unless the user creates
@@ -1518,14 +1533,24 @@ def reconcile_feedback_work_orders(
                 item.setdefault("evidence", old.get("evidence", ""))
             continue
 
-        if wants_addressed:
+        if wants_addressed or ready_for_verification:
             resolution = str(item.get("resolution", "") or "").strip()
             evidence = str(item.get("evidence", "") or "").strip()
             valid = verification_complete and bool(resolution) and bool(evidence) and not build_failed and not test_failed
+            if strict_quality:
+                # In strict experimental mode, targeted/savestate/warp/fast-forward
+                # checks may guide development but cannot close a user requirement.
+                # A successful configured build AND the unchanged configured full
+                # regression are mandatory before GameForge closes the work order.
+                valid = valid and build_configured and test_configured
             if valid:
                 item["addressed"] = True
                 item["status"] = "addressed"
+                item["ready_for_verification"] = False
                 item["addressed_at"] = str(item.get("addressed_at") or now_iso())
+                if strict_quality:
+                    item["verification_class"] = "targeted-plus-original-full-regression"
+                    item["full_regression_verified_at"] = now_iso()
                 item.pop("verification_error", None)
             else:
                 item["addressed"] = False
@@ -1538,6 +1563,10 @@ def reconcile_feedback_work_orders(
                     reasons.append("missing resolution summary")
                 if not evidence:
                     reasons.append("missing concrete evidence")
+                if strict_quality and not build_configured:
+                    reasons.append("strict quality requires the configured full build")
+                if strict_quality and not test_configured:
+                    reasons.append("strict quality requires the configured original full regression")
                 if build_failed:
                     reasons.append("configured build failed")
                 if test_failed:
@@ -1562,6 +1591,13 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
     # User feedback is a persistent work-order queue. Technical acceptance alone
     # cannot complete the project while a user-requested change is still pending.
     if pending_user_feedback(p):
+        return False
+    cfg = read_json(p / "gameforge.json", {}) or {}
+    pipeline = cfg.get("experimental_pipeline", {}) if isinstance(cfg.get("experimental_pipeline", {}), dict) else {}
+    strict_quality = bool(pipeline.get("enabled") and pipeline.get("strict_original_quality"))
+    if strict_quality and not build_result.get("configured"):
+        return False
+    if strict_quality and not test_result.get("configured"):
         return False
     if build_result.get("configured") and not build_result.get("ok"):
         return False
@@ -1610,14 +1646,16 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     if fast_pipeline:
         startup = """EXPERIMENTAL FAST PIPELINE: Start with .gameforge/compact_state.json, goal.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
 
-During the AI turn, prefer short targeted tests for the code you are actively changing. Do not rerun the configured full build/regression merely as an end-of-turn ritual because GameForge will run the configured build and full test once after this turn returns. You MAY run the full suite inside the turn when the change is high-risk (save format, camera/player core, collision/damage, scene transition, object loading, input/render hooks), when diagnosing a failure, or when targeted evidence is insufficient.
+During the AI turn, prefer short targeted tests for the code you are actively changing. Do not rerun the configured full build/regression merely as an end-of-turn ritual because GameForge will run the configured build and ORIGINAL configured full test once after this turn returns. You MAY run the full suite inside the turn when the change is high-risk (save format, camera/player core, collision/damage, scene transition, object loading, input/render hooks), when diagnosing a failure, or when targeted evidence is insufficient.
 
-When multiple pending user-feedback work orders are closely related, batch them into one coherent milestone and verify them together instead of spending separate iterations on tiny adjacent changes. This changes workflow efficiency only; it does NOT lower acceptance, regression, evidence, or user-feedback completion requirements."""
+STRICT ORIGINAL QUALITY MODE: The original configured build/test commands are the trusted quality gate and must not be weakened, replaced, shortened, fast-forwarded, or rewritten merely to make the experiment look faster. Savestates, direct scene warps, test-only state injection, fast-forward, native-save checkpoints, or other shortcuts may be used ONLY as development diagnostics. They are NEVER trusted acceptance evidence and NEVER sufficient to close a user-feedback work order. After a targeted check looks good, keep addressed=false and set ready_for_verification=true with a concrete resolution and targeted evidence; GameForge will close it only after the unchanged configured full build and full regression pass. Final project completion still requires the original full regression path.
+
+When multiple pending user-feedback work orders are closely related, batch them into one coherent milestone and verify them together instead of spending separate iterations on tiny adjacent changes. This changes workflow efficiency only; it does NOT lower acceptance, regression, evidence, user-feedback completion, visual, physics, audio, gameplay, persistence, or polish requirements."""
     else:
         startup = "Read AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything."
     return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\n{startup}\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
 
-USER FEEDBACK WORK-ORDER CONTRACT: Every entry in .gameforge/user_review.json with addressed=false is a persistent requirement and takes priority over lower-value roadmap polish. Do not merely acknowledge it. Implement the requested change, build/run the relevant result, and verify the user's requested behavior or appearance with concrete evidence. Only after verification may you update that same feedback entry to addressed=true and status="addressed". When doing so, preserve id/created_at/category/text exactly and add non-empty "resolution" (what changed), "evidence" (specific test/log/capture/runtime proof), and "addressed_at". If verification is incomplete, a configured build/test fails, or the request is blocked, keep addressed=false/status="pending" and explain the blocker in iteration notes. Never delete a feedback entry. GameForge will reject unsupported resolution claims and will not accept project completion while any feedback work order remains pending.
+USER FEEDBACK WORK-ORDER CONTRACT: Every entry in .gameforge/user_review.json with addressed=false is a persistent requirement and takes priority over lower-value roadmap polish. Do not merely acknowledge it. Implement the requested change, build/run the relevant result, and verify the user's requested behavior or appearance with concrete evidence. In strict experimental quality mode, after your targeted verification set ready_for_verification=true but keep addressed=false; GameForge itself will mark it addressed only after the configured original full build/regression pass. Outside strict experimental mode, only after verification may you update that same feedback entry to addressed=true and status="addressed". When doing so, preserve id/created_at/category/text exactly and add non-empty "resolution" (what changed), "evidence" (specific test/log/capture/runtime proof), and "addressed_at". If verification is incomplete, a configured build/test fails, or the request is blocked, keep addressed=false/status="pending" and explain the blocker in iteration notes. Never delete a feedback entry. GameForge will reject unsupported resolution claims and will not accept project completion while any feedback work order remains pending.
 
 Treat build/runtime warnings, dependency errors, WSL issues, toolchain failures, crashes, missing packages, configuration mistakes, and environment problems as live diagnostic signals. For every recoverable issue: read the exact output, identify the root cause, apply the smallest safe reversible fix, rerun the exact failed step, verify it, and continue toward the playable result. Install missing dependencies autonomously from official package managers or authoritative upstream sources when allowed. Prefer project-local or user-local installs, unattended/non-interactive flags, and pinned/reproducible versions. Never open terminal windows just to run WSL, PowerShell, package managers, compilers, or tests; keep diagnostics and repairs headless and capture their output. In WSL, prefer non-interactive commands and repair filesystem/tool configuration rather than repeatedly tolerating the same warning. Do not ask the user to perform routine debugging, install ordinary development dependencies, copy files between project folders, edit configs, or rerun commands that you can safely do yourself.
 
