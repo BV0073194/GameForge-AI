@@ -57,6 +57,12 @@ with tempfile.TemporaryDirectory() as td:
     assert pipeline["full_configured_test_required"] is True
     assert pipeline["allow_savestate_for_trusted_evidence"] is False
 
+    # Prompt construction itself is runtime-critical. Keep JSON examples inside
+    # the f-string escaped so Start/Continue cannot fail before Codex launches.
+    prompt_smoke = app.build_agent_prompt(p, production_cfg, 1, None, None, None)
+    assert '.gameforge/cleanup_candidates.json' in prompt_smoke
+    assert '{"path":"relative/path","safe_to_delete":true' in prompt_smoke
+
     before_review = app.append_user_feedback(p, "Strict quality smoke feedback.", "general")
     candidate = app.load_user_review(p)
     candidate["feedback"][-1]["ready_for_verification"] = True
