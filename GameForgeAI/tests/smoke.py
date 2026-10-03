@@ -110,6 +110,64 @@ with tempfile.TemporaryDirectory() as td:
     assert (p / "clean.marker").exists()
     assert (p / "build.marker").exists()
 
+    # Wrapped zeldaret/oot projects can infer the official build-dir-only clean
+    # command without requiring an existing project's config to have been migrated.
+    oot_cfg = app.project_config(cfg["id"])
+    oot_cfg["goal"] = "Modify the current zeldaret/oot decomp."
+    oot_cfg["commands"]["clean"] = ""
+    tools_dir = p / "workspace" / "tools"
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    (tools_dir / "build_mod.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "mod=/home/test/oot-mod\n"
+        "make all VERSION=ntsc-1.0 REGION=US COMPARE=0 NON_MATCHING=0 -j4\n",
+        encoding="utf-8",
+    )
+    (tools_dir / "build_mod.ps1").write_text(
+        "& wsl -d Ubuntu --exec bash /tmp/build_mod.sh\n", encoding="utf-8"
+    )
+    inferred_clean = app.infer_clean_command(p, oot_cfg)
+    assert "wsl -d Ubuntu --exec bash -lc" in inferred_clean, inferred_clean
+    assert "cd /home/test/oot-mod && make clean VERSION=ntsc-1.0 REGION=US" in inferred_clean, inferred_clean
+
+    # Project commands are serialized so a manual Build cannot collide with an
+    # agent/test build and leave WSL compiler executables busy.
+    blocker_script = p / "smoke_blocker.py"
+    blocker_script.write_text("import time\ntime.sleep(2)\n", encoding="utf-8")
+    first_result = {}
+    def run_blocker():
+        first_result.update(app.run_shell(f'"{sys.executable}" smoke_blocker.py', p, timeout=10))
+    blocker_thread = threading.Thread(target=run_blocker, daemon=True)
+    blocker_thread.start()
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        lock = app._project_command_lock(p)
+        if not lock.acquire(blocking=False):
+            break
+        lock.release()
+        time.sleep(0.05)
+    overlapping = app.run_shell(f'"{sys.executable}" -c "print(1)"', p, timeout=5)
+    assert overlapping.get("busy") is True, overlapping
+    blocker_thread.join(timeout=5)
+    assert first_result.get("ok") is True, first_result
+
+    # A short-lived Text-file-busy failure is retried automatically instead of
+    # being surfaced as a permanent build failure.
+    transient_script = p / "smoke_transient_busy.py"
+    transient_script.write_text(
+        "from pathlib import Path\n"
+        "m=Path('transient.marker')\n"
+        "if not m.exists():\n"
+        "    m.write_text('1')\n"
+        "    print('cp: Text file busy')\n"
+        "    raise SystemExit(1)\n"
+        "print('retry ok')\n",
+        encoding="utf-8",
+    )
+    transient = app.run_shell(f'"{sys.executable}" smoke_transient_busy.py', p, timeout=10)
+    assert transient["ok"] is True, transient
+    assert transient.get("transient_retries") == 1, transient
+
     # Automatic cleanup archives old logs before deletion, prunes only old
     # iteration-specific research/capture groups, and honors explicit AI-safe
     # workspace candidates.
