@@ -2814,6 +2814,37 @@ def infer_clean_command(p: Path, cfg: dict[str, Any]) -> str:
         return "./gradlew clean"
     if (p / "gradlew.bat").is_file():
         return "gradlew.bat clean"
+
+    # Existing zeldaret/oot projects commonly wrap the real Linux build in
+    # workspace/tools/build_mod.ps1 -> build_mod.sh. Infer the official
+    # decomp's safe 'make clean' only when the project goal explicitly targets
+    # zeldaret/oot and the wrapper exposes a literal absolute mod worktree path.
+    # The upstream oot Makefile clean target removes BUILD_DIR only.
+    goal_text = str(cfg.get("goal", "") or "").lower()
+    wrapped_sh = p / "workspace" / "tools" / "build_mod.sh"
+    wrapped_ps1 = p / "workspace" / "tools" / "build_mod.ps1"
+    if "zeldaret/oot" in goal_text and wrapped_sh.is_file():
+        try:
+            sh_text = wrapped_sh.read_text(encoding="utf-8", errors="replace")
+            mod_match = re.search(r"(?m)^mod=(?:\"([^\"]+)\"|'([^']+)'|([^\s#]+))\s*$", sh_text)
+            make_match = re.search(r"(?m)^\s*make\s+all\s+([^\r\n]+)$", sh_text)
+            if mod_match and make_match:
+                mod_path = next((x for x in mod_match.groups() if x), "")
+                assignments = re.findall(r"\b(?:VERSION|REGION)=[^\s]+", make_match.group(1))
+                if mod_path.startswith("/") and ".." not in Path(mod_path).parts:
+                    distro = ""
+                    if wrapped_ps1.is_file():
+                        ps_text = wrapped_ps1.read_text(encoding="utf-8", errors="replace")
+                        dm = re.search(r"(?i)\bwsl\s+-d\s+([A-Za-z0-9_.-]+)", ps_text)
+                        if dm:
+                            distro = dm.group(1)
+                    linux_clean = f"cd {shlex.quote(mod_path)} && make clean"
+                    if assignments:
+                        linux_clean += " " + " ".join(assignments)
+                    distro_args = f"-d {distro} " if distro else ""
+                    return f'wsl {distro_args}--exec bash -lc "{linux_clean}"'
+        except Exception:
+            pass
     return ""
 
 
