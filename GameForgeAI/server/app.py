@@ -807,7 +807,7 @@ def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | Non
 
         total_started = time.time()
         attempts: list[dict[str, Any]] = []
-        max_attempts = 3
+        max_attempts = 5
 
         for attempt in range(1, max_attempts + 1):
             started = time.time()
@@ -912,6 +912,16 @@ def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | Non
                     if attempt > 1:
                         result["transient_retries"] = attempt - 1
                         result["attempts"] = attempts
+                    if transient_busy and attempt >= max_attempts:
+                        result["error"] = (
+                            "Build files remained busy after automatic retries. This usually means "
+                            "another compiler/tool process is still using an executable, or the build "
+                            "wrapper is unnecessarily overwriting toolchain binaries on every build."
+                        )
+                        result["repair_hint"] = (
+                            "Stop the stale build process and make the wrapper copy generated toolchain "
+                            "files only when missing instead of overwriting executables that may be in use."
+                        )
                     break
 
                 # A compiler/tool from the immediately previous WSL/native build
