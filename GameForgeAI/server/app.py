@@ -18,6 +18,7 @@ import time
 import traceback
 import urllib.parse
 import webbrowser
+import zipfile
 import atexit
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -919,6 +920,25 @@ def iteration_pipeline_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     return settings
 
 
+DEFAULT_CLEANUP_POLICY = {
+    "enabled": True,
+    "auto_after_iteration": True,
+    "archive_old_logs": True,
+    "log_keep_files": 60,
+    "capture_keep_groups": 4,
+    "research_keep_iterations": 8,
+    "process_ai_cleanup_candidates": True,
+}
+
+
+def cleanup_policy_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    settings = dict(DEFAULT_CLEANUP_POLICY)
+    configured = cfg.get("cleanup")
+    if isinstance(configured, dict):
+        settings.update(configured)
+    return settings
+
+
 def _experiment_meta_path(p: Path) -> Path:
     return p / ".gameforge" / "experiment.json"
 
@@ -1254,6 +1274,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
         "commands": {"build": "", "test": "", "launch": ""},
         "command_timeout_sec": 1800,
         "iteration_pipeline": dict(DEFAULT_ITERATION_PIPELINE),
+        "cleanup": dict(DEFAULT_CLEANUP_POLICY),
         "agent": {
             "permission_mode": "full-auto",
             "max_iterations": 0,
@@ -2793,7 +2814,7 @@ class Handler(SimpleHTTPRequestHandler):
             p = project_path(pid); cfg = project_config(pid)
             if action == "config":
                 body = self.body_json()
-                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","agent","visual","log_globs"}
+                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","agent","visual","log_globs"}
                 for k,v in body.items():
                     if k in allowed: cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
