@@ -195,12 +195,17 @@ $('#runCleanBuild').onclick=async()=>{
  $('#runOutput').textContent='Cleaning build outputs…';
  try{
    const r=await postAction('run/clean-build',{});
-   const cleanOut=r.clean?.output||'';
-   const buildOut=r.build?.output||'';
-   $('#runOutput').textContent=
-     'CLEAN\n'+cleanOut+
-     '\n\nBUILD\n'+buildOut+
-     `\n\nclean_ok=${!!r.clean?.ok} build_ok=${!!r.build?.ok} overall_ok=${!!r.ok}`;
+   const cleanOut=r.clean?.output||r.clean?.error||'';
+   const buildOut=r.build?.output||r.build?.error||'';
+   const lines=[
+     r.error?('ERROR\n'+r.error+'\n'):'',
+     'CLEAN'+(r.clean_command?'\ncommand: '+r.clean_command:'')+'\n'+(cleanOut||'(no output)'),
+     '',
+     'BUILD'+(r.build_command?'\ncommand: '+r.build_command:'')+'\n'+(buildOut||'(not run / no output)'),
+     '',
+     `clean_configured=${!!r.clean?.configured} clean_ok=${!!r.clean?.ok} build_configured=${!!r.build?.configured} build_ok=${!!r.build?.ok} overall_ok=${!!r.ok}`
+   ];
+   $('#runOutput').textContent=lines.filter((x,i)=>x!==''||i>0).join('\n');
  }catch(e){$('#runOutput').textContent=e.message}
 };
 $('#runTest').onclick=()=>run('test');$('#runLaunch').onclick=()=>run('launch');
