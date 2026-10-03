@@ -2283,6 +2283,303 @@ def start_cv(project_id: str) -> dict[str, Any]:
     return {"status": "starting", "message": "Starting OpenCV monitor"}
 
 
+
+def _cleanup_reference_text(p: Path) -> str:
+    """Collect authoritative current evidence references that cleanup must preserve."""
+    chunks: list[str] = []
+    for rel in (
+        ".gameforge/acceptance.json",
+        ".gameforge/user_review.json",
+        ".gameforge/last_evidence.json",
+        ".gameforge/compact_state.json",
+        ".gameforge/delivery_state.json",
+    ):
+        path = p / rel
+        if path.exists():
+            try:
+                chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                pass
+    notes = tail_text(p / ".gameforge" / "iteration_notes.md", 120000)
+    if notes:
+        chunks.append(notes)
+    return "\n".join(chunks)
+
+
+def _path_is_referenced(rel: str, reference_text: str) -> bool:
+    rel_norm = rel.replace("\\", "/")
+    name = Path(rel_norm).name
+    return rel_norm in reference_text or (len(name) >= 8 and name in reference_text)
+
+
+def _archive_log_files(log_root: Path, files: list[Path], archive_path: Path) -> tuple[int, int]:
+    if not files:
+        return 0, 0
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archived = 0
+    archived_bytes = 0
+    mode = "a" if archive_path.exists() else "w"
+    try:
+        with zipfile.ZipFile(archive_path, mode, compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            existing = set(zf.namelist())
+            for file in files:
+                if not file.exists() or not file.is_file():
+                    continue
+                arcname = str(file.relative_to(log_root)).replace("\\", "/")
+                if arcname in existing:
+                    # A prior cleanup already archived this logical path. Preserve
+                    # the newer copy with a timestamped name rather than create an
+                    # ambiguous duplicate member.
+                    stamp = int(file.stat().st_mtime)
+                    stem = Path(arcname)
+                    arcname = str(stem.with_name(f"{stem.stem}-{stamp}{stem.suffix}")).replace("\\", "/")
+                size = file.stat().st_size
+                zf.write(file, arcname)
+                existing.add(arcname)
+                archived += 1
+                archived_bytes += size
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            bad = zf.testzip()
+            if bad:
+                raise RuntimeError(f"Archive verification failed at {bad}")
+        for file in files:
+            try:
+                if file.exists() and file.is_file():
+                    file.unlink()
+            except OSError:
+                pass
+        return archived, archived_bytes
+    except Exception:
+        # Never delete originals if archive creation/verification fails.
+        raise
+
+
+def _remove_empty_dirs(root: Path) -> None:
+    if not root.exists():
+        return
+    for base, dirs, files in os.walk(root, topdown=False):
+        path = Path(base)
+        if path == root:
+            continue
+        try:
+            if not any(path.iterdir()):
+                path.rmdir()
+        except OSError:
+            pass
+
+
+def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, reason: str = "automatic") -> dict[str, Any]:
+    """Compact disposable runtime artifacts without deleting current evidence.
+
+    Logs are archived into logs/old_logs.zip before originals are removed.
+    Iteration-specific research and old capture groups are deleted only when they
+    are not referenced by current acceptance/feedback/evidence state. Workspace
+    files are deleted only when the AI explicitly marks them safe in
+    .gameforge/cleanup_candidates.json.
+    """
+    cfg = cfg or read_json(p / "gameforge.json", {}) or {}
+    policy = cleanup_policy_settings(cfg)
+    report: dict[str, Any] = {
+        "timestamp": now_iso(),
+        "reason": reason,
+        "enabled": bool(policy.get("enabled", True)),
+        "archived_logs": 0,
+        "archived_log_bytes": 0,
+        "deleted_capture_groups": [],
+        "deleted_research_files": [],
+        "deleted_ai_candidates": [],
+        "preserved_referenced": [],
+        "errors": [],
+    }
+    if not report["enabled"]:
+        write_json(p / ".gameforge" / "last_cleanup.json", report)
+        return report
+
+    reference_text = _cleanup_reference_text(p)
+
+    # 1) Logs: keep a bounded recent working set plus anything explicitly
+    # referenced by current evidence. Everything older goes into old_logs.zip.
+    log_root = p / "logs"
+    if bool(policy.get("archive_old_logs", True)) and log_root.exists():
+        archive_path = log_root / "old_logs.zip"
+        candidates = [
+            x for x in log_root.rglob("*")
+            if x.is_file() and x.resolve() != archive_path.resolve()
+        ]
+        candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        keep_count = max(10, int(policy.get("log_keep_files", 60) or 60))
+        recent = set(candidates[:keep_count])
+        archive_candidates: list[Path] = []
+        for file in candidates[keep_count:]:
+            rel = str(file.relative_to(p)).replace("\\", "/")
+            if _path_is_referenced(rel, reference_text):
+                report["preserved_referenced"].append(rel)
+                continue
+            archive_candidates.append(file)
+        try:
+            n, b = _archive_log_files(log_root, archive_candidates, archive_path)
+            report["archived_logs"] = n
+            report["archived_log_bytes"] = b
+        except Exception as exc:
+            report["errors"].append(f"log archive failed: {exc}")
+        _remove_empty_dirs(log_root)
+
+    # 2) Captures: keep a small recent working set plus every group named by
+    # current evidence. Old generated capture groups can always be regenerated.
+    capture_root = p / "captures"
+    if capture_root.exists():
+        groups = [x for x in capture_root.iterdir() if x.is_dir()]
+        groups.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        keep_groups = max(1, int(policy.get("capture_keep_groups", 4) or 4))
+        recent_groups = set(groups[:keep_groups])
+        for group in groups[keep_groups:]:
+            rel = str(group.relative_to(p)).replace("\\", "/")
+            if _path_is_referenced(rel, reference_text) or group.name in reference_text:
+                report["preserved_referenced"].append(rel)
+                continue
+            try:
+                shutil.rmtree(group)
+                report["deleted_capture_groups"].append(rel)
+            except Exception as exc:
+                report["errors"].append(f"capture cleanup {rel}: {exc}")
+
+    # 3) Research: retain canonical/non-iteration research permanently. Prune
+    # superseded iteration-specific evidence outside a recent iteration window,
+    # unless current acceptance/feedback still references it.
+    research_root = p / "research"
+    if research_root.exists():
+        iteration_files: list[tuple[int, Path]] = []
+        for file in research_root.iterdir():
+            if not file.is_file():
+                continue
+            m = re.match(r"(?i)^iteration[_-]?(\d+)", file.name)
+            if m:
+                iteration_files.append((int(m.group(1)), file))
+        max_iteration = max((n for n, _ in iteration_files), default=0)
+        keep_iterations = max(2, int(policy.get("research_keep_iterations", 8) or 8))
+        cutoff = max(0, max_iteration - keep_iterations + 1)
+        for number, file in iteration_files:
+            if number >= cutoff:
+                continue
+            rel = str(file.relative_to(p)).replace("\\", "/")
+            if _path_is_referenced(rel, reference_text):
+                report["preserved_referenced"].append(rel)
+                continue
+            try:
+                file.unlink()
+                report["deleted_research_files"].append(rel)
+            except Exception as exc:
+                report["errors"].append(f"research cleanup {rel}: {exc}")
+
+    # 4) Explicit AI candidates. This is the only route that may remove
+    # workspace tooling. The AI must name the exact file and mark it safe.
+    if bool(policy.get("process_ai_cleanup_candidates", True)):
+        manifest_path = p / ".gameforge" / "cleanup_candidates.json"
+        manifest = read_json(manifest_path, {}) or {}
+        rows = manifest.get("candidates", []) if isinstance(manifest, dict) else []
+        remaining = []
+        allowed_prefixes = ("workspace/tools/", "workspace/tests/", "research/", "captures/", "logs/")
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("safe_to_delete"):
+                remaining.append(row)
+                continue
+            rel = str(row.get("path", "") or "").replace("\\", "/").lstrip("/")
+            if not rel.startswith(allowed_prefixes) or ".." in Path(rel).parts:
+                row["cleanup_error"] = "path is outside disposable artifact areas"
+                remaining.append(row)
+                continue
+            target = (p / rel).resolve()
+            if p.resolve() not in target.parents:
+                row["cleanup_error"] = "path escapes project"
+                remaining.append(row)
+                continue
+            if _path_is_referenced(rel, reference_text):
+                row["cleanup_error"] = "still referenced by current evidence"
+                remaining.append(row)
+                report["preserved_referenced"].append(rel)
+                continue
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target)
+                elif target.exists():
+                    target.unlink()
+                report["deleted_ai_candidates"].append(rel)
+            except Exception as exc:
+                row["cleanup_error"] = str(exc)
+                remaining.append(row)
+        if rows:
+            write_json(manifest_path, {"updated_at": now_iso(), "candidates": remaining})
+
+    report["preserved_referenced"] = sorted(set(report["preserved_referenced"]))[:500]
+    write_json(p / ".gameforge" / "last_cleanup.json", report)
+    return report
+
+
+def infer_clean_command(p: Path, cfg: dict[str, Any]) -> str:
+    explicit = str(cfg.get("commands", {}).get("clean", "") or "").strip()
+    if explicit:
+        return explicit
+    candidates = [
+        ("workspace/tools/clean_mod.ps1", 'powershell -NoProfile -ExecutionPolicy Bypass -File "workspace/tools/clean_mod.ps1"'),
+        ("workspace/tools/clean_mod.sh", 'bash "workspace/tools/clean_mod.sh"'),
+        ("clean.ps1", 'powershell -NoProfile -ExecutionPolicy Bypass -File "clean.ps1"'),
+        ("clean.sh", 'bash "clean.sh"'),
+    ]
+    for rel, command in candidates:
+        if (p / rel).is_file():
+            return command
+    if (p / "CMakeCache.txt").is_file():
+        return "cmake --build . --target clean"
+    if (p / "build" / "CMakeCache.txt").is_file():
+        return "cmake --build build --target clean"
+    if (p / "build.ninja").is_file():
+        return "ninja -t clean"
+    if (p / "Makefile").is_file():
+        return "make clean"
+    package = read_json(p / "package.json", {}) or {}
+    if isinstance(package, dict) and isinstance(package.get("scripts"), dict) and package["scripts"].get("clean"):
+        return "npm run clean"
+    if (p / "gradlew").is_file():
+        return "./gradlew clean"
+    if (p / "gradlew.bat").is_file():
+        return "gradlew.bat clean"
+    return ""
+
+
+def run_clean_build(project_id: str) -> dict[str, Any]:
+    p = project_path(project_id)
+    cfg = project_config(project_id)
+    timeout = int(cfg.get("command_timeout_sec", 1800) or 1800)
+    clean_cmd = infer_clean_command(p, cfg)
+    build_cmd = str(cfg.get("commands", {}).get("build", "") or "").strip()
+    if not clean_cmd:
+        return {
+            "ok": False,
+            "error": "No clean command is configured or safely inferable. Set Commands → Clean, or let the agent add a project-local clean wrapper.",
+            "clean": {"configured": False, "ok": False},
+            "build": {"configured": bool(build_cmd), "ok": False},
+        }
+    if not build_cmd:
+        return {
+            "ok": False,
+            "error": "No build command is configured.",
+            "clean": {"configured": True, "ok": False},
+            "build": {"configured": False, "ok": False},
+        }
+    token = int(time.time())
+    clean_result = run_shell(clean_cmd, p, timeout, p / f"logs/manual-clean-{token}.log")
+    if not clean_result.get("ok"):
+        return {"ok": False, "clean": clean_result, "build": {"configured": True, "ok": False}, "error": "Clean step failed; build was not started."}
+    build_result = run_shell(build_cmd, p, timeout, p / f"logs/manual-clean-build-{token}.log")
+    return {
+        "ok": bool(build_result.get("ok")),
+        "clean_command": clean_cmd,
+        "build_command": build_cmd,
+        "clean": clean_result,
+        "build": build_result,
+    }
+
+
 def scan_uploads(project_id: str) -> dict[str, Any]:
     p = project_path(project_id)
     base = p / "UPLOAD"
