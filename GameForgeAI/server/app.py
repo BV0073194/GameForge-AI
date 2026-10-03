@@ -2482,7 +2482,17 @@ def _archive_log_files(log_root: Path, files: list[Path], archive_path: Path) ->
     archived_bytes = 0
     mode = "a" if archive_path.exists() else "w"
     try:
-        with zipfile.ZipFile(archive_path, mode, compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        # ZIP stores timestamps in DOS date format, whose minimum year is 1980.
+        # Copied/restored project logs can legitimately carry older filesystem
+        # mtimes. Clamp those timestamps instead of failing cleanup and leaving
+        # every old log unpacked.
+        with zipfile.ZipFile(
+            archive_path,
+            mode,
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=6,
+            strict_timestamps=False,
+        ) as zf:
             existing = set(zf.namelist())
             for file in files:
                 if not file.exists() or not file.is_file():
