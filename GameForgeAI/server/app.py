@@ -2869,17 +2869,39 @@ def run_clean_build(project_id: str) -> dict[str, Any]:
             "build": {"configured": False, "ok": False},
         }
     token = int(time.time())
-    clean_result = run_shell(clean_cmd, p, timeout, p / f"logs/manual-clean-{token}.log")
-    if not clean_result.get("ok"):
-        return {"ok": False, "clean": clean_result, "build": {"configured": True, "ok": False}, "error": "Clean step failed; build was not started."}
-    build_result = run_shell(build_cmd, p, timeout, p / f"logs/manual-clean-build-{token}.log")
-    return {
-        "ok": bool(build_result.get("ok")),
-        "clean_command": clean_cmd,
-        "build_command": build_cmd,
-        "clean": clean_result,
-        "build": build_result,
-    }
+    workflow_lock = _project_command_lock(p)
+    if not workflow_lock.acquire(blocking=False):
+        return {
+            "ok": False,
+            "error": "Another GameForge build/test/clean command is already running for this project. Clean & Build was not started.",
+            "clean": {"configured": True, "ok": False, "busy": True},
+            "build": {"configured": True, "ok": False, "busy": True},
+            "clean_command": clean_cmd,
+            "build_command": build_cmd,
+        }
+    try:
+        clean_result = run_shell(clean_cmd, p, timeout, p / f"logs/manual-clean-{token}.log")
+        if not clean_result.get("ok"):
+            return {
+                "ok": False,
+                "clean": clean_result,
+                "build": {"configured": True, "ok": False},
+                "clean_command": clean_cmd,
+                "build_command": build_cmd,
+                "error": clean_result.get("error") or "Clean step failed; build was not started.",
+            }
+        build_result = run_shell(build_cmd, p, timeout, p / f"logs/manual-clean-build-{token}.log")
+        return {
+            "ok": bool(build_result.get("ok")),
+            "clean_command": clean_cmd,
+            "build_command": build_cmd,
+            "clean": clean_result,
+            "build": build_result,
+            "error": build_result.get("error", "") if not build_result.get("ok") else "",
+            "repair_hint": build_result.get("repair_hint", "") if not build_result.get("ok") else "",
+        }
+    finally:
+        workflow_lock.release()
 
 
 def scan_uploads(project_id: str) -> dict[str, Any]:
