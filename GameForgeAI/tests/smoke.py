@@ -1,5 +1,5 @@
 from __future__ import annotations
-import json, os, tempfile, threading, time, urllib.request, sys
+import json, os, tempfile, threading, time, urllib.request, sys, zipfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -48,29 +48,24 @@ with tempfile.TemporaryDirectory() as td:
     idx = app.scan_project_tree(p)
     assert idx["file_count"] > 0
 
-    experiment = app.create_experimental_copy(cfg["id"])
-    assert experiment["ok"], experiment
-    exp_id = experiment["experimental_project_id"]
-    exp_root = app.project_path(exp_id)
-    assert exp_root.exists()
-    assert Path(experiment["initial_backup_path"]).exists()
-    exp_status = app.experiment_status(exp_root)
-    assert exp_status["role"] == "experimental"
-    assert not exp_status["promotion_allowed"]
-    exp_cfg = app.project_config(exp_id)
-    assert exp_cfg["experimental_pipeline"]["quality_mode"] == "strict-original"
-    assert exp_cfg["experimental_pipeline"]["full_configured_test_required"] is True
-    assert exp_cfg["experimental_pipeline"]["allow_savestate_for_trusted_evidence"] is False
+    # The strict fast pipeline is now production behavior on main. Targeted
+    # diagnostics may accelerate iteration, but they cannot close feedback or
+    # completion without the configured full build/test quality gate.
+    production_cfg = app.project_config(cfg["id"])
+    pipeline = app.iteration_pipeline_settings(production_cfg)
+    assert pipeline["quality_mode"] == "strict-original"
+    assert pipeline["full_configured_test_required"] is True
+    assert pipeline["allow_savestate_for_trusted_evidence"] is False
 
-    # Targeted/shortcut evidence alone must never close feedback in strict mode.
-    before_review = app.append_user_feedback(exp_root, "Strict quality smoke feedback.", "general")
-    candidate = app.load_user_review(exp_root)
+    before_review = app.append_user_feedback(p, "Strict quality smoke feedback.", "general")
+    candidate = app.load_user_review(p)
     candidate["feedback"][-1]["ready_for_verification"] = True
     candidate["feedback"][-1]["resolution"] = "Implemented in smoke fixture."
     candidate["feedback"][-1]["evidence"] = "Targeted diagnostic passed."
-    app.save_user_review(exp_root, candidate)
+    app.save_user_review(p, candidate)
+
     after_targeted_only = app.reconcile_feedback_work_orders(
-        exp_root,
+        p,
         before_review,
         {"configured": False, "ok": True},
         {"configured": False, "ok": True},
@@ -80,7 +75,7 @@ with tempfile.TemporaryDirectory() as td:
     assert after_targeted_only["feedback"][-1]["ready_for_verification"] is True
 
     after_full_gate = app.reconcile_feedback_work_orders(
-        exp_root,
+        p,
         before_review,
         {"configured": True, "ok": True},
         {"configured": True, "ok": True},
@@ -89,20 +84,63 @@ with tempfile.TemporaryDirectory() as td:
     assert after_full_gate["feedback"][-1]["addressed"] is True
     assert after_full_gate["feedback"][-1]["verification_class"] == "targeted-plus-original-full-regression"
 
-    old_channel = os.environ.get("GAMEFORGE_BUILD_CHANNEL")
-    os.environ["GAMEFORGE_BUILD_CHANNEL"] = "main"
-    try:
-        promoted = app.promote_experimental_copy(exp_id, True)
-        assert promoted["ok"], promoted
-        restored = app.project_path(cfg["id"])
-        assert (restored / ".gameforge" / "promotion_receipt.json").exists()
-        assert app.project_config(cfg["id"])["id"] == cfg["id"]
-        assert Path(promoted["pre_promotion_backup_path"]).exists()
-    finally:
-        if old_channel is None:
-            os.environ.pop("GAMEFORGE_BUILD_CHANNEL", None)
-        else:
-            os.environ["GAMEFORGE_BUILD_CHANNEL"] = old_channel
+    # Clean & Build must run a real clean step first and only then build.
+    clean_script = p / "smoke_clean.py"
+    build_script = p / "smoke_build.py"
+    clean_script.write_text("from pathlib import Path\nPath('clean.marker').write_text('clean', encoding='utf-8')\n", encoding="utf-8")
+    build_script.write_text(
+        "from pathlib import Path\n"
+        "assert Path('clean.marker').exists()\n"
+        "Path('build.marker').write_text('build', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    cfg3 = app.project_config(cfg["id"])
+    cfg3["commands"]["clean"] = f'"{sys.executable}" smoke_clean.py'
+    cfg3["commands"]["build"] = f'"{sys.executable}" smoke_build.py'
+    cfg3["cleanup"].update({"log_keep_files": 10, "capture_keep_groups": 2, "research_keep_iterations": 3})
+    app.write_json(p / "gameforge.json", cfg3)
+    clean_build = app.run_clean_build(cfg["id"])
+    assert clean_build["ok"], clean_build
+    assert (p / "clean.marker").exists()
+    assert (p / "build.marker").exists()
+
+    # Automatic cleanup archives old logs before deletion, prunes only old
+    # iteration-specific research/capture groups, and honors explicit AI-safe
+    # workspace candidates.
+    logs = p / "logs"
+    logs.mkdir(exist_ok=True)
+    for i in range(20):
+        q = logs / f"old-{i:02d}.log"
+        q.write_text(f"log {i}", encoding="utf-8")
+        os.utime(q, (1000 + i, 1000 + i))
+    research = p / "research"
+    research.mkdir(exist_ok=True)
+    for i in range(1, 9):
+        (research / f"ITERATION{i}_EVIDENCE.json").write_text("{}", encoding="utf-8")
+    captures = p / "captures"
+    captures.mkdir(exist_ok=True)
+    for i in range(1, 6):
+        d = captures / f"iteration-{i:02d}"
+        d.mkdir(exist_ok=True)
+        (d / "frame.png").write_bytes(b"not-an-image-needed-for-cleanup-smoke")
+        os.utime(d, (1000 + i, 1000 + i))
+    disposable = p / "workspace" / "tools" / "disposable-smoke.py"
+    disposable.parent.mkdir(parents=True, exist_ok=True)
+    disposable.write_text("print('obsolete')", encoding="utf-8")
+    app.write_json(p / ".gameforge" / "cleanup_candidates.json", {
+        "candidates": [{"path": "workspace/tools/disposable-smoke.py", "safe_to_delete": True, "reason": "smoke fixture"}]
+    })
+    cleanup = app.cleanup_project_artifacts(p, app.project_config(cfg["id"]), reason="smoke")
+    assert cleanup["archived_logs"] >= 10, cleanup
+    assert (logs / "old_logs.zip").exists()
+    with zipfile.ZipFile(logs / "old_logs.zip", "r") as zf:
+        assert zf.namelist()
+        assert zf.testzip() is None
+    assert not disposable.exists()
+    remaining_research = list(research.glob("ITERATION*_EVIDENCE.json"))
+    assert len(remaining_research) <= 3, [x.name for x in remaining_research]
+    remaining_capture_dirs = [x for x in captures.iterdir() if x.is_dir()]
+    assert len(remaining_capture_dirs) <= 2, [x.name for x in remaining_capture_dirs]
 
     server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
     port = server.server_address[1]
