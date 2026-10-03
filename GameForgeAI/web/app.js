@@ -163,7 +163,20 @@ async function postAction(action,body={}){if(!current)return;return api(`/api/pr
 $('#createBtn').onclick=async()=>{const goal=$('#newGoal').value.trim();if(!goal)return alert('Describe the playable result first.');try{const p=await api('/api/projects/create',{method:'POST',body:JSON.stringify({name:$('#newName').value||'Game Project',goal,research_mode:$('#newResearch').value})});$('#newGoal').value='';await loadProjects(p.id)}catch(e){alert(e.message)}};
 $('#refreshBtn').onclick=()=>loadProjects();
 for(const [id,act] of [['startAgent','agent/start'],['pauseAgent','agent/pause'],['resumeAgent','agent/resume'],['stopAgent','agent/stop'],['startCv','cv/start'],['stopCv','cv/stop']])$('#'+id).onclick=async()=>{try{await postAction(act);await refreshState()}catch(e){alert(e.message)}};
-async function run(which){$('#runOutput').textContent=`Running ${which}...`;try{const r=await postAction(`run/${which}`);$('#runOutput').textContent=(r.output||'')+`\nexit=${r.exit_code} ok=${r.ok}`}catch(e){$('#runOutput').textContent=e.message}}
+async function run(which){
+ $('#runOutput').textContent=`Running ${which}...`;
+ try{
+   const r=await postAction(`run/${which}`);
+   const parts=[];
+   if(r.error)parts.push('ERROR\n'+r.error);
+   if(r.repair_hint)parts.push('REPAIR HINT\n'+r.repair_hint);
+   if(r.output)parts.push(r.output);
+   if(r.busy)parts.push('Another project command is already active; GameForge did not start an overlapping build/test.');
+   if(r.transient_retries)parts.push('Automatic transient retries: '+r.transient_retries);
+   parts.push(`exit=${r.exit_code} ok=${r.ok}`);
+   $('#runOutput').textContent=parts.join('\n\n');
+ }catch(e){$('#runOutput').textContent=e.message}
+}
 $('#runBuild').onclick=()=>run('build');
 $('#runCleanBuild').onclick=async()=>{
  if(!current)return;
