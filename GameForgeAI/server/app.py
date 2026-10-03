@@ -761,107 +761,194 @@ def stop_agent_now(state: AgentState) -> None:
         ).start()
 
 
+def _project_command_lock(cwd: Path) -> threading.RLock:
+    key = str(cwd.resolve()).lower() if os.name == "nt" else str(cwd.resolve())
+    with PROJECT_COMMAND_LOCKS_GUARD:
+        lock = PROJECT_COMMAND_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            PROJECT_COMMAND_LOCKS[key] = lock
+        return lock
+
+
 def run_shell(command: str, cwd: Path, timeout: int = 1800, log_path: Path | None = None, activity_state: AgentState | None = None) -> dict[str, Any]:
     if not command.strip():
         return {"configured": False, "ok": True, "exit_code": None, "output": ""}
-    started = time.time()
-    stdout_lines: list[str] = []
-    stderr_lines: list[str] = []
-    proc: subprocess.Popen | None = None
+
+    project_lock = _project_command_lock(cwd)
+    acquired = False
     try:
-        kwargs: dict[str, Any] = {
-            "cwd": str(cwd),
-            "shell": True,
-            "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE,
-            "text": True,
-            "errors": "replace",
-            "env": _gameforge_process_env(),
-        }
-        if os.name == "nt":
-            kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        if activity_state is None:
+            # Manual build/test/clean actions should never overlap an autonomous
+            # project command. Return a useful busy result instead of starting a
+            # second compiler/emulator tree against the same files.
+            acquired = project_lock.acquire(blocking=False)
+            if not acquired:
+                result = {
+                    "configured": True,
+                    "ok": False,
+                    "busy": True,
+                    "exit_code": None,
+                    "output": "",
+                    "error": "Another GameForge build/test/clean command is already running for this project. Wait for it to finish or Stop the active run, then try again.",
+                }
+                if log_path:
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    log_path.write_text(result["error"], encoding="utf-8", errors="replace")
+                return result
         else:
-            kwargs["start_new_session"] = True
-        proc = subprocess.Popen(command, **kwargs)
-        _bind_active_process(activity_state, proc, "project-command")
-
-        def read_pipe(pipe, target: list[str]) -> None:
-            if pipe is None:
-                return
-            for line in pipe:
-                target.append(line)
-                if len(target) > 5000:
-                    del target[:1000]
-
-        out_thread = threading.Thread(target=read_pipe, args=(proc.stdout, stdout_lines), daemon=True)
-        err_thread = threading.Thread(target=read_pipe, args=(proc.stderr, stderr_lines), daemon=True)
-        out_thread.start(); err_thread.start()
-
-        cancelled = False
-        timed_out = False
-        while proc.poll() is None:
-            if activity_state is not None:
+            while not acquired:
                 if activity_state.stop_event.is_set():
+                    return {
+                        "configured": True, "ok": False, "cancelled": True,
+                        "exit_code": None, "output": "STOPPED BY USER while waiting for the project command lock.",
+                    }
+                acquired = project_lock.acquire(timeout=0.2)
+
+        total_started = time.time()
+        attempts: list[dict[str, Any]] = []
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
+            started = time.time()
+            stdout_lines: list[str] = []
+            stderr_lines: list[str] = []
+            proc: subprocess.Popen | None = None
+            try:
+                kwargs: dict[str, Any] = {
+                    "cwd": str(cwd),
+                    "shell": True,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.PIPE,
+                    "text": True,
+                    "errors": "replace",
+                    "env": _gameforge_process_env(),
+                }
+                if os.name == "nt":
+                    kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                else:
+                    kwargs["start_new_session"] = True
+                proc = subprocess.Popen(command, **kwargs)
+                _bind_active_process(activity_state, proc, "project-command")
+
+                def read_pipe(pipe, target: list[str]) -> None:
+                    if pipe is None:
+                        return
+                    for line in pipe:
+                        target.append(line)
+                        if len(target) > 5000:
+                            del target[:1000]
+
+                out_thread = threading.Thread(target=read_pipe, args=(proc.stdout, stdout_lines), daemon=True)
+                err_thread = threading.Thread(target=read_pipe, args=(proc.stderr, stderr_lines), daemon=True)
+                out_thread.start(); err_thread.start()
+
+                cancelled = False
+                timed_out = False
+                while proc.poll() is None:
+                    if activity_state is not None:
+                        if activity_state.stop_event.is_set():
+                            cancelled = True
+                            _terminate_process_tree(proc, grace_sec=1.0)
+                            break
+                        set_agent_activity(
+                            activity_state,
+                            activity_state.current_task or "Running project tooling",
+                            activity_state.current_detail or command,
+                            "heartbeat",
+                            history=False,
+                        )
+                    if time.time() - total_started >= timeout:
+                        timed_out = True
+                        _terminate_process_tree(proc, grace_sec=1.0)
+                        break
+                    time.sleep(0.2)
+
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    _terminate_process_tree(proc, grace_sec=0.5)
+                out_thread.join(timeout=2); err_thread.join(timeout=2)
+
+                if activity_state is not None and activity_state.stop_event.is_set() and not timed_out:
                     cancelled = True
-                    _terminate_process_tree(proc, grace_sec=1.0)
+
+                output = "".join(stdout_lines) + ("\n" if stdout_lines and stderr_lines else "") + "".join(stderr_lines)
+                if cancelled:
+                    result = {
+                        "configured": True, "ok": False, "cancelled": True,
+                        "exit_code": proc.returncode, "duration_sec": round(time.time() - total_started, 2),
+                        "output": ("STOPPED BY USER\n" + output)[-80000:],
+                    }
                     break
-                set_agent_activity(
-                    activity_state,
-                    activity_state.current_task or "Running project tooling",
-                    activity_state.current_detail or command,
-                    "heartbeat",
-                    history=False,
+                if timed_out:
+                    result = {
+                        "configured": True, "ok": False, "timed_out": True,
+                        "exit_code": proc.returncode, "duration_sec": round(time.time() - total_started, 2),
+                        "output": (f"TIMEOUT after {timeout}s\n" + output)[-80000:],
+                    }
+                    break
+
+                result = {
+                    "configured": True,
+                    "ok": proc.returncode == 0,
+                    "exit_code": proc.returncode,
+                    "duration_sec": round(time.time() - total_started, 2),
+                    "output": output[-80000:],
+                }
+                attempts.append({
+                    "attempt": attempt,
+                    "exit_code": proc.returncode,
+                    "duration_sec": round(time.time() - started, 2),
+                })
+
+                lower = output.lower()
+                transient_busy = proc.returncode != 0 and (
+                    "text file busy" in lower
+                    or "resource temporarily unavailable" in lower
+                    or "the process cannot access the file because it is being used by another process" in lower
                 )
-            if time.time() - started >= timeout:
-                timed_out = True
-                _terminate_process_tree(proc, grace_sec=1.0)
+                if not transient_busy or attempt >= max_attempts:
+                    if attempt > 1:
+                        result["transient_retries"] = attempt - 1
+                        result["attempts"] = attempts
+                    break
+
+                # A compiler/tool from the immediately previous WSL/native build
+                # can still have an executable mapped for a fraction of a second.
+                # Back off and retry the whole configured command without killing
+                # unrelated processes or weakening the build.
+                delay = float(attempt)
+                if activity_state is not None:
+                    set_agent_activity(
+                        activity_state,
+                        "Waiting for build files to unlock",
+                        f"Transient file-busy error detected; retrying the same command in {delay:.0f}s (attempt {attempt + 1}/{max_attempts}).",
+                        "self-heal",
+                    )
+                    if activity_state.stop_event.wait(delay):
+                        result["cancelled"] = True
+                        result["output"] = ("STOPPED BY USER during transient retry backoff.\n" + output)[-80000:]
+                        break
+                else:
+                    time.sleep(delay)
+            except Exception as exc:
+                result = {"configured": True, "ok": False, "exit_code": None, "output": repr(exc), "error": repr(exc)}
                 break
-            time.sleep(0.2)
+            finally:
+                if activity_state is not None and activity_state.active_process is proc:
+                    _bind_active_process(activity_state, None, "")
 
-        try:
-            proc.wait(timeout=3)
-        except Exception:
-            _terminate_process_tree(proc, grace_sec=0.5)
-        out_thread.join(timeout=2); err_thread.join(timeout=2)
-
-        # stop_agent_now() terminates the child tree from a separate thread so the
-        # UI remains responsive. On fast exits (notably Windows CTRL_BREAK_EVENT,
-        # which commonly returns 0xC000013A / 3221225786) the process can disappear
-        # before this polling loop gets another chance to set cancelled=True.
-        # The stop_event is therefore the authoritative cancellation signal.
-        if activity_state is not None and activity_state.stop_event.is_set() and not timed_out:
-            cancelled = True
-
-        output = "".join(stdout_lines) + ("\n" if stdout_lines and stderr_lines else "") + "".join(stderr_lines)
-        if cancelled:
-            result = {
-                "configured": True, "ok": False, "cancelled": True,
-                "exit_code": proc.returncode, "duration_sec": round(time.time() - started, 2),
-                "output": ("STOPPED BY USER\n" + output)[-80000:],
-            }
-        elif timed_out:
-            result = {
-                "configured": True, "ok": False, "timed_out": True,
-                "exit_code": proc.returncode, "duration_sec": round(time.time() - started, 2),
-                "output": (f"TIMEOUT after {timeout}s\n" + output)[-80000:],
-            }
-        else:
-            result = {
-                "configured": True,
-                "ok": proc.returncode == 0,
-                "exit_code": proc.returncode,
-                "duration_sec": round(time.time() - started, 2),
-                "output": output[-80000:],
-            }
-    except Exception as exc:
-        result = {"configured": True, "ok": False, "exit_code": None, "output": repr(exc)}
+        if log_path:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_text = result.get("output", "")
+            if result.get("error") and result["error"] not in log_text:
+                log_text = (result["error"] + "\n" + log_text).strip()
+            log_path.write_text(log_text, encoding="utf-8", errors="replace")
+        return result
     finally:
-        if activity_state is not None and activity_state.active_process is proc:
-            _bind_active_process(activity_state, None, "")
-    if log_path:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_path.write_text(result["output"], encoding="utf-8", errors="replace")
-    return result
+        if acquired:
+            project_lock.release()
 
 
 def repair_project_layout(p: Path) -> None:
@@ -1400,6 +1487,8 @@ CVS: dict[str, CVState] = {}
 STATE_LOCK = threading.Lock()
 MANAGED_PROCESSES: dict[str, subprocess.Popen] = {}
 MANAGED_PROCESS_META: dict[str, dict[str, Any]] = {}
+PROJECT_COMMAND_LOCKS: dict[str, threading.RLock] = {}
+PROJECT_COMMAND_LOCKS_GUARD = threading.Lock()
 APP_SERVER: ThreadingHTTPServer | None = None
 WEB_SESSION = {"last_heartbeat": time.monotonic(), "closing": False, "shutdown_started": False}
 
