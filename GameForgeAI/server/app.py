@@ -1271,7 +1271,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
         "goal": goal.strip(),
         "research_mode": research_mode if research_mode in {"off", "normal", "deep", "exhaustive"} else "deep",
         "internet_research": True,
-        "commands": {"build": "", "test": "", "launch": ""},
+        "commands": {"clean": "", "build": "", "test": "", "launch": ""},
         "command_timeout_sec": 1800,
         "iteration_pipeline": dict(DEFAULT_ITERATION_PIPELINE),
         "cleanup": dict(DEFAULT_CLEANUP_POLICY),
@@ -3256,6 +3256,10 @@ class Handler(SimpleHTTPRequestHandler):
                     if not st or not st.thread or not st.thread.is_alive():
                         start_agent(pid)
                 return self.send_json(save_user_review(p, review))
+            if action == "run/clean-build":
+                return self.send_json(run_clean_build(pid))
+            if action == "maintenance/cleanup":
+                return self.send_json(cleanup_project_artifacts(p, cfg, reason="manual"))
             if action in {"run/build","run/test","run/launch"}:
                 which = action.split("/")[1]
                 cmd = cfg.get("commands", {}).get(which, "")
