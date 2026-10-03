@@ -18,6 +18,7 @@ import time
 import traceback
 import urllib.parse
 import webbrowser
+import zipfile
 import atexit
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -919,6 +920,25 @@ def iteration_pipeline_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     return settings
 
 
+DEFAULT_CLEANUP_POLICY = {
+    "enabled": True,
+    "auto_after_iteration": True,
+    "archive_old_logs": True,
+    "log_keep_files": 60,
+    "capture_keep_groups": 4,
+    "research_keep_iterations": 8,
+    "process_ai_cleanup_candidates": True,
+}
+
+
+def cleanup_policy_settings(cfg: dict[str, Any]) -> dict[str, Any]:
+    settings = dict(DEFAULT_CLEANUP_POLICY)
+    configured = cfg.get("cleanup")
+    if isinstance(configured, dict):
+        settings.update(configured)
+    return settings
+
+
 def _experiment_meta_path(p: Path) -> Path:
     return p / ".gameforge" / "experiment.json"
 
@@ -1251,9 +1271,10 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
         "goal": goal.strip(),
         "research_mode": research_mode if research_mode in {"off", "normal", "deep", "exhaustive"} else "deep",
         "internet_research": True,
-        "commands": {"build": "", "test": "", "launch": ""},
+        "commands": {"clean": "", "build": "", "test": "", "launch": ""},
         "command_timeout_sec": 1800,
         "iteration_pipeline": dict(DEFAULT_ITERATION_PIPELINE),
+        "cleanup": dict(DEFAULT_CLEANUP_POLICY),
         "agent": {
             "permission_mode": "full-auto",
             "max_iterations": 0,
@@ -1781,6 +1802,121 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
     return True
 
 
+
+NON_PRODUCTION_CHANGE_PREFIXES = (
+    "logs/",
+    "captures/",
+    "research/",
+    ".gameforge/",
+    "workspace/tools/",
+    "workspace/tests/",
+)
+NON_PRODUCTION_CHANGE_FILES = {
+    "gameforge.json",
+    "AGENTS.md",
+}
+
+
+def git_changed_paths_since(p: Path, base_rev: str) -> list[str]:
+    paths: set[str] = set()
+    if not base_rev or not command_exists("git") or not (p / ".git").exists():
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", f"{base_rev}..HEAD"],
+            cwd=p, capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode == 0:
+            paths.update(x.strip().replace("\\", "/") for x in proc.stdout.splitlines() if x.strip())
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(["git", "status", "--porcelain"], cwd=p, capture_output=True, text=True, timeout=15)
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if len(line) < 4:
+                    continue
+                value = line[3:].strip()
+                if " -> " in value:
+                    value = value.split(" -> ", 1)[1]
+                value = value.strip('"').replace("\\", "/")
+                if value:
+                    paths.add(value)
+    except Exception:
+        pass
+    return sorted(paths)
+
+
+def classify_iteration_changes(p: Path, base_rev: str) -> dict[str, Any]:
+    paths = git_changed_paths_since(p, base_rev)
+    production: list[str] = []
+    diagnostic: list[str] = []
+    for rel in paths:
+        if rel in NON_PRODUCTION_CHANGE_FILES or rel.startswith(NON_PRODUCTION_CHANGE_PREFIXES):
+            diagnostic.append(rel)
+        else:
+            production.append(rel)
+    return {
+        "changed_paths": paths,
+        "production_paths": production,
+        "diagnostic_paths": diagnostic,
+        "production_changed": bool(production),
+        "diagnostic_only": bool(paths) and not bool(production),
+    }
+
+
+def update_delivery_state(p: Path, review: dict[str, Any], iteration: int, change_summary: dict[str, Any]) -> dict[str, Any]:
+    path = p / ".gameforge" / "delivery_state.json"
+    state = read_json(path, {}) or {}
+    pending = [
+        x for x in review.get("feedback", [])
+        if isinstance(x, dict) and not bool(x.get("addressed")) and x.get("id")
+    ]
+    pending_ids = [str(x["id"]) for x in pending]
+    focus = str(state.get("focus_feedback_id") or "")
+    if focus not in pending_ids:
+        focus = pending_ids[0] if pending_ids else ""
+
+    diagnostic_only = bool(change_summary.get("diagnostic_only"))
+    production_changed = bool(change_summary.get("production_changed"))
+    streak = int(state.get("consecutive_diagnostic_only", 0) or 0)
+    if pending_ids:
+        if diagnostic_only:
+            streak += 1
+        elif production_changed:
+            streak = 0
+
+    state.update({
+        "updated_at": now_iso(),
+        "iteration": iteration,
+        "focus_feedback_id": focus,
+        "pending_feedback_ids": pending_ids,
+        "consecutive_diagnostic_only": streak,
+        "last_change_summary": change_summary,
+        "delivery_enforcement": bool(pending_ids and streak >= 2),
+    })
+    write_json(path, state)
+    return state
+
+
+def delivery_state_for_prompt(p: Path, review: dict[str, Any]) -> dict[str, Any]:
+    state = read_json(p / ".gameforge" / "delivery_state.json", {}) or {}
+    pending = [
+        x for x in review.get("feedback", [])
+        if isinstance(x, dict) and not bool(x.get("addressed")) and x.get("id")
+    ]
+    pending_ids = [str(x["id"]) for x in pending]
+    focus = str(state.get("focus_feedback_id") or "")
+    if focus not in pending_ids:
+        focus = pending_ids[0] if pending_ids else ""
+    state["focus_feedback_id"] = focus
+    state["pending_feedback_ids"] = pending_ids
+    state["delivery_enforcement"] = bool(
+        pending_ids and int(state.get("consecutive_diagnostic_only", 0) or 0) >= 2
+    )
+    return state
+
+
 def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_result: dict[str, Any] | None, test_result: dict[str, Any] | None, recovery_context: dict[str, Any] | None = None) -> str:
     pipeline = iteration_pipeline_settings(cfg)
     fast_pipeline = bool(pipeline.get("enabled"))
@@ -1794,6 +1930,8 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
             "user_review": review,
             "last_evidence": read_json(p / ".gameforge/last_evidence.json", {}),
             "last_self_heal": read_json(p / ".gameforge/last_self_heal.json", {}),
+            "delivery_state": delivery_state_for_prompt(p, review),
+            "last_cleanup": read_json(p / ".gameforge/last_cleanup.json", {}),
             "iteration_notes_tail": tail_text(p / ".gameforge/iteration_notes.md", 14000),
             "git": git_status(p),
         }
@@ -1806,6 +1944,17 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     pending_feedback = [x for x in feedback_items if not bool(x.get("addressed"))]
     if pending_feedback:
         prior += "\nPENDING USER FEEDBACK WORK ORDERS (highest priority; do not silently skip):\n" + json.dumps(pending_feedback[-20:], indent=2)[-18000:]
+        delivery = delivery_state_for_prompt(p, review)
+        prior += "\nDELIVERY STATE:\n" + json.dumps(delivery, indent=2)[-7000:]
+        if delivery.get("delivery_enforcement"):
+            focus = delivery.get("focus_feedback_id") or pending_feedback[0].get("id")
+            prior += (
+                "\nDELIVERY ENFORCEMENT IS ACTIVE. Two or more consecutive passes changed only "
+                "diagnostic/research/test artifacts while user work remains pending. This pass must "
+                f"make a production-facing code/asset/gameplay change toward {focus}, or record a "
+                "specific genuine blocker and move to another actionable pending work order. Do not "
+                "spend another entire pass only inventing diagnostics, probes, captures, or verifiers.\n"
+            )
     addressed_feedback = [x for x in feedback_items if bool(x.get("addressed"))]
     if addressed_feedback:
         prior += "\nRecently addressed user feedback (context only):\n" + json.dumps(addressed_feedback[-8:], indent=2)[-7000:]
@@ -1825,12 +1974,18 @@ During the AI turn, prefer short targeted tests for the code you are actively ch
 
 STRICT ORIGINAL QUALITY MODE: The original configured build/test commands are the trusted quality gate and must not be weakened, replaced, shortened, fast-forwarded, or rewritten merely to make the experiment look faster. Savestates, direct scene warps, test-only state injection, fast-forward, native-save checkpoints, or other shortcuts may be used ONLY as development diagnostics. They are NEVER trusted acceptance evidence and NEVER sufficient to close a user-feedback work order. After a targeted check looks good, keep addressed=false and set ready_for_verification=true with a concrete resolution and targeted evidence; GameForge will close it only after the unchanged configured full build and full regression pass. Final project completion still requires the original full regression path.
 
+DELIVERY-FIRST RULE: User-visible implementation is the purpose of the loop; diagnostics exist only to unblock implementation. Never spend more than two consecutive iterations on diagnostic-only research/probes/verifier construction for pending user work. Prefer modifying production gameplay/code/assets and then testing that result. If a diagnostic path remains ambiguous after two passes, implement the safest evidence-backed candidate, try an alternate production approach, or explicitly record a genuine blocker and work a different pending requirement. Do not indefinitely investigate one edge case while other requested features remain unimplemented.
+
 When multiple pending user-feedback work orders are closely related, batch them into one coherent milestone and verify them together instead of spending separate iterations on tiny adjacent changes. This changes workflow efficiency only; it does NOT lower acceptance, regression, evidence, user-feedback completion, visual, physics, audio, gameplay, persistence, or polish requirements."""
     else:
         startup = "Read AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything."
     return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\n{startup}\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
 
 USER FEEDBACK WORK-ORDER CONTRACT: Every entry in .gameforge/user_review.json with addressed=false is a persistent requirement and takes priority over lower-value roadmap polish. Do not merely acknowledge it. Implement the requested change, build/run the relevant result, and verify the user's requested behavior or appearance with concrete evidence. In strict quality mode, after your targeted verification set ready_for_verification=true but keep addressed=false; GameForge itself will mark it addressed only after the configured original full build/regression pass. Outside strict quality mode, only after verification may you update that same feedback entry to addressed=true and status="addressed". When doing so, preserve id/created_at/category/text exactly and add non-empty "resolution" (what changed), "evidence" (specific test/log/capture/runtime proof), and "addressed_at". If verification is incomplete, a configured build/test fails, or the request is blocked, keep addressed=false/status="pending" and explain the blocker in iteration notes. Never delete a feedback entry. GameForge will reject unsupported resolution claims and will not accept project completion while any feedback work order remains pending.
+
+ARTIFACT HYGIENE: Keep the working project lean. Do not preserve disposable diagnostic scripts, captures, or iteration-only research merely out of habit. When a generated file under workspace/tools/, workspace/tests/, research/, captures/, or logs/ is no longer needed and is not current acceptance/feedback evidence, add it to .gameforge/cleanup_candidates.json as {"path":"relative/path","safe_to_delete":true,"reason":"why it is obsolete"}. GameForge will safely process those candidates after the iteration. Never mark source/gameplay assets, UPLOAD inputs, current evidence, or anything needed to reproduce a pending requirement as disposable.
+
+CLEAN BUILD SUPPORT: Keep gameforge.json commands.clean configured whenever the project's build system has a safe clean operation. Prefer a project-local clean wrapper when the real toolchain lives in WSL or another environment. A clean operation may remove generated build/intermediate/cache outputs only; it must never remove source, user uploads, saves, acceptance evidence, or required external toolchains. If commands.clean is blank and the build system is understood, add/verify the clean wrapper as part of normal project maintenance.
 
 Treat build/runtime warnings, dependency errors, WSL issues, toolchain failures, crashes, missing packages, configuration mistakes, and environment problems as live diagnostic signals. For every recoverable issue: read the exact output, identify the root cause, apply the smallest safe reversible fix, rerun the exact failed step, verify it, and continue toward the playable result. Install missing dependencies autonomously from official package managers or authoritative upstream sources when allowed. Prefer project-local or user-local installs, unattended/non-interactive flags, and pinned/reproducible versions. Never open terminal windows just to run WSL, PowerShell, package managers, compilers, or tests; keep diagnostics and repairs headless and capture their output. In WSL, prefer non-interactive commands and repair filesystem/tool configuration rather than repeatedly tolerating the same warning. Do not ask the user to perform routine debugging, install ordinary development dependencies, copy files between project folders, edit configs, or rerun commands that you can safely do yourself.
 
@@ -1893,7 +2048,8 @@ def agent_loop(project_id: str) -> None:
             state.last_update = now_iso()
             state.message = f"Iteration {iteration}: checkpointing and asking Codex to improve the playable result"
             set_agent_activity(state, "Saving a safety checkpoint", f"Creating the pre-iteration Git checkpoint for iteration {iteration}.", "checkpoint")
-            git_checkpoint(p, f"GameForge pre-iteration {iteration}")
+            pre_checkpoint = git_checkpoint(p, f"GameForge pre-iteration {iteration}")
+            pre_iteration_rev = str(pre_checkpoint.get("rev", "") or "")
             review_before_iteration = load_user_review(p)
             prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result, recovery_context)
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
@@ -2028,6 +2184,11 @@ def agent_loop(project_id: str) -> None:
                 state.message = f"Automatic recovery exhausted {recovery_failures} timeout attempts. Project state and diagnostics are preserved."
                 return
 
+            change_summary = classify_iteration_changes(p, pre_iteration_rev)
+            delivery_state = update_delivery_state(
+                p, load_user_review(p), iteration, change_summary
+            )
+
             if load_user_review(p).get("user_done"):
                 reconcile_feedback_work_orders(
                     p, review_before_iteration, verification_complete=False
@@ -2101,8 +2262,30 @@ def agent_loop(project_id: str) -> None:
                 "test": {k:v for k,v in test_result.items() if k != "output"},
                 "visual": read_json(p / "captures/metrics.json", {}),
                 "pending_user_feedback": pending_feedback_count,
+                "change_summary": change_summary,
+                "delivery_state": delivery_state,
             }
             write_json(p / ".gameforge/last_evidence.json", evidence)
+
+            cleanup_report = None
+            cleanup_policy = cleanup_policy_settings(cfg)
+            if cleanup_policy.get("enabled", True) and cleanup_policy.get("auto_after_iteration", True):
+                try:
+                    set_agent_activity(state, "Cleaning old artifacts", "Archiving old logs and removing obsolete unreferenced research/captures.", "cleanup")
+                    cleanup_report = cleanup_project_artifacts(p, cfg, reason=f"iteration-{iteration}")
+                    evidence["cleanup"] = {
+                        "archived_logs": cleanup_report.get("archived_logs", 0),
+                        "archived_log_bytes": cleanup_report.get("archived_log_bytes", 0),
+                        "deleted_capture_groups": len(cleanup_report.get("deleted_capture_groups", [])),
+                        "deleted_research_files": len(cleanup_report.get("deleted_research_files", [])),
+                        "deleted_ai_candidates": len(cleanup_report.get("deleted_ai_candidates", [])),
+                        "errors": cleanup_report.get("errors", []),
+                    }
+                    write_json(p / ".gameforge/last_evidence.json", evidence)
+                except Exception as exc:
+                    write_json(p / ".gameforge/last_cleanup.json", {
+                        "timestamp": now_iso(), "reason": f"iteration-{iteration}", "errors": [str(exc)]
+                    })
 
             if acceptance_is_complete(p, build_result, test_result):
                 git_checkpoint(p, f"GameForge verified completion iteration {iteration}")
@@ -2260,6 +2443,303 @@ def start_cv(project_id: str) -> dict[str, Any]:
     s.thread = t
     t.start()
     return {"status": "starting", "message": "Starting OpenCV monitor"}
+
+
+
+def _cleanup_reference_text(p: Path) -> str:
+    """Collect authoritative current evidence references that cleanup must preserve."""
+    chunks: list[str] = []
+    for rel in (
+        ".gameforge/acceptance.json",
+        ".gameforge/user_review.json",
+        ".gameforge/last_evidence.json",
+        ".gameforge/compact_state.json",
+        ".gameforge/delivery_state.json",
+    ):
+        path = p / rel
+        if path.exists():
+            try:
+                chunks.append(path.read_text(encoding="utf-8", errors="replace"))
+            except Exception:
+                pass
+    notes = tail_text(p / ".gameforge" / "iteration_notes.md", 120000)
+    if notes:
+        chunks.append(notes)
+    return "\n".join(chunks)
+
+
+def _path_is_referenced(rel: str, reference_text: str) -> bool:
+    rel_norm = rel.replace("\\", "/")
+    name = Path(rel_norm).name
+    return rel_norm in reference_text or (len(name) >= 8 and name in reference_text)
+
+
+def _archive_log_files(log_root: Path, files: list[Path], archive_path: Path) -> tuple[int, int]:
+    if not files:
+        return 0, 0
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    archived = 0
+    archived_bytes = 0
+    mode = "a" if archive_path.exists() else "w"
+    try:
+        with zipfile.ZipFile(archive_path, mode, compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            existing = set(zf.namelist())
+            for file in files:
+                if not file.exists() or not file.is_file():
+                    continue
+                arcname = str(file.relative_to(log_root)).replace("\\", "/")
+                if arcname in existing:
+                    # A prior cleanup already archived this logical path. Preserve
+                    # the newer copy with a timestamped name rather than create an
+                    # ambiguous duplicate member.
+                    stamp = int(file.stat().st_mtime)
+                    stem = Path(arcname)
+                    arcname = str(stem.with_name(f"{stem.stem}-{stamp}{stem.suffix}")).replace("\\", "/")
+                size = file.stat().st_size
+                zf.write(file, arcname)
+                existing.add(arcname)
+                archived += 1
+                archived_bytes += size
+        with zipfile.ZipFile(archive_path, "r") as zf:
+            bad = zf.testzip()
+            if bad:
+                raise RuntimeError(f"Archive verification failed at {bad}")
+        for file in files:
+            try:
+                if file.exists() and file.is_file():
+                    file.unlink()
+            except OSError:
+                pass
+        return archived, archived_bytes
+    except Exception:
+        # Never delete originals if archive creation/verification fails.
+        raise
+
+
+def _remove_empty_dirs(root: Path) -> None:
+    if not root.exists():
+        return
+    for base, dirs, files in os.walk(root, topdown=False):
+        path = Path(base)
+        if path == root:
+            continue
+        try:
+            if not any(path.iterdir()):
+                path.rmdir()
+        except OSError:
+            pass
+
+
+def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, reason: str = "automatic") -> dict[str, Any]:
+    """Compact disposable runtime artifacts without deleting current evidence.
+
+    Logs are archived into logs/old_logs.zip before originals are removed.
+    Iteration-specific research and old capture groups are deleted only when they
+    are not referenced by current acceptance/feedback/evidence state. Workspace
+    files are deleted only when the AI explicitly marks them safe in
+    .gameforge/cleanup_candidates.json.
+    """
+    cfg = cfg or read_json(p / "gameforge.json", {}) or {}
+    policy = cleanup_policy_settings(cfg)
+    report: dict[str, Any] = {
+        "timestamp": now_iso(),
+        "reason": reason,
+        "enabled": bool(policy.get("enabled", True)),
+        "archived_logs": 0,
+        "archived_log_bytes": 0,
+        "deleted_capture_groups": [],
+        "deleted_research_files": [],
+        "deleted_ai_candidates": [],
+        "preserved_referenced": [],
+        "errors": [],
+    }
+    if not report["enabled"]:
+        write_json(p / ".gameforge" / "last_cleanup.json", report)
+        return report
+
+    reference_text = _cleanup_reference_text(p)
+
+    # 1) Logs: keep a bounded recent working set plus anything explicitly
+    # referenced by current evidence. Everything older goes into old_logs.zip.
+    log_root = p / "logs"
+    if bool(policy.get("archive_old_logs", True)) and log_root.exists():
+        archive_path = log_root / "old_logs.zip"
+        candidates = [
+            x for x in log_root.rglob("*")
+            if x.is_file() and x.resolve() != archive_path.resolve()
+        ]
+        candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        keep_count = max(10, int(policy.get("log_keep_files", 60) or 60))
+        recent = set(candidates[:keep_count])
+        archive_candidates: list[Path] = []
+        for file in candidates[keep_count:]:
+            rel = str(file.relative_to(p)).replace("\\", "/")
+            if _path_is_referenced(rel, reference_text):
+                report["preserved_referenced"].append(rel)
+                continue
+            archive_candidates.append(file)
+        try:
+            n, b = _archive_log_files(log_root, archive_candidates, archive_path)
+            report["archived_logs"] = n
+            report["archived_log_bytes"] = b
+        except Exception as exc:
+            report["errors"].append(f"log archive failed: {exc}")
+        _remove_empty_dirs(log_root)
+
+    # 2) Captures: keep a small recent working set plus every group named by
+    # current evidence. Old generated capture groups can always be regenerated.
+    capture_root = p / "captures"
+    if capture_root.exists():
+        groups = [x for x in capture_root.iterdir() if x.is_dir()]
+        groups.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        keep_groups = max(1, int(policy.get("capture_keep_groups", 4) or 4))
+        recent_groups = set(groups[:keep_groups])
+        for group in groups[keep_groups:]:
+            rel = str(group.relative_to(p)).replace("\\", "/")
+            if _path_is_referenced(rel, reference_text) or group.name in reference_text:
+                report["preserved_referenced"].append(rel)
+                continue
+            try:
+                shutil.rmtree(group)
+                report["deleted_capture_groups"].append(rel)
+            except Exception as exc:
+                report["errors"].append(f"capture cleanup {rel}: {exc}")
+
+    # 3) Research: retain canonical/non-iteration research permanently. Prune
+    # superseded iteration-specific evidence outside a recent iteration window,
+    # unless current acceptance/feedback still references it.
+    research_root = p / "research"
+    if research_root.exists():
+        iteration_files: list[tuple[int, Path]] = []
+        for file in research_root.iterdir():
+            if not file.is_file():
+                continue
+            m = re.match(r"(?i)^iteration[_-]?(\d+)", file.name)
+            if m:
+                iteration_files.append((int(m.group(1)), file))
+        max_iteration = max((n for n, _ in iteration_files), default=0)
+        keep_iterations = max(2, int(policy.get("research_keep_iterations", 8) or 8))
+        cutoff = max(0, max_iteration - keep_iterations + 1)
+        for number, file in iteration_files:
+            if number >= cutoff:
+                continue
+            rel = str(file.relative_to(p)).replace("\\", "/")
+            if _path_is_referenced(rel, reference_text):
+                report["preserved_referenced"].append(rel)
+                continue
+            try:
+                file.unlink()
+                report["deleted_research_files"].append(rel)
+            except Exception as exc:
+                report["errors"].append(f"research cleanup {rel}: {exc}")
+
+    # 4) Explicit AI candidates. This is the only route that may remove
+    # workspace tooling. The AI must name the exact file and mark it safe.
+    if bool(policy.get("process_ai_cleanup_candidates", True)):
+        manifest_path = p / ".gameforge" / "cleanup_candidates.json"
+        manifest = read_json(manifest_path, {}) or {}
+        rows = manifest.get("candidates", []) if isinstance(manifest, dict) else []
+        remaining = []
+        allowed_prefixes = ("workspace/tools/", "workspace/tests/", "research/", "captures/", "logs/")
+        for row in rows:
+            if not isinstance(row, dict) or not row.get("safe_to_delete"):
+                remaining.append(row)
+                continue
+            rel = str(row.get("path", "") or "").replace("\\", "/").lstrip("/")
+            if not rel.startswith(allowed_prefixes) or ".." in Path(rel).parts:
+                row["cleanup_error"] = "path is outside disposable artifact areas"
+                remaining.append(row)
+                continue
+            target = (p / rel).resolve()
+            if p.resolve() not in target.parents:
+                row["cleanup_error"] = "path escapes project"
+                remaining.append(row)
+                continue
+            if _path_is_referenced(rel, reference_text):
+                row["cleanup_error"] = "still referenced by current evidence"
+                remaining.append(row)
+                report["preserved_referenced"].append(rel)
+                continue
+            try:
+                if target.is_dir():
+                    shutil.rmtree(target)
+                elif target.exists():
+                    target.unlink()
+                report["deleted_ai_candidates"].append(rel)
+            except Exception as exc:
+                row["cleanup_error"] = str(exc)
+                remaining.append(row)
+        if rows:
+            write_json(manifest_path, {"updated_at": now_iso(), "candidates": remaining})
+
+    report["preserved_referenced"] = sorted(set(report["preserved_referenced"]))[:500]
+    write_json(p / ".gameforge" / "last_cleanup.json", report)
+    return report
+
+
+def infer_clean_command(p: Path, cfg: dict[str, Any]) -> str:
+    explicit = str(cfg.get("commands", {}).get("clean", "") or "").strip()
+    if explicit:
+        return explicit
+    candidates = [
+        ("workspace/tools/clean_mod.ps1", 'powershell -NoProfile -ExecutionPolicy Bypass -File "workspace/tools/clean_mod.ps1"'),
+        ("workspace/tools/clean_mod.sh", 'bash "workspace/tools/clean_mod.sh"'),
+        ("clean.ps1", 'powershell -NoProfile -ExecutionPolicy Bypass -File "clean.ps1"'),
+        ("clean.sh", 'bash "clean.sh"'),
+    ]
+    for rel, command in candidates:
+        if (p / rel).is_file():
+            return command
+    if (p / "CMakeCache.txt").is_file():
+        return "cmake --build . --target clean"
+    if (p / "build" / "CMakeCache.txt").is_file():
+        return "cmake --build build --target clean"
+    if (p / "build.ninja").is_file():
+        return "ninja -t clean"
+    if (p / "Makefile").is_file():
+        return "make clean"
+    package = read_json(p / "package.json", {}) or {}
+    if isinstance(package, dict) and isinstance(package.get("scripts"), dict) and package["scripts"].get("clean"):
+        return "npm run clean"
+    if (p / "gradlew").is_file():
+        return "./gradlew clean"
+    if (p / "gradlew.bat").is_file():
+        return "gradlew.bat clean"
+    return ""
+
+
+def run_clean_build(project_id: str) -> dict[str, Any]:
+    p = project_path(project_id)
+    cfg = project_config(project_id)
+    timeout = int(cfg.get("command_timeout_sec", 1800) or 1800)
+    clean_cmd = infer_clean_command(p, cfg)
+    build_cmd = str(cfg.get("commands", {}).get("build", "") or "").strip()
+    if not clean_cmd:
+        return {
+            "ok": False,
+            "error": "No clean command is configured or safely inferable. Set Commands → Clean, or let the agent add a project-local clean wrapper.",
+            "clean": {"configured": False, "ok": False},
+            "build": {"configured": bool(build_cmd), "ok": False},
+        }
+    if not build_cmd:
+        return {
+            "ok": False,
+            "error": "No build command is configured.",
+            "clean": {"configured": True, "ok": False},
+            "build": {"configured": False, "ok": False},
+        }
+    token = int(time.time())
+    clean_result = run_shell(clean_cmd, p, timeout, p / f"logs/manual-clean-{token}.log")
+    if not clean_result.get("ok"):
+        return {"ok": False, "clean": clean_result, "build": {"configured": True, "ok": False}, "error": "Clean step failed; build was not started."}
+    build_result = run_shell(build_cmd, p, timeout, p / f"logs/manual-clean-build-{token}.log")
+    return {
+        "ok": bool(build_result.get("ok")),
+        "clean_command": clean_cmd,
+        "build_command": build_cmd,
+        "clean": clean_result,
+        "build": build_result,
+    }
 
 
 def scan_uploads(project_id: str) -> dict[str, Any]:
@@ -2793,7 +3273,7 @@ class Handler(SimpleHTTPRequestHandler):
             p = project_path(pid); cfg = project_config(pid)
             if action == "config":
                 body = self.body_json()
-                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","agent","visual","log_globs"}
+                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","agent","visual","log_globs"}
                 for k,v in body.items():
                     if k in allowed: cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
@@ -2938,6 +3418,10 @@ class Handler(SimpleHTTPRequestHandler):
                     if not st or not st.thread or not st.thread.is_alive():
                         start_agent(pid)
                 return self.send_json(save_user_review(p, review))
+            if action == "run/clean-build":
+                return self.send_json(run_clean_build(pid))
+            if action == "maintenance/cleanup":
+                return self.send_json(cleanup_project_artifacts(p, cfg, reason="manual"))
             if action in {"run/build","run/test","run/launch"}:
                 which = action.split("/")[1]
                 cmd = cfg.get("commands", {}).get(which, "")
