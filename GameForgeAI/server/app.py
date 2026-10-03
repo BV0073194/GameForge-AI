@@ -2046,7 +2046,8 @@ def agent_loop(project_id: str) -> None:
             state.last_update = now_iso()
             state.message = f"Iteration {iteration}: checkpointing and asking Codex to improve the playable result"
             set_agent_activity(state, "Saving a safety checkpoint", f"Creating the pre-iteration Git checkpoint for iteration {iteration}.", "checkpoint")
-            git_checkpoint(p, f"GameForge pre-iteration {iteration}")
+            pre_checkpoint = git_checkpoint(p, f"GameForge pre-iteration {iteration}")
+            pre_iteration_rev = str(pre_checkpoint.get("rev", "") or "")
             review_before_iteration = load_user_review(p)
             prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result, recovery_context)
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
@@ -2181,6 +2182,11 @@ def agent_loop(project_id: str) -> None:
                 state.message = f"Automatic recovery exhausted {recovery_failures} timeout attempts. Project state and diagnostics are preserved."
                 return
 
+            change_summary = classify_iteration_changes(p, pre_iteration_rev)
+            delivery_state = update_delivery_state(
+                p, load_user_review(p), iteration, change_summary
+            )
+
             if load_user_review(p).get("user_done"):
                 reconcile_feedback_work_orders(
                     p, review_before_iteration, verification_complete=False
@@ -2254,8 +2260,30 @@ def agent_loop(project_id: str) -> None:
                 "test": {k:v for k,v in test_result.items() if k != "output"},
                 "visual": read_json(p / "captures/metrics.json", {}),
                 "pending_user_feedback": pending_feedback_count,
+                "change_summary": change_summary,
+                "delivery_state": delivery_state,
             }
             write_json(p / ".gameforge/last_evidence.json", evidence)
+
+            cleanup_report = None
+            cleanup_policy = cleanup_policy_settings(cfg)
+            if cleanup_policy.get("enabled", True) and cleanup_policy.get("auto_after_iteration", True):
+                try:
+                    set_agent_activity(state, "Cleaning old artifacts", "Archiving old logs and removing obsolete unreferenced research/captures.", "cleanup")
+                    cleanup_report = cleanup_project_artifacts(p, cfg, reason=f"iteration-{iteration}")
+                    evidence["cleanup"] = {
+                        "archived_logs": cleanup_report.get("archived_logs", 0),
+                        "archived_log_bytes": cleanup_report.get("archived_log_bytes", 0),
+                        "deleted_capture_groups": len(cleanup_report.get("deleted_capture_groups", [])),
+                        "deleted_research_files": len(cleanup_report.get("deleted_research_files", [])),
+                        "deleted_ai_candidates": len(cleanup_report.get("deleted_ai_candidates", [])),
+                        "errors": cleanup_report.get("errors", []),
+                    }
+                    write_json(p / ".gameforge/last_evidence.json", evidence)
+                except Exception as exc:
+                    write_json(p / ".gameforge/last_cleanup.json", {
+                        "timestamp": now_iso(), "reason": f"iteration-{iteration}", "errors": [str(exc)]
+                    })
 
             if acceptance_is_complete(p, build_result, test_result):
                 git_checkpoint(p, f"GameForge verified completion iteration {iteration}")
