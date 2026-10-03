@@ -1802,6 +1802,121 @@ def acceptance_is_complete(p: Path, build_result: dict[str, Any], test_result: d
     return True
 
 
+
+NON_PRODUCTION_CHANGE_PREFIXES = (
+    "logs/",
+    "captures/",
+    "research/",
+    ".gameforge/",
+    "workspace/tools/",
+    "workspace/tests/",
+)
+NON_PRODUCTION_CHANGE_FILES = {
+    "gameforge.json",
+    "AGENTS.md",
+}
+
+
+def git_changed_paths_since(p: Path, base_rev: str) -> list[str]:
+    paths: set[str] = set()
+    if not base_rev or not command_exists("git") or not (p / ".git").exists():
+        return []
+    try:
+        proc = subprocess.run(
+            ["git", "diff", "--name-only", f"{base_rev}..HEAD"],
+            cwd=p, capture_output=True, text=True, timeout=15,
+        )
+        if proc.returncode == 0:
+            paths.update(x.strip().replace("\\", "/") for x in proc.stdout.splitlines() if x.strip())
+    except Exception:
+        pass
+    try:
+        proc = subprocess.run(["git", "status", "--porcelain"], cwd=p, capture_output=True, text=True, timeout=15)
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if len(line) < 4:
+                    continue
+                value = line[3:].strip()
+                if " -> " in value:
+                    value = value.split(" -> ", 1)[1]
+                value = value.strip('"').replace("\\", "/")
+                if value:
+                    paths.add(value)
+    except Exception:
+        pass
+    return sorted(paths)
+
+
+def classify_iteration_changes(p: Path, base_rev: str) -> dict[str, Any]:
+    paths = git_changed_paths_since(p, base_rev)
+    production: list[str] = []
+    diagnostic: list[str] = []
+    for rel in paths:
+        if rel in NON_PRODUCTION_CHANGE_FILES or rel.startswith(NON_PRODUCTION_CHANGE_PREFIXES):
+            diagnostic.append(rel)
+        else:
+            production.append(rel)
+    return {
+        "changed_paths": paths,
+        "production_paths": production,
+        "diagnostic_paths": diagnostic,
+        "production_changed": bool(production),
+        "diagnostic_only": bool(paths) and not bool(production),
+    }
+
+
+def update_delivery_state(p: Path, review: dict[str, Any], iteration: int, change_summary: dict[str, Any]) -> dict[str, Any]:
+    path = p / ".gameforge" / "delivery_state.json"
+    state = read_json(path, {}) or {}
+    pending = [
+        x for x in review.get("feedback", [])
+        if isinstance(x, dict) and not bool(x.get("addressed")) and x.get("id")
+    ]
+    pending_ids = [str(x["id"]) for x in pending]
+    focus = str(state.get("focus_feedback_id") or "")
+    if focus not in pending_ids:
+        focus = pending_ids[0] if pending_ids else ""
+
+    diagnostic_only = bool(change_summary.get("diagnostic_only"))
+    production_changed = bool(change_summary.get("production_changed"))
+    streak = int(state.get("consecutive_diagnostic_only", 0) or 0)
+    if pending_ids:
+        if diagnostic_only:
+            streak += 1
+        elif production_changed:
+            streak = 0
+
+    state.update({
+        "updated_at": now_iso(),
+        "iteration": iteration,
+        "focus_feedback_id": focus,
+        "pending_feedback_ids": pending_ids,
+        "consecutive_diagnostic_only": streak,
+        "last_change_summary": change_summary,
+        "delivery_enforcement": bool(pending_ids and streak >= 2),
+    })
+    write_json(path, state)
+    return state
+
+
+def delivery_state_for_prompt(p: Path, review: dict[str, Any]) -> dict[str, Any]:
+    state = read_json(p / ".gameforge" / "delivery_state.json", {}) or {}
+    pending = [
+        x for x in review.get("feedback", [])
+        if isinstance(x, dict) and not bool(x.get("addressed")) and x.get("id")
+    ]
+    pending_ids = [str(x["id"]) for x in pending]
+    focus = str(state.get("focus_feedback_id") or "")
+    if focus not in pending_ids:
+        focus = pending_ids[0] if pending_ids else ""
+    state["focus_feedback_id"] = focus
+    state["pending_feedback_ids"] = pending_ids
+    state["delivery_enforcement"] = bool(
+        pending_ids and int(state.get("consecutive_diagnostic_only", 0) or 0) >= 2
+    )
+    return state
+
+
 def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_result: dict[str, Any] | None, test_result: dict[str, Any] | None, recovery_context: dict[str, Any] | None = None) -> str:
     pipeline = iteration_pipeline_settings(cfg)
     fast_pipeline = bool(pipeline.get("enabled"))
@@ -1815,6 +1930,8 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
             "user_review": review,
             "last_evidence": read_json(p / ".gameforge/last_evidence.json", {}),
             "last_self_heal": read_json(p / ".gameforge/last_self_heal.json", {}),
+            "delivery_state": delivery_state_for_prompt(p, review),
+            "last_cleanup": read_json(p / ".gameforge/last_cleanup.json", {}),
             "iteration_notes_tail": tail_text(p / ".gameforge/iteration_notes.md", 14000),
             "git": git_status(p),
         }
@@ -1827,6 +1944,17 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     pending_feedback = [x for x in feedback_items if not bool(x.get("addressed"))]
     if pending_feedback:
         prior += "\nPENDING USER FEEDBACK WORK ORDERS (highest priority; do not silently skip):\n" + json.dumps(pending_feedback[-20:], indent=2)[-18000:]
+        delivery = delivery_state_for_prompt(p, review)
+        prior += "\nDELIVERY STATE:\n" + json.dumps(delivery, indent=2)[-7000:]
+        if delivery.get("delivery_enforcement"):
+            focus = delivery.get("focus_feedback_id") or pending_feedback[0].get("id")
+            prior += (
+                "\nDELIVERY ENFORCEMENT IS ACTIVE. Two or more consecutive passes changed only "
+                "diagnostic/research/test artifacts while user work remains pending. This pass must "
+                f"make a production-facing code/asset/gameplay change toward {focus}, or record a "
+                "specific genuine blocker and move to another actionable pending work order. Do not "
+                "spend another entire pass only inventing diagnostics, probes, captures, or verifiers.\n"
+            )
     addressed_feedback = [x for x in feedback_items if bool(x.get("addressed"))]
     if addressed_feedback:
         prior += "\nRecently addressed user feedback (context only):\n" + json.dumps(addressed_feedback[-8:], indent=2)[-7000:]
@@ -1846,12 +1974,16 @@ During the AI turn, prefer short targeted tests for the code you are actively ch
 
 STRICT ORIGINAL QUALITY MODE: The original configured build/test commands are the trusted quality gate and must not be weakened, replaced, shortened, fast-forwarded, or rewritten merely to make the experiment look faster. Savestates, direct scene warps, test-only state injection, fast-forward, native-save checkpoints, or other shortcuts may be used ONLY as development diagnostics. They are NEVER trusted acceptance evidence and NEVER sufficient to close a user-feedback work order. After a targeted check looks good, keep addressed=false and set ready_for_verification=true with a concrete resolution and targeted evidence; GameForge will close it only after the unchanged configured full build and full regression pass. Final project completion still requires the original full regression path.
 
+DELIVERY-FIRST RULE: User-visible implementation is the purpose of the loop; diagnostics exist only to unblock implementation. Never spend more than two consecutive iterations on diagnostic-only research/probes/verifier construction for pending user work. Prefer modifying production gameplay/code/assets and then testing that result. If a diagnostic path remains ambiguous after two passes, implement the safest evidence-backed candidate, try an alternate production approach, or explicitly record a genuine blocker and work a different pending requirement. Do not indefinitely investigate one edge case while other requested features remain unimplemented.
+
 When multiple pending user-feedback work orders are closely related, batch them into one coherent milestone and verify them together instead of spending separate iterations on tiny adjacent changes. This changes workflow efficiency only; it does NOT lower acceptance, regression, evidence, user-feedback completion, visual, physics, audio, gameplay, persistence, or polish requirements."""
     else:
         startup = "Read AGENTS.md, goal.md, gameforge.json, .gameforge/acceptance.json, research/, UPLOAD/, the current source tree, and Git history/status before changing anything."
     return f'''You are iteration {iteration} of a persistent autonomous game-development run.\n\n{startup}\n\nResearch mode: {research}. Internet research requested: {cfg.get("internet_research", True)}. If web/internet tools are available, use them when they materially improve correctness or unblock implementation. Prefer primary/official sources and public source code; record important sources/provenance in research/SOURCES.md.\n\nYour job this iteration is to make the highest-value SAFE, REVERSIBLE progress toward the user's playable goal. Implement and debug rather than only describing. Use uploaded assets when useful and adapt them to the target game's native visual/technical style. Never invent unsupported APIs. Preserve known-good behavior.\n\nAfter making changes, update .gameforge/acceptance.json honestly. Do NOT set project_complete=true unless there is concrete runtime/test evidence for every criterion. Leave notes in .gameforge/iteration_notes.md about what changed, what was tested, what remains, and the next best action.
 
 USER FEEDBACK WORK-ORDER CONTRACT: Every entry in .gameforge/user_review.json with addressed=false is a persistent requirement and takes priority over lower-value roadmap polish. Do not merely acknowledge it. Implement the requested change, build/run the relevant result, and verify the user's requested behavior or appearance with concrete evidence. In strict quality mode, after your targeted verification set ready_for_verification=true but keep addressed=false; GameForge itself will mark it addressed only after the configured original full build/regression pass. Outside strict quality mode, only after verification may you update that same feedback entry to addressed=true and status="addressed". When doing so, preserve id/created_at/category/text exactly and add non-empty "resolution" (what changed), "evidence" (specific test/log/capture/runtime proof), and "addressed_at". If verification is incomplete, a configured build/test fails, or the request is blocked, keep addressed=false/status="pending" and explain the blocker in iteration notes. Never delete a feedback entry. GameForge will reject unsupported resolution claims and will not accept project completion while any feedback work order remains pending.
+
+ARTIFACT HYGIENE: Keep the working project lean. Do not preserve disposable diagnostic scripts, captures, or iteration-only research merely out of habit. When a generated file under workspace/tools/, workspace/tests/, research/, captures/, or logs/ is no longer needed and is not current acceptance/feedback evidence, add it to .gameforge/cleanup_candidates.json as {"path":"relative/path","safe_to_delete":true,"reason":"why it is obsolete"}. GameForge will safely process those candidates after the iteration. Never mark source/gameplay assets, UPLOAD inputs, current evidence, or anything needed to reproduce a pending requirement as disposable.
 
 Treat build/runtime warnings, dependency errors, WSL issues, toolchain failures, crashes, missing packages, configuration mistakes, and environment problems as live diagnostic signals. For every recoverable issue: read the exact output, identify the root cause, apply the smallest safe reversible fix, rerun the exact failed step, verify it, and continue toward the playable result. Install missing dependencies autonomously from official package managers or authoritative upstream sources when allowed. Prefer project-local or user-local installs, unattended/non-interactive flags, and pinned/reproducible versions. Never open terminal windows just to run WSL, PowerShell, package managers, compilers, or tests; keep diagnostics and repairs headless and capture their output. In WSL, prefer non-interactive commands and repair filesystem/tool configuration rather than repeatedly tolerating the same warning. Do not ask the user to perform routine debugging, install ordinary development dependencies, copy files between project folders, edit configs, or rerun commands that you can safely do yourself.
 
