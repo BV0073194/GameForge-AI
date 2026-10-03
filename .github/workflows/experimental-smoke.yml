@@ -1,8 +1,9 @@
-name: Experimental Fast Pipeline Smoke
+name: GameForge Source Smoke
 
 on:
   push:
     branches:
+      - main
       - "experimental/**"
   pull_request:
     branches:
