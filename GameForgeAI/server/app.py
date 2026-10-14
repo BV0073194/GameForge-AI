@@ -1715,6 +1715,136 @@ def collect_logs(p: Path, cfg: dict[str, Any]) -> str:
     return "".join(chunks)[-70000:]
 
 
+
+def live_queue_path(p: Path) -> Path:
+    return p / ".gameforge" / "live_queue.json"
+
+
+def load_live_queue(p: Path) -> dict[str, Any]:
+    data = read_json(live_queue_path(p), {}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = []
+    data["version"] = 1
+    data["items"] = [x for x in items if isinstance(x, dict)][-200:]
+    return data
+
+
+def save_live_queue(p: Path, data: dict[str, Any]) -> dict[str, Any]:
+    data["version"] = 1
+    data["updated_at"] = now_iso()
+    data["items"] = [x for x in data.get("items", []) if isinstance(x, dict)][-200:]
+    write_json(live_queue_path(p), data)
+    return data
+
+
+def live_queue_public(p: Path) -> dict[str, Any]:
+    data = load_live_queue(p)
+    items = data.get("items", [])
+    queued = [x for x in items if x.get("status") == "queued"]
+    in_progress = [x for x in items if x.get("status") == "in_progress"]
+    recent = [x for x in items if x.get("status") in {"delivered", "cancelled"}][-20:]
+    return {
+        "queued": queued,
+        "in_progress": in_progress,
+        "recent": recent,
+        "queued_count": len(queued),
+        "in_progress_count": len(in_progress),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+def enqueue_live_instruction(
+    p: Path,
+    text_value: str,
+    *,
+    mode: str = "queue",
+    source: str = "user",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    text_value = str(text_value or "").strip()
+    if not text_value:
+        raise ValueError("Live instruction cannot be empty")
+    if len(text_value) > 20000:
+        raise ValueError("Live instruction is too long")
+    mode = "interrupt" if mode == "interrupt" else "queue"
+    data = load_live_queue(p)
+    item = {
+        "id": f"live-{int(time.time() * 1000)}-{len(data.get('items', []))}",
+        "created_at": now_iso(),
+        "text": text_value,
+        "mode": mode,
+        "priority": "immediate" if mode == "interrupt" else "normal",
+        "source": source,
+        "status": "queued",
+        "attempts": 0,
+        "metadata": metadata or {},
+    }
+    data.setdefault("items", []).append(item)
+    save_live_queue(p, data)
+    return item
+
+
+def requeue_live_instructions(p: Path, *, reason: str) -> None:
+    data = load_live_queue(p)
+    changed = False
+    for item in data.get("items", []):
+        if item.get("status") == "in_progress":
+            item["status"] = "queued"
+            item["requeued_at"] = now_iso()
+            item["requeue_reason"] = reason
+            item.pop("claimed_iteration", None)
+            changed = True
+    if changed:
+        save_live_queue(p, data)
+
+
+def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[dict[str, Any]]:
+    data = load_live_queue(p)
+    changed = False
+    # A crashed/interrupted prior turn must never lose user steering.
+    for item in data.get("items", []):
+        if item.get("status") == "in_progress" and int(item.get("claimed_iteration", -1) or -1) != iteration:
+            item["status"] = "queued"
+            item["requeued_at"] = now_iso()
+            item["requeue_reason"] = "prior turn did not settle"
+            changed = True
+
+    queued = [x for x in data.get("items", []) if x.get("status") == "queued"]
+    queued.sort(key=lambda x: (0 if x.get("priority") == "immediate" else 1, str(x.get("created_at", ""))))
+    claimed = queued[:max(1, limit)]
+    for item in claimed:
+        item["status"] = "in_progress"
+        item["claimed_iteration"] = iteration
+        item["claimed_at"] = now_iso()
+        item["attempts"] = int(item.get("attempts", 0) or 0) + 1
+        changed = True
+    if changed:
+        save_live_queue(p, data)
+    return [dict(x) for x in claimed]
+
+
+def settle_live_instructions(p: Path, iteration: int, *, delivered: bool, reason: str = "") -> None:
+    data = load_live_queue(p)
+    changed = False
+    for item in data.get("items", []):
+        if item.get("status") != "in_progress" or int(item.get("claimed_iteration", -1) or -1) != iteration:
+            continue
+        if delivered:
+            item["status"] = "delivered"
+            item["delivered_at"] = now_iso()
+        else:
+            item["status"] = "queued"
+            item["requeued_at"] = now_iso()
+            if reason:
+                item["requeue_reason"] = reason
+        changed = True
+    if changed:
+        save_live_queue(p, data)
+
+
 def user_input_request_path(p: Path) -> Path:
     return p / ".gameforge" / "user_input_request.json"
 
