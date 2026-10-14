@@ -62,6 +62,8 @@ with tempfile.TemporaryDirectory() as td:
     prompt_smoke = app.build_agent_prompt(p, production_cfg, 1, None, None, None)
     assert '.gameforge/cleanup_candidates.json' in prompt_smoke
     assert '{"path":"relative/path","safe_to_delete":true' in prompt_smoke
+    assert "LIVE FUSION INTERACTION" in prompt_smoke
+    assert "FUSION RUNTIME" in prompt_smoke
 
     # Fusion live steering is durable, priority ordered, and injected into the
     # next coding-agent prompt without weakening the normal quality gates.
@@ -215,6 +217,33 @@ with tempfile.TemporaryDirectory() as td:
     assert manifest["format"] == "GameForgeAI.Fusion"
     assert manifest["recent_run_reports"][-1]["worked"] is True
 
+    # Fusion deployment provides the Melty-style reversible install property:
+    # replace a file only after backing it up, then restore the exact original.
+    game_root = Path(td) / "owned-game"
+    game_target = game_root / "mods" / "example.dat"
+    game_target.parent.mkdir(parents=True, exist_ok=True)
+    game_target.write_text("original-game-file", encoding="utf-8")
+    built_file = p / "release" / "example.dat"
+    built_file.parent.mkdir(parents=True, exist_ok=True)
+    built_file.write_text("fusion-built-file", encoding="utf-8")
+    app.write_json(app.fusion_deploy_config_path(p), {
+        "target_root": str(game_root),
+        "files": [{"source": "release/example.dat", "target": "mods/example.dat"}],
+    })
+    install = app.fusion_install(cfg["id"])
+    assert install["ok"], install
+    assert game_target.read_text(encoding="utf-8") == "fusion-built-file"
+    assert app.fusion_deployment_status(p)["state"]["status"] == "active"
+    restore = app.fusion_uninstall(cfg["id"])
+    assert restore["ok"], restore
+    assert game_target.read_text(encoding="utf-8") == "original-game-file"
+    assert app.fusion_deployment_status(p)["state"]["status"] == "restored"
+
+    inventory = app.discover_installed_games()
+    assert inventory["local_only"] is True
+    assert isinstance(inventory["games"], list)
+    app.write_json(p / ".gameforge" / "game_inventory.json", inventory)
+
     # Automatic cleanup archives old logs before deletion, prunes only old
     # iteration-specific research/capture groups, and honors explicit AI-safe
     # workspace candidates.
@@ -289,6 +318,8 @@ with tempfile.TemporaryDirectory() as td:
             state_payload = json.loads(r.read())
             assert "live_queue" in state_payload
             assert state_payload["fusion_manifest"]["format"] == "GameForgeAI.Fusion"
+            assert "fusion_deployment" in state_payload
+            assert "game_inventory" in state_payload
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r:
             page = r.read().decode("utf-8", "replace")
             assert "GameForge" in page
