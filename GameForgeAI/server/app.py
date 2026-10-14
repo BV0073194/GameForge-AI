@@ -2174,6 +2174,8 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
             "delivery_state": delivery_state_for_prompt(p, review),
             "last_cleanup": read_json(p / ".gameforge/last_cleanup.json", {}),
             "live_user_inputs": live_inputs,
+            "installed_games": read_json(p / ".gameforge" / "game_inventory.json", {"count": 0, "games": []}),
+            "fusion_deployment": fusion_deployment_status(p),
             "iteration_notes_tail": tail_text(p / ".gameforge/iteration_notes.md", 14000),
             "git": git_status(p),
         }
@@ -2240,6 +2242,8 @@ STRICT ORIGINAL QUALITY MODE: The original configured build/test commands are th
 DELIVERY-FIRST RULE: User-visible implementation is the purpose of the loop; diagnostics exist only to unblock implementation. Never spend more than two consecutive iterations on diagnostic-only research/probes/verifier construction for pending user work. Prefer modifying production gameplay/code/assets and then testing that result. If a diagnostic path remains ambiguous after two passes, implement the safest evidence-backed candidate, try an alternate production approach, or explicitly record a genuine blocker and work a different pending requirement. Do not indefinitely investigate one edge case while other requested features remain unimplemented.
 
 LIVE FUSION INTERACTION: The user can type steering instructions while you work. Any LIVE USER INSTRUCTIONS in this prompt are fresh and should be treated as the highest-priority steering for this pass. The user may also interrupt a running turn to run a new instruction immediately; preserve already-good work and continue from the current files rather than starting over. When you genuinely need a user-only answer, use the structured user_input_request.json contract below so the UI can present the question and feed the answer directly into the next turn.
+
+FUSION RUNTIME: Prefer locally detected owned-game installations and never redistribute proprietary game files. For PC mods that must place built files into a real game folder, create .gameforge/fusion_deploy.json with {"target_root":"absolute owned-game folder","files":[{"source":"project-relative built file","target":"game-relative destination"}]}. GameForge performs transactional backups before installation and restores originals on uninstall. Do not use this deployment path to bypass anti-cheat, modify competitive online sessions, or touch files outside the declared game root. Record real managed launches as runtime evidence, but keep GameForge's configured full build/regression as the final quality authority.
 
 When multiple pending user-feedback work orders are closely related, batch them into one coherent milestone and verify them together instead of spending separate iterations on tiny adjacent changes. This changes workflow efficiency only; it does NOT lower acceptance, regression, evidence, user-feedback completion, visual, physics, audio, gameplay, persistence, or polish requirements."""
     else:
@@ -3171,6 +3175,276 @@ def list_processes(limit: int = 300) -> list[dict[str, Any]]:
     return rows[:limit]
 
 
+
+def discover_installed_games() -> dict[str, Any]:
+    """Local-only Steam inventory: names, install folders, app ids and build ids."""
+    steam_roots: set[Path] = set()
+    system = platform.system()
+    if system == "Windows":
+        try:
+            import winreg
+            for root, key_path in (
+                (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+            ):
+                try:
+                    with winreg.OpenKey(root, key_path) as key:
+                        for value_name in ("SteamPath", "InstallPath"):
+                            try:
+                                value, _ = winreg.QueryValueEx(key, value_name)
+                                if value:
+                                    steam_roots.add(Path(str(value)).expanduser())
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        for base in (
+            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam",
+            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam",
+        ):
+            steam_roots.add(base)
+    elif system == "Darwin":
+        steam_roots.add(Path.home() / "Library" / "Application Support" / "Steam")
+    else:
+        steam_roots.update({
+            Path.home() / ".steam" / "steam",
+            Path.home() / ".local" / "share" / "Steam",
+        })
+
+    libraries: set[Path] = set()
+    for root in list(steam_roots):
+        if root.exists():
+            libraries.add(root)
+            vdf = root / "steamapps" / "libraryfolders.vdf"
+            if vdf.is_file():
+                try:
+                    text_value = vdf.read_text(encoding="utf-8", errors="replace")
+                    for match in re.finditer(r'"path"\s+"([^"]+)"', text_value):
+                        raw = match.group(1).replace(r"\\", "\\")
+                        candidate = Path(raw).expanduser()
+                        if candidate.exists():
+                            libraries.add(candidate)
+                except Exception:
+                    pass
+
+    games: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for library in sorted(libraries, key=lambda x: str(x).lower()):
+        steamapps = library / "steamapps"
+        if not steamapps.is_dir():
+            continue
+        for manifest in sorted(steamapps.glob("appmanifest_*.acf")):
+            try:
+                text_value = manifest.read_text(encoding="utf-8", errors="replace")
+                fields = {
+                    key.lower(): value
+                    for key, value in re.findall(r'"([^"]+)"\s+"([^"]*)"', text_value)
+                }
+                app_id = fields.get("appid") or manifest.stem.replace("appmanifest_", "")
+                install_dir = fields.get("installdir", "")
+                name = fields.get("name", "") or f"Steam app {app_id}"
+                install_path = steamapps / "common" / install_dir if install_dir else None
+                identity = str(app_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                games.append({
+                    "store": "steam",
+                    "app_id": str(app_id),
+                    "name": name,
+                    "build_id": fields.get("buildid", ""),
+                    "install_dir": install_dir,
+                    "install_path": str(install_path) if install_path else "",
+                    "installed": bool(install_path and install_path.exists()),
+                    "library": str(library),
+                })
+            except Exception:
+                continue
+    games.sort(key=lambda x: str(x.get("name", "")).lower())
+    return {"scanned_at": now_iso(), "local_only": True, "games": games, "count": len(games)}
+
+
+def fusion_deploy_config_path(p: Path) -> Path:
+    return p / ".gameforge" / "fusion_deploy.json"
+
+
+def fusion_deployment_state_path(p: Path) -> Path:
+    return p / ".gameforge" / "fusion_deployment_state.json"
+
+
+def load_fusion_deploy_config(p: Path) -> dict[str, Any]:
+    data = read_json(fusion_deploy_config_path(p), {}) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fusion_deployment_status(p: Path) -> dict[str, Any]:
+    config = load_fusion_deploy_config(p)
+    state = read_json(fusion_deployment_state_path(p), {}) or {}
+    if not isinstance(state, dict):
+        state = {}
+    return {
+        "configured": bool(config.get("target_root") and isinstance(config.get("files"), list)),
+        "config": config,
+        "state": state,
+    }
+
+
+def fusion_install(project_id: str) -> dict[str, Any]:
+    p = project_path(project_id)
+    cfg = load_fusion_deploy_config(p)
+    target_raw = str(cfg.get("target_root", "") or "").strip()
+    files = cfg.get("files")
+    if not target_raw or not isinstance(files, list) or not files:
+        return {
+            "ok": False,
+            "error": "No Fusion deployment is configured. The agent can create .gameforge/fusion_deploy.json with target_root and source→target file mappings.",
+        }
+    target_root = Path(target_raw).expanduser().resolve()
+    if not target_root.is_dir():
+        return {"ok": False, "error": f"Target game folder does not exist: {target_root}"}
+    if len(files) > 5000:
+        return {"ok": False, "error": "Fusion deployment contains too many files"}
+
+    active = read_json(fusion_deployment_state_path(p), {}) or {}
+    if isinstance(active, dict) and active.get("status") in {"active", "active-with-conflicts"}:
+        return {"ok": False, "error": "A Fusion deployment is already active. Restore it before installing again.", "state": active}
+
+    deployment_id = f"deploy-{int(time.time() * 1000)}"
+    backup_root = p / ".gameforge" / "fusion-deployments" / deployment_id / "backup"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    state: dict[str, Any] = {
+        "id": deployment_id,
+        "status": "installing",
+        "started_at": now_iso(),
+        "target_root": str(target_root),
+        "files": [],
+    }
+    write_json(fusion_deployment_state_path(p), state)
+    changed: list[dict[str, Any]] = []
+
+    try:
+        for row in files:
+            if not isinstance(row, dict):
+                raise ValueError("Invalid Fusion file mapping")
+            source_rel = str(row.get("source", "") or "").replace("\\", "/").lstrip("/")
+            target_rel = str(row.get("target", "") or "").replace("\\", "/").lstrip("/")
+            if not source_rel or not target_rel:
+                raise ValueError("Every Fusion file mapping needs source and target")
+            source = safe_child(p, source_rel)
+            target = safe_child(target_root, target_rel)
+            if not source.is_file():
+                raise FileNotFoundError(f"Fusion source file missing: {source_rel}")
+            if target.exists() and not target.is_file():
+                raise ValueError(f"Fusion target is not a regular file: {target_rel}")
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            existed = target.exists()
+            backup_rel = target_rel
+            backup = safe_child(backup_root, backup_rel)
+            original_sha = ""
+            if existed:
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+                original_sha = _sha256_file(target)
+
+            temp = target.with_name(target.name + ".gameforge-installing")
+            shutil.copy2(source, temp)
+            os.replace(temp, target)
+            record = {
+                "source": source_rel,
+                "target": target_rel,
+                "existed": existed,
+                "backup": str(backup.relative_to(p)).replace("\\", "/") if existed else "",
+                "original_sha256": original_sha,
+                "installed_sha256": _sha256_file(target),
+            }
+            state["files"].append(record)
+            changed.append(record)
+            write_json(fusion_deployment_state_path(p), state)
+
+        state["status"] = "active"
+        state["installed_at"] = now_iso()
+        write_json(fusion_deployment_state_path(p), state)
+        return {"ok": True, "state": state}
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for record in reversed(changed):
+            try:
+                target = safe_child(target_root, str(record["target"]))
+                if record.get("existed"):
+                    backup = safe_child(p, str(record["backup"]))
+                    if backup.is_file():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        temp = target.with_name(target.name + ".gameforge-rollback")
+                        shutil.copy2(backup, temp)
+                        os.replace(temp, target)
+                elif target.exists():
+                    target.unlink()
+            except Exception as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        state["status"] = "failed"
+        state["failed_at"] = now_iso()
+        state["error"] = str(exc)
+        state["rollback_errors"] = rollback_errors
+        write_json(fusion_deployment_state_path(p), state)
+        return {"ok": False, "error": str(exc), "rollback_errors": rollback_errors, "state": state}
+
+
+def fusion_uninstall(project_id: str) -> dict[str, Any]:
+    p = project_path(project_id)
+    state = read_json(fusion_deployment_state_path(p), {}) or {}
+    if not isinstance(state, dict) or state.get("status") not in {"active", "active-with-conflicts"}:
+        return {"ok": False, "error": "No active Fusion deployment to restore"}
+    target_root = Path(str(state.get("target_root", ""))).expanduser().resolve()
+    conflicts: list[dict[str, Any]] = []
+    restored: list[str] = []
+
+    for record in reversed(state.get("files", [])):
+        try:
+            target = safe_child(target_root, str(record.get("target", "")))
+            installed_sha = str(record.get("installed_sha256", "") or "")
+            if target.exists() and installed_sha and _sha256_file(target) != installed_sha:
+                conflicts.append({
+                    "target": record.get("target"),
+                    "reason": "Target changed after Fusion installed it; left untouched to avoid data loss.",
+                })
+                continue
+            if record.get("existed"):
+                backup = safe_child(p, str(record.get("backup", "")))
+                if not backup.is_file():
+                    conflicts.append({"target": record.get("target"), "reason": "Original backup is missing."})
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temp = target.with_name(target.name + ".gameforge-restoring")
+                shutil.copy2(backup, temp)
+                os.replace(temp, target)
+            elif target.exists():
+                target.unlink()
+            restored.append(str(record.get("target", "")))
+        except Exception as exc:
+            conflicts.append({"target": record.get("target"), "reason": str(exc)})
+
+    state["restored_at"] = now_iso()
+    state["restored_files"] = restored
+    state["conflicts"] = conflicts
+    state["status"] = "active-with-conflicts" if conflicts else "restored"
+    write_json(fusion_deployment_state_path(p), state)
+    return {"ok": not conflicts, "state": state, "conflicts": conflicts}
+
+
 def run_reports_path(p: Path) -> Path:
     return p / ".gameforge" / "run_reports.json"
 
@@ -3651,6 +3925,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "fusion": cfg.get("fusion", DEFAULT_FUSION_POLICY),
                     "fusion_manifest": fusion_manifest(p, cfg),
                     "run_reports": load_run_reports(p),
+                    "game_inventory": read_json(p / ".gameforge" / "game_inventory.json", {"count": 0, "games": []}),
+                    "fusion_deployment": fusion_deployment_status(p),
                 })
             if path.startswith("/api/project/") and path.endswith("/index"):
                 pid = path.split("/")[3]
@@ -3954,6 +4230,14 @@ class Handler(SimpleHTTPRequestHandler):
             if action == "git/rollback":
                 body = self.body_json()
                 return self.send_json(git_rollback(p, body.get("revision", "")))
+            if action == "games/scan":
+                inventory = discover_installed_games()
+                write_json(p / ".gameforge" / "game_inventory.json", inventory)
+                return self.send_json(inventory)
+            if action == "fusion/install":
+                return self.send_json(fusion_install(pid))
+            if action == "fusion/restore":
+                return self.send_json(fusion_uninstall(pid))
             if action == "process/start":
                 body = self.body_json()
                 return self.send_json(start_managed_process(pid, body.get("command")))
