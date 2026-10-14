@@ -2349,6 +2349,7 @@ def agent_loop(project_id: str) -> None:
                 )
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 if state.stop_event.is_set():
+                    settle_live_instructions(p, iteration, delivered=False, reason="agent turn was interrupted")
                     reconcile_feedback_work_orders(
                         p, review_before_iteration, verification_complete=False
                     )
@@ -2358,6 +2359,12 @@ def agent_loop(project_id: str) -> None:
                     return
                 pending_input = detect_agent_input_request(p)
                 if pending_input:
+                    settle_live_instructions(
+                        p,
+                        iteration,
+                        delivered=proc.returncode == 0,
+                        reason="agent requested user input before successful turn completion" if proc.returncode != 0 else "",
+                    )
                     reconcile_feedback_work_orders(
                         p, review_before_iteration, verification_complete=False
                     )
@@ -2367,6 +2374,7 @@ def agent_loop(project_id: str) -> None:
                     state.input_request = pending_input
                     return
                 if proc.returncode != 0:
+                    settle_live_instructions(p, iteration, delivered=False, reason=f"Codex exited with {proc.returncode}")
                     reconcile_feedback_work_orders(
                         p, review_before_iteration, verification_complete=False
                     )
@@ -2419,9 +2427,11 @@ def agent_loop(project_id: str) -> None:
                     state.message = f"Automatic recovery tried {recovery_failures} times without restoring the Codex/tooling path. Project state and diagnostics are preserved."
                     return
 
+                settle_live_instructions(p, iteration, delivered=True)
                 recovery_failures = 0
                 recovery_context = None
             except subprocess.TimeoutExpired as exc:
+                settle_live_instructions(p, iteration, delivered=False, reason="Codex turn timed out")
                 reconcile_feedback_work_orders(
                     p, review_before_iteration, verification_complete=False
                 )
