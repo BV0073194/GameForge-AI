@@ -2545,6 +2545,10 @@ def agent_loop(project_id: str) -> None:
                 "delivery_state": delivery_state,
             }
             write_json(p / ".gameforge/last_evidence.json", evidence)
+            try:
+                fusion_manifest(p, cfg, persist=True)
+            except Exception:
+                pass
 
             cleanup_report = None
             cleanup_policy = cleanup_policy_settings(cfg)
@@ -3480,7 +3484,7 @@ def append_run_report(project_id: str, meta: dict[str, Any], returncode: int | N
     return report
 
 
-def fusion_manifest(p: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+def fusion_manifest(p: Path, cfg: dict[str, Any], *, persist: bool = True) -> dict[str, Any]:
     review = load_user_review(p)
     acceptance = read_json(p / ".gameforge" / "acceptance.json", {}) or {}
     queue = live_queue_public(p)
@@ -3512,7 +3516,8 @@ def fusion_manifest(p: Path, cfg: dict[str, Any]) -> dict[str, Any]:
             "note": "Use local owned-game resources only; do not redistribute proprietary game content.",
         },
     }
-    write_json(p / ".gameforge" / "fusion_manifest.json", manifest)
+    if persist:
+        write_json(p / ".gameforge" / "fusion_manifest.json", manifest)
     return manifest
 
 
@@ -3923,7 +3928,7 @@ class Handler(SimpleHTTPRequestHandler):
                     "experiment": experiment_status(p),
                     "live_queue": live_queue_public(p),
                     "fusion": cfg.get("fusion", DEFAULT_FUSION_POLICY),
-                    "fusion_manifest": fusion_manifest(p, cfg),
+                    "fusion_manifest": fusion_manifest(p, cfg, persist=False),
                     "run_reports": load_run_reports(p),
                     "game_inventory": read_json(p / ".gameforge" / "game_inventory.json", {"count": 0, "games": []}),
                     "fusion_deployment": fusion_deployment_status(p),
