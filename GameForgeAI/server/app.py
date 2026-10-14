@@ -1851,12 +1851,15 @@ def requeue_live_instructions(p: Path, *, reason: str) -> None:
 def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[dict[str, Any]]:
     data = load_live_queue(p)
     changed = False
-    # A crashed/interrupted prior turn must never lose user steering.
+    # A previous prompt construction/turn may have died before it could settle
+    # claimed instructions. No user steering is ever discarded: at the start of
+    # a fresh prompt build, return all unfinished claims to the queue first.
     for item in data.get("items", []):
-        if item.get("status") == "in_progress" and int(item.get("claimed_iteration", -1) or -1) != iteration:
+        if item.get("status") == "in_progress":
             item["status"] = "queued"
             item["requeued_at"] = now_iso()
-            item["requeue_reason"] = "prior turn did not settle"
+            item["requeue_reason"] = "previous turn did not settle"
+            item.pop("claimed_iteration", None)
             changed = True
 
     queued = [x for x in data.get("items", []) if x.get("status") == "queued"]
