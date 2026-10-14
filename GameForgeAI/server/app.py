@@ -3171,13 +3171,91 @@ def list_processes(limit: int = 300) -> list[dict[str, Any]]:
     return rows[:limit]
 
 
-def managed_process_public(project_id: str) -> dict[str, Any]:
-    proc = MANAGED_PROCESSES.get(project_id)
+def run_reports_path(p: Path) -> Path:
+    return p / ".gameforge" / "run_reports.json"
+
+
+def load_run_reports(p: Path) -> dict[str, Any]:
+    data = read_json(run_reports_path(p), {}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    reports = data.get("reports")
+    if not isinstance(reports, list):
+        reports = []
+    data["reports"] = [x for x in reports if isinstance(x, dict)][-100:]
+    return data
+
+
+def append_run_report(project_id: str, meta: dict[str, Any], returncode: int | None) -> dict[str, Any]:
+    p = project_path(project_id)
+    data = load_run_reports(p)
+    report = {
+        "id": meta.get("run_id") or f"run-{int(time.time() * 1000)}",
+        "started_at": meta.get("started_at"),
+        "finished_at": now_iso(),
+        "command": meta.get("command", ""),
+        "log": meta.get("log", ""),
+        "returncode": returncode,
+        "worked": returncode == 0,
+        "stopped_by_user": bool(meta.get("stopped_by_user")),
+        "source": "GameForge Fusion runtime",
+    }
+    data.setdefault("reports", []).append(report)
+    data["updated_at"] = now_iso()
+    write_json(run_reports_path(p), data)
+    return report
+
+
+def fusion_manifest(p: Path, cfg: dict[str, Any]) -> dict[str, Any]:
+    review = load_user_review(p)
+    acceptance = read_json(p / ".gameforge" / "acceptance.json", {}) or {}
+    queue = live_queue_public(p)
+    reports = load_run_reports(p).get("reports", [])
+    manifest = {
+        "format": "GameForgeAI.Fusion",
+        "format_version": 1,
+        "generated_at": now_iso(),
+        "project_id": cfg.get("id"),
+        "name": cfg.get("name"),
+        "goal": cfg.get("goal"),
+        "commands": cfg.get("commands", {}),
+        "strict_quality": iteration_pipeline_settings(cfg),
+        "acceptance": acceptance,
+        "pending_feedback": [
+            x for x in review.get("feedback", [])
+            if isinstance(x, dict) and not bool(x.get("addressed"))
+        ],
+        "live_queue": {
+            "queued_count": queue.get("queued_count", 0),
+            "in_progress_count": queue.get("in_progress_count", 0),
+        },
+        "recent_run_reports": reports[-10:],
+        "melty_compatible_handoff": {
+            "agents": "AGENTS.md",
+            "goal": "goal.md",
+            "project_config": "gameforge.json",
+            "quality_evidence": ".gameforge/last_evidence.json",
+            "note": "Use local owned-game resources only; do not redistribute proprietary game content.",
+        },
+    }
+    write_json(p / ".gameforge" / "fusion_manifest.json", manifest)
+    return manifest
+
+
+def managed_process_public(project_id: str) -> dict[str, Any]:    proc = MANAGED_PROCESSES.get(project_id)
     meta = dict(MANAGED_PROCESS_META.get(project_id, {}))
     if not proc:
         return {"running": False, **meta}
     rc = proc.poll()
     meta.update({"running": rc is None, "pid": proc.pid, "returncode": rc})
+    if rc is not None and not meta.get("reported"):
+        try:
+            report = append_run_report(project_id, meta, rc)
+            meta["reported"] = True
+            meta["report_id"] = report.get("id")
+            MANAGED_PROCESS_META[project_id] = meta
+        except Exception:
+            pass
     return meta
 
 
@@ -3200,7 +3278,13 @@ def start_managed_process(project_id: str, command: str | None = None) -> dict[s
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(command, **kwargs)
     MANAGED_PROCESSES[project_id] = proc
-    MANAGED_PROCESS_META[project_id] = {"command": command, "started_at": now_iso(), "log": str(log_path.relative_to(p)).replace("\\", "/")}
+    MANAGED_PROCESS_META[project_id] = {
+        "run_id": f"run-{int(time.time() * 1000)}",
+        "command": command,
+        "started_at": now_iso(),
+        "log": str(log_path.relative_to(p)).replace("\\", "/"),
+        "reported": False,
+    }
     return {"ok": True, **managed_process_public(project_id)}
 
 
@@ -3208,6 +3292,7 @@ def stop_managed_process(project_id: str) -> dict[str, Any]:
     proc = MANAGED_PROCESSES.get(project_id)
     if not proc or proc.poll() is not None:
         return {"ok": True, **managed_process_public(project_id)}
+    MANAGED_PROCESS_META.setdefault(project_id, {})["stopped_by_user"] = True
     try:
         if os.name == "nt":
             # Managed Windows processes are created in their own process group.
@@ -3563,6 +3648,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "experiment": experiment_status(p),
                     "live_queue": live_queue_public(p),
                     "fusion": cfg.get("fusion", DEFAULT_FUSION_POLICY),
+                    "fusion_manifest": fusion_manifest(p, cfg),
+                    "run_reports": load_run_reports(p),
                 })
             if path.startswith("/api/project/") and path.endswith("/index"):
                 pid = path.split("/")[3]
