@@ -192,6 +192,14 @@
             <article class="card"><h3>Asset intelligence</h3><p>Analyze uploaded models/textures so the agent can plan optimization, conversion and art-style adaptation.</p><div class="actions"><button id="analyzeAssets">Analyze assets</button></div><pre id="assetOutput" class="console"></pre></article>
             <article class="card"><h3>Git safety</h3><div class="actions"><button id="gitStatusBtn">Refresh Git</button></div><pre id="gitOutput" class="console"></pre><label>Rollback revision<input id="rollbackRev" placeholder="commit hash"></label><button id="rollbackBtn" class="danger">Rollback to revision</button></article>
           </div>
+
+          <article class="card" id="fusionRuntimeCard">
+            <div class="row between wrap"><h3>Fusion runtime &amp; handoff</h3><span class="badge">GameForge + Melty-style flow</span></div>
+            <p class="muted">GameForge keeps the strict autonomous QA loop while recording Melty-style local run outcomes and a portable handoff manifest for coding-agent/runtime workflows.</p>
+            <div id="fusionRunReports"></div>
+            <details><summary>Fusion handoff manifest</summary><pre id="fusionManifest" class="compact"></pre></details>
+            <p class="tiny">Manifest: <code>.gameforge/fusion_manifest.json</code>. It references AGENTS.md, goal.md, project config, quality evidence, queued steering, and recent local run reports without bundling proprietary game content.</p>
+          </article>
         </div>
 
         <div id="tab-settings" class="tab">
