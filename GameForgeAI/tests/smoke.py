@@ -47,6 +47,11 @@ with tempfile.TemporaryDirectory() as td:
     assert rp == p.resolve()
     idx = app.scan_project_tree(p)
     assert idx["file_count"] > 0
+    assert (p / "design" / "project.json").is_file()
+    assert (p / "tasks" / "MVP.md").is_file()
+    fusion_design = app.read_json(p / "design" / "project.json", {})
+    assert fusion_design["format"] == "GameForgeAI.FusionProject"
+    assert "configured original full regression passes" in fusion_design["release_gates"]
 
     # The strict fast pipeline is now production behavior on main. Targeted
     # diagnostics may accelerate iteration, but they cannot close feedback or
@@ -238,6 +243,23 @@ with tempfile.TemporaryDirectory() as td:
     assert restore["ok"], restore
     assert game_target.read_text(encoding="utf-8") == "original-game-file"
     assert app.fusion_deployment_status(p)["state"]["status"] == "restored"
+
+    # If the installed file changes after deployment, restore must refuse to
+    # overwrite it. This preserves user/game changes instead of blindly rolling back.
+    game_target.write_text("original-game-file-2", encoding="utf-8")
+    install2 = app.fusion_install(cfg["id"])
+    assert install2["ok"], install2
+    game_target.write_text("changed-after-install", encoding="utf-8")
+    restore_conflict = app.fusion_uninstall(cfg["id"])
+    assert restore_conflict["ok"] is False, restore_conflict
+    assert restore_conflict["conflicts"], restore_conflict
+    assert game_target.read_text(encoding="utf-8") == "changed-after-install"
+    assert app.fusion_deployment_status(p)["state"]["status"] == "active-with-conflicts"
+
+    # Reset the fixture so later smoke work is not left with an active deployment.
+    state_reset = app.read_json(app.fusion_deployment_state_path(p), {})
+    state_reset["status"] = "restored"
+    app.write_json(app.fusion_deployment_state_path(p), state_reset)
 
     inventory = app.discover_installed_games()
     assert inventory["local_only"] is True
