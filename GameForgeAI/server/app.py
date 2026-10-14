@@ -1027,6 +1027,16 @@ DEFAULT_CLEANUP_POLICY = {
     "process_ai_cleanup_candidates": True,
 }
 
+DEFAULT_FUSION_POLICY = {
+    "enabled": True,
+    "live_queue": True,
+    "interrupt_and_run_now": True,
+    "agent_questions": True,
+    "reversible_runtime": True,
+    "local_run_reports": True,
+    "melty_compatible_project_handoff": True,
+}
+
 
 def cleanup_policy_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     settings = dict(DEFAULT_CLEANUP_POLICY)
@@ -1372,6 +1382,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
         "command_timeout_sec": 1800,
         "iteration_pipeline": dict(DEFAULT_ITERATION_PIPELINE),
         "cleanup": dict(DEFAULT_CLEANUP_POLICY),
+        "fusion": dict(DEFAULT_FUSION_POLICY),
         "agent": {
             "permission_mode": "full-auto",
             "max_iterations": 0,
@@ -3435,7 +3446,7 @@ class Handler(SimpleHTTPRequestHandler):
             p = project_path(pid); cfg = project_config(pid)
             if action == "config":
                 body = self.body_json()
-                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","agent","visual","log_globs"}
+                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","fusion","agent","visual","log_globs"}
                 for k,v in body.items():
                     if k in allowed: cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
