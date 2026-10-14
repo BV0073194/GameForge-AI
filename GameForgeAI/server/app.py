@@ -1027,6 +1027,23 @@ DEFAULT_CLEANUP_POLICY = {
     "process_ai_cleanup_candidates": True,
 }
 
+DEFAULT_FUSION_POLICY = {
+    "enabled": True,
+    "live_queue": True,
+    "interrupt_and_run_now": True,
+    "agent_questions": True,
+    "reversible_runtime": True,
+    "local_run_reports": True,
+    "melty_compatible_project_handoff": True,
+    "deployment": {
+        "target_root": "",
+        "mappings": [],
+    },
+    "release": {
+        "roots": ["workspace/release"],
+    },
+}
+
 
 def cleanup_policy_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     settings = dict(DEFAULT_CLEANUP_POLICY)
@@ -1346,6 +1363,52 @@ def promote_experimental_copy(project_id: str, confirmed: bool) -> dict[str, Any
     }
 
 
+def ensure_fusion_project_scaffold(p: Path, cfg: dict[str, Any]) -> None:
+    """Add Melty-style agent/design/task handoff files without overwriting project work."""
+    (p / "design").mkdir(parents=True, exist_ok=True)
+    (p / "tasks").mkdir(parents=True, exist_ok=True)
+    design_path = p / "design" / "project.json"
+    if not design_path.exists():
+        write_json(design_path, {
+            "format": "GameForgeAI.FusionProject",
+            "format_version": 1,
+            "name": cfg.get("name", cfg.get("id", "Game Project")),
+            "goal": cfg.get("goal", ""),
+            "project_id": cfg.get("id", ""),
+            "release_gates": [
+                "requested behavior implemented",
+                "configured full build passes",
+                "configured original full regression passes",
+                "pending user feedback is resolved with evidence",
+                "managed runtime/play evidence is captured when applicable",
+            ],
+            "owned_game_policy": "Use locally owned game installations; never redistribute proprietary game content.",
+            "handoff_files": {
+                "agents": "AGENTS.md",
+                "goal": "goal.md",
+                "acceptance": ".gameforge/acceptance.json",
+                "live_queue": ".gameforge/live_queue.json",
+                "fusion_manifest": ".gameforge/fusion_manifest.json",
+            },
+        })
+    tasks_path = p / "tasks" / "MVP.md"
+    if not tasks_path.exists():
+        tasks_path.write_text(
+            "# Fusion delivery checklist\n\n"
+            f"## Goal\n{str(cfg.get('goal', '')).strip()}\n\n"
+            "## Required delivery flow\n"
+            "- [ ] Implement the user-visible requested behavior, not only diagnostics.\n"
+            "- [ ] Run focused tests while developing.\n"
+            "- [ ] Pass the configured full build.\n"
+            "- [ ] Pass the configured original full regression.\n"
+            "- [ ] Resolve every user feedback work order with concrete evidence.\n"
+            "- [ ] Record a real local runtime/play result when applicable.\n"
+            "- [ ] Package/deploy reversibly when the target game requires file installation.\n"
+            "- [ ] Do not claim completion until GameForge acceptance is verified.\n",
+            encoding="utf-8",
+        )
+
+
 def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[str, Any]:
     pid_base = slugify(name)
     pid = pid_base
@@ -1357,7 +1420,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
     for rel in [
         "UPLOAD/MODELS", "UPLOAD/TEXTURES", "UPLOAD/ANIMATIONS", "UPLOAD/AUDIO", "UPLOAD/UI",
         "UPLOAD/REFERENCE", "UPLOAD/MODS", "UPLOAD/SOURCE", "UPLOAD/REPOS", "UPLOAD/TOOLS",
-        "UPLOAD/DOCS", "UPLOAD/ROMS_LOCAL", "workspace", "research", "logs", "captures", ".gameforge"
+        "UPLOAD/DOCS", "UPLOAD/ROMS_LOCAL", "workspace", "research", "logs", "captures", ".gameforge", "design", "tasks"
     ]:
         (p / rel).mkdir(parents=True, exist_ok=True)
 
@@ -1372,6 +1435,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
         "command_timeout_sec": 1800,
         "iteration_pipeline": dict(DEFAULT_ITERATION_PIPELINE),
         "cleanup": dict(DEFAULT_CLEANUP_POLICY),
+        "fusion": dict(DEFAULT_FUSION_POLICY),
         "agent": {
             "permission_mode": "full-auto",
             "max_iterations": 0,
@@ -1390,6 +1454,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
     }
     write_json(p / "gameforge.json", cfg)
     (p / "goal.md").write_text(f"# User Goal\n\n{goal.strip()}\n", encoding="utf-8")
+    ensure_fusion_project_scaffold(p, cfg)
     acceptance = {
         "project_complete": False,
         "updated_at": now_iso(),
@@ -1702,6 +1767,139 @@ def collect_logs(p: Path, cfg: dict[str, Any]) -> str:
     if cv_report:
         chunks.append("\n--- OpenCV visual report ---\n" + json.dumps(cv_report, indent=2))
     return "".join(chunks)[-70000:]
+
+
+
+def live_queue_path(p: Path) -> Path:
+    return p / ".gameforge" / "live_queue.json"
+
+
+def load_live_queue(p: Path) -> dict[str, Any]:
+    data = read_json(live_queue_path(p), {}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    items = data.get("items")
+    if not isinstance(items, list):
+        items = []
+    data["version"] = 1
+    data["items"] = [x for x in items if isinstance(x, dict)][-200:]
+    return data
+
+
+def save_live_queue(p: Path, data: dict[str, Any]) -> dict[str, Any]:
+    data["version"] = 1
+    data["updated_at"] = now_iso()
+    data["items"] = [x for x in data.get("items", []) if isinstance(x, dict)][-200:]
+    write_json(live_queue_path(p), data)
+    return data
+
+
+def live_queue_public(p: Path) -> dict[str, Any]:
+    data = load_live_queue(p)
+    items = data.get("items", [])
+    queued = [x for x in items if x.get("status") == "queued"]
+    in_progress = [x for x in items if x.get("status") == "in_progress"]
+    recent = [x for x in items if x.get("status") in {"delivered", "cancelled"}][-20:]
+    return {
+        "queued": queued,
+        "in_progress": in_progress,
+        "recent": recent,
+        "queued_count": len(queued),
+        "in_progress_count": len(in_progress),
+        "updated_at": data.get("updated_at"),
+    }
+
+
+def enqueue_live_instruction(
+    p: Path,
+    text_value: str,
+    *,
+    mode: str = "queue",
+    source: str = "user",
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    text_value = str(text_value or "").strip()
+    if not text_value:
+        raise ValueError("Live instruction cannot be empty")
+    if len(text_value) > 20000:
+        raise ValueError("Live instruction is too long")
+    mode = "interrupt" if mode == "interrupt" else "queue"
+    data = load_live_queue(p)
+    item = {
+        "id": f"live-{int(time.time() * 1000)}-{len(data.get('items', []))}",
+        "created_at": now_iso(),
+        "text": text_value,
+        "mode": mode,
+        "priority": "immediate" if mode == "interrupt" else "normal",
+        "source": source,
+        "status": "queued",
+        "attempts": 0,
+        "metadata": metadata or {},
+    }
+    data.setdefault("items", []).append(item)
+    save_live_queue(p, data)
+    return item
+
+
+def requeue_live_instructions(p: Path, *, reason: str) -> None:
+    data = load_live_queue(p)
+    changed = False
+    for item in data.get("items", []):
+        if item.get("status") == "in_progress":
+            item["status"] = "queued"
+            item["requeued_at"] = now_iso()
+            item["requeue_reason"] = reason
+            item.pop("claimed_iteration", None)
+            changed = True
+    if changed:
+        save_live_queue(p, data)
+
+
+def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[dict[str, Any]]:
+    data = load_live_queue(p)
+    changed = False
+    # A previous prompt construction/turn may have died before it could settle
+    # claimed instructions. No user steering is ever discarded: at the start of
+    # a fresh prompt build, return all unfinished claims to the queue first.
+    for item in data.get("items", []):
+        if item.get("status") == "in_progress":
+            item["status"] = "queued"
+            item["requeued_at"] = now_iso()
+            item["requeue_reason"] = "previous turn did not settle"
+            item.pop("claimed_iteration", None)
+            changed = True
+
+    queued = [x for x in data.get("items", []) if x.get("status") == "queued"]
+    queued.sort(key=lambda x: (0 if x.get("priority") == "immediate" else 1, str(x.get("created_at", ""))))
+    claimed = queued[:max(1, limit)]
+    for item in claimed:
+        item["status"] = "in_progress"
+        item["claimed_iteration"] = iteration
+        item["claimed_at"] = now_iso()
+        item["attempts"] = int(item.get("attempts", 0) or 0) + 1
+        changed = True
+    if changed:
+        save_live_queue(p, data)
+    return [dict(x) for x in claimed]
+
+
+def settle_live_instructions(p: Path, iteration: int, *, delivered: bool, reason: str = "") -> None:
+    data = load_live_queue(p)
+    changed = False
+    for item in data.get("items", []):
+        if item.get("status") != "in_progress" or int(item.get("claimed_iteration", -1) or -1) != iteration:
+            continue
+        if delivered:
+            item["status"] = "delivered"
+            item["delivered_at"] = now_iso()
+        else:
+            item["status"] = "queued"
+            item["requeued_at"] = now_iso()
+            if reason:
+                item["requeue_reason"] = reason
+        changed = True
+    if changed:
+        save_live_queue(p, data)
 
 
 def user_input_request_path(p: Path) -> Path:
@@ -2020,6 +2218,7 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     pipeline = iteration_pipeline_settings(cfg)
     fast_pipeline = bool(pipeline.get("enabled"))
     review = load_user_review(p)
+    live_inputs = claim_live_instructions(p, iteration)
     if fast_pipeline and pipeline.get("compact_context", True):
         compact = {
             "generated_at": now_iso(),
@@ -2031,6 +2230,9 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
             "last_self_heal": read_json(p / ".gameforge/last_self_heal.json", {}),
             "delivery_state": delivery_state_for_prompt(p, review),
             "last_cleanup": read_json(p / ".gameforge/last_cleanup.json", {}),
+            "live_user_inputs": live_inputs,
+            "installed_games": read_json(p / ".gameforge" / "game_inventory.json", {"count": 0, "games": []}),
+            "fusion_deployment": fusion_deployment_status(p),
             "iteration_notes_tail": tail_text(p / ".gameforge/iteration_notes.md", 14000),
             "git": git_status(p),
         }
@@ -2039,6 +2241,27 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     else:
         evidence = collect_logs(p, cfg)
     prior = ""
+    if live_inputs:
+        prior += (
+            "\nLIVE USER INSTRUCTIONS — THESE ARRIVED WHILE THE AGENT WAS RUNNING. "
+            "Honor them before lower-priority roadmap work. If an instruction conflicts with an older plan, "
+            "the newer live instruction wins unless doing so would be unsafe or would violate an explicit immutable user requirement.\n"
+            + json.dumps(
+                [
+                    {
+                        "id": x.get("id"),
+                        "created_at": x.get("created_at"),
+                        "priority": x.get("priority"),
+                        "source": x.get("source"),
+                        "text": x.get("text"),
+                    }
+                    for x in live_inputs
+                ],
+                indent=2,
+                ensure_ascii=False,
+            )[-18000:]
+            + "\n"
+        )
     feedback_items = [x for x in review.get("feedback", []) if isinstance(x, dict)]
     pending_feedback = [x for x in feedback_items if not bool(x.get("addressed"))]
     if pending_feedback:
@@ -2067,13 +2290,17 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
         prior += "\nAutomatic recovery context:\n" + json.dumps(recovery_context, indent=2)[-16000:]
     research = cfg.get("research_mode", "deep")
     if fast_pipeline:
-        startup = """FAST STRICT PIPELINE: Start with .gameforge/compact_state.json, goal.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
+        startup = """FAST STRICT PIPELINE: Start with .gameforge/compact_state.json, goal.md, design/project.json, tasks/MVP.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
 
 During the AI turn, prefer short targeted tests for the code you are actively changing. Do not rerun the configured full build/regression merely as an end-of-turn ritual because GameForge will run the configured build and ORIGINAL configured full test once after this turn returns. You MAY run the full suite inside the turn when the change is high-risk (save format, camera/player core, collision/damage, scene transition, object loading, input/render hooks), when diagnosing a failure, or when targeted evidence is insufficient.
 
 STRICT ORIGINAL QUALITY MODE: The original configured build/test commands are the trusted quality gate and must not be weakened, replaced, shortened, fast-forwarded, or rewritten merely to make the experiment look faster. Savestates, direct scene warps, test-only state injection, fast-forward, native-save checkpoints, or other shortcuts may be used ONLY as development diagnostics. They are NEVER trusted acceptance evidence and NEVER sufficient to close a user-feedback work order. After a targeted check looks good, keep addressed=false and set ready_for_verification=true with a concrete resolution and targeted evidence; GameForge will close it only after the unchanged configured full build and full regression pass. Final project completion still requires the original full regression path.
 
 DELIVERY-FIRST RULE: User-visible implementation is the purpose of the loop; diagnostics exist only to unblock implementation. Never spend more than two consecutive iterations on diagnostic-only research/probes/verifier construction for pending user work. Prefer modifying production gameplay/code/assets and then testing that result. If a diagnostic path remains ambiguous after two passes, implement the safest evidence-backed candidate, try an alternate production approach, or explicitly record a genuine blocker and work a different pending requirement. Do not indefinitely investigate one edge case while other requested features remain unimplemented.
+
+LIVE FUSION INTERACTION: The user can type steering instructions while you work. Any LIVE USER INSTRUCTIONS in this prompt are fresh and should be treated as the highest-priority steering for this pass. The user may also interrupt a running turn to run a new instruction immediately; preserve already-good work and continue from the current files rather than starting over. When you genuinely need a user-only answer, use the structured user_input_request.json contract below so the UI can present the question and feed the answer directly into the next turn.
+
+FUSION RUNTIME: Prefer locally detected owned-game installations and never redistribute proprietary game files. For PC mods that must place built files into a real game folder, create .gameforge/fusion_deploy.json with {"target_root":"absolute owned-game folder","files":[{"source":"project-relative built file","target":"game-relative destination"}]}. GameForge performs transactional backups before installation and restores originals on uninstall. Do not use this deployment path to bypass anti-cheat, modify competitive online sessions, or touch files outside the declared game root. Record real managed launches as runtime evidence, but keep GameForge's configured full build/regression as the final quality authority.
 
 When multiple pending user-feedback work orders are closely related, batch them into one coherent milestone and verify them together instead of spending separate iterations on tiny adjacent changes. This changes workflow efficiency only; it does NOT lower acceptance, regression, evidence, user-feedback completion, visual, physics, audio, gameplay, persistence, or polish requirements."""
     else:
@@ -2183,6 +2410,7 @@ def agent_loop(project_id: str) -> None:
                 )
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 if state.stop_event.is_set():
+                    settle_live_instructions(p, iteration, delivered=False, reason="agent turn was interrupted")
                     reconcile_feedback_work_orders(
                         p, review_before_iteration, verification_complete=False
                     )
@@ -2192,6 +2420,12 @@ def agent_loop(project_id: str) -> None:
                     return
                 pending_input = detect_agent_input_request(p)
                 if pending_input:
+                    settle_live_instructions(
+                        p,
+                        iteration,
+                        delivered=proc.returncode == 0,
+                        reason="agent requested user input before successful turn completion" if proc.returncode != 0 else "",
+                    )
                     reconcile_feedback_work_orders(
                         p, review_before_iteration, verification_complete=False
                     )
@@ -2201,6 +2435,7 @@ def agent_loop(project_id: str) -> None:
                     state.input_request = pending_input
                     return
                 if proc.returncode != 0:
+                    settle_live_instructions(p, iteration, delivered=False, reason=f"Codex exited with {proc.returncode}")
                     reconcile_feedback_work_orders(
                         p, review_before_iteration, verification_complete=False
                     )
@@ -2253,9 +2488,11 @@ def agent_loop(project_id: str) -> None:
                     state.message = f"Automatic recovery tried {recovery_failures} times without restoring the Codex/tooling path. Project state and diagnostics are preserved."
                     return
 
+                settle_live_instructions(p, iteration, delivered=True)
                 recovery_failures = 0
                 recovery_context = None
             except subprocess.TimeoutExpired as exc:
+                settle_live_instructions(p, iteration, delivered=False, reason="Codex turn timed out")
                 reconcile_feedback_work_orders(
                     p, review_before_iteration, verification_complete=False
                 )
@@ -2365,6 +2602,10 @@ def agent_loop(project_id: str) -> None:
                 "delivery_state": delivery_state,
             }
             write_json(p / ".gameforge/last_evidence.json", evidence)
+            try:
+                fusion_manifest(p, cfg, persist=True)
+            except Exception:
+                pass
 
             cleanup_report = None
             cleanup_policy = cleanup_policy_settings(cfg)
@@ -2413,18 +2654,55 @@ def agent_loop(project_id: str) -> None:
 
 
 def start_agent(project_id: str) -> dict[str, Any]:
-    project_config(project_id)
+    p = project_path(project_id)
+    cfg = project_config(project_id)
+    ensure_fusion_project_scaffold(p, cfg)
     with STATE_LOCK:
         existing = AGENTS.get(project_id)
         if existing and existing.thread and existing.thread.is_alive():
             existing.pause_event.clear()
             return agent_public(existing)
-        state = AgentState(project_id=project_id)
+        persisted_iteration = int((read_json(p / ".gameforge" / "last_evidence.json", {}) or {}).get("iteration", 0) or 0)
+        resume_iteration = max(persisted_iteration, existing.iteration if existing else 0)
+        state = AgentState(project_id=project_id, iteration=resume_iteration)
         AGENTS[project_id] = state
         t = threading.Thread(target=agent_loop, args=(project_id,), daemon=True, name=f"agent-{project_id}")
         state.thread = t
         t.start()
         return agent_public(state)
+
+
+def interrupt_agent_and_restart(project_id: str, reason: str = "live user instruction") -> dict[str, Any]:
+    """Kill only the current work pass, then immediately continue from current files."""
+    p = project_path(project_id)
+    requeue_live_instructions(p, reason=reason)
+    state = AGENTS.get(project_id)
+    if not state or not state.thread or not state.thread.is_alive():
+        return {"restarting": False, "agent": start_agent(project_id)}
+
+    stop_agent_now(state)
+
+    def restart() -> None:
+        thread = state.thread
+        if thread:
+            thread.join(timeout=20)
+        if thread and thread.is_alive():
+            state.status = "error"
+            state.message = "Current task did not exit after interrupt; automatic restart was withheld to avoid overlapping agents."
+            set_agent_activity(state, "Interrupt needs attention", state.message, "error")
+            return
+        try:
+            start_agent(project_id)
+        except Exception as exc:
+            state.status = "error"
+            state.message = f"Interrupted task stopped, but restart failed: {exc}"
+
+    threading.Thread(
+        target=restart,
+        daemon=True,
+        name=f"live-interrupt-restart-{project_id}",
+    ).start()
+    return {"restarting": True, "agent": agent_public(state)}
 
 
 def agent_public(s: AgentState) -> dict[str, Any]:
@@ -2959,6 +3237,348 @@ def list_processes(limit: int = 300) -> list[dict[str, Any]]:
     return rows[:limit]
 
 
+
+def discover_installed_games() -> dict[str, Any]:
+    """Local-only Steam inventory: names, install folders, app ids and build ids."""
+    steam_roots: set[Path] = set()
+    system = platform.system()
+    if system == "Windows":
+        try:
+            import winreg
+            for root, key_path in (
+                (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+                (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam"),
+            ):
+                try:
+                    with winreg.OpenKey(root, key_path) as key:
+                        for value_name in ("SteamPath", "InstallPath"):
+                            try:
+                                value, _ = winreg.QueryValueEx(key, value_name)
+                                if value:
+                                    steam_roots.add(Path(str(value)).expanduser())
+                            except OSError:
+                                pass
+                except OSError:
+                    pass
+        except Exception:
+            pass
+        for base in (
+            Path(os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")) / "Steam",
+            Path(os.environ.get("PROGRAMFILES", r"C:\Program Files")) / "Steam",
+        ):
+            steam_roots.add(base)
+    elif system == "Darwin":
+        steam_roots.add(Path.home() / "Library" / "Application Support" / "Steam")
+    else:
+        steam_roots.update({
+            Path.home() / ".steam" / "steam",
+            Path.home() / ".local" / "share" / "Steam",
+        })
+
+    libraries: set[Path] = set()
+    for root in list(steam_roots):
+        if root.exists():
+            libraries.add(root)
+            vdf = root / "steamapps" / "libraryfolders.vdf"
+            if vdf.is_file():
+                try:
+                    text_value = vdf.read_text(encoding="utf-8", errors="replace")
+                    for match in re.finditer(r'"path"\s+"([^"]+)"', text_value):
+                        raw = match.group(1).replace(r"\\", "\\")
+                        candidate = Path(raw).expanduser()
+                        if candidate.exists():
+                            libraries.add(candidate)
+                except Exception:
+                    pass
+
+    games: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for library in sorted(libraries, key=lambda x: str(x).lower()):
+        steamapps = library / "steamapps"
+        if not steamapps.is_dir():
+            continue
+        for manifest in sorted(steamapps.glob("appmanifest_*.acf")):
+            try:
+                text_value = manifest.read_text(encoding="utf-8", errors="replace")
+                fields = {
+                    key.lower(): value
+                    for key, value in re.findall(r'"([^"]+)"\s+"([^"]*)"', text_value)
+                }
+                app_id = fields.get("appid") or manifest.stem.replace("appmanifest_", "")
+                install_dir = fields.get("installdir", "")
+                name = fields.get("name", "") or f"Steam app {app_id}"
+                install_path = steamapps / "common" / install_dir if install_dir else None
+                identity = str(app_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                games.append({
+                    "store": "steam",
+                    "app_id": str(app_id),
+                    "name": name,
+                    "build_id": fields.get("buildid", ""),
+                    "install_dir": install_dir,
+                    "install_path": str(install_path) if install_path else "",
+                    "installed": bool(install_path and install_path.exists()),
+                    "library": str(library),
+                })
+            except Exception:
+                continue
+    games.sort(key=lambda x: str(x.get("name", "")).lower())
+    return {"scanned_at": now_iso(), "local_only": True, "games": games, "count": len(games)}
+
+
+def fusion_deploy_config_path(p: Path) -> Path:
+    return p / ".gameforge" / "fusion_deploy.json"
+
+
+def fusion_deployment_state_path(p: Path) -> Path:
+    return p / ".gameforge" / "fusion_deployment_state.json"
+
+
+def load_fusion_deploy_config(p: Path) -> dict[str, Any]:
+    data = read_json(fusion_deploy_config_path(p), {}) or {}
+    return data if isinstance(data, dict) else {}
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def fusion_deployment_status(p: Path) -> dict[str, Any]:
+    config = load_fusion_deploy_config(p)
+    state = read_json(fusion_deployment_state_path(p), {}) or {}
+    if not isinstance(state, dict):
+        state = {}
+    return {
+        "configured": bool(config.get("target_root") and isinstance(config.get("files"), list)),
+        "config": config,
+        "state": state,
+    }
+
+
+def fusion_install(project_id: str) -> dict[str, Any]:
+    p = project_path(project_id)
+    cfg = load_fusion_deploy_config(p)
+    target_raw = str(cfg.get("target_root", "") or "").strip()
+    files = cfg.get("files")
+    if not target_raw or not isinstance(files, list) or not files:
+        return {
+            "ok": False,
+            "error": "No Fusion deployment is configured. The agent can create .gameforge/fusion_deploy.json with target_root and source→target file mappings.",
+        }
+    target_root = Path(target_raw).expanduser().resolve()
+    if not target_root.is_dir():
+        return {"ok": False, "error": f"Target game folder does not exist: {target_root}"}
+    if len(files) > 5000:
+        return {"ok": False, "error": "Fusion deployment contains too many files"}
+
+    active = read_json(fusion_deployment_state_path(p), {}) or {}
+    if isinstance(active, dict) and active.get("status") in {"active", "active-with-conflicts"}:
+        return {"ok": False, "error": "A Fusion deployment is already active. Restore it before installing again.", "state": active}
+
+    deployment_id = f"deploy-{int(time.time() * 1000)}"
+    backup_root = p / ".gameforge" / "fusion-deployments" / deployment_id / "backup"
+    backup_root.mkdir(parents=True, exist_ok=True)
+    state: dict[str, Any] = {
+        "id": deployment_id,
+        "status": "installing",
+        "started_at": now_iso(),
+        "target_root": str(target_root),
+        "files": [],
+    }
+    write_json(fusion_deployment_state_path(p), state)
+    changed: list[dict[str, Any]] = []
+
+    try:
+        for row in files:
+            if not isinstance(row, dict):
+                raise ValueError("Invalid Fusion file mapping")
+            source_rel = str(row.get("source", "") or "").replace("\\", "/").lstrip("/")
+            target_rel = str(row.get("target", "") or "").replace("\\", "/").lstrip("/")
+            if not source_rel or not target_rel:
+                raise ValueError("Every Fusion file mapping needs source and target")
+            source = safe_child(p, source_rel)
+            target = safe_child(target_root, target_rel)
+            if not source.is_file():
+                raise FileNotFoundError(f"Fusion source file missing: {source_rel}")
+            if target.exists() and not target.is_file():
+                raise ValueError(f"Fusion target is not a regular file: {target_rel}")
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+            existed = target.exists()
+            backup_rel = target_rel
+            backup = safe_child(backup_root, backup_rel)
+            original_sha = ""
+            if existed:
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(target, backup)
+                original_sha = _sha256_file(target)
+
+            temp = target.with_name(target.name + ".gameforge-installing")
+            shutil.copy2(source, temp)
+            os.replace(temp, target)
+            record = {
+                "source": source_rel,
+                "target": target_rel,
+                "existed": existed,
+                "backup": str(backup.relative_to(p)).replace("\\", "/") if existed else "",
+                "original_sha256": original_sha,
+                "installed_sha256": _sha256_file(target),
+            }
+            state["files"].append(record)
+            changed.append(record)
+            write_json(fusion_deployment_state_path(p), state)
+
+        state["status"] = "active"
+        state["installed_at"] = now_iso()
+        write_json(fusion_deployment_state_path(p), state)
+        return {"ok": True, "state": state}
+    except Exception as exc:
+        rollback_errors: list[str] = []
+        for record in reversed(changed):
+            try:
+                target = safe_child(target_root, str(record["target"]))
+                if record.get("existed"):
+                    backup = safe_child(p, str(record["backup"]))
+                    if backup.is_file():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        temp = target.with_name(target.name + ".gameforge-rollback")
+                        shutil.copy2(backup, temp)
+                        os.replace(temp, target)
+                elif target.exists():
+                    target.unlink()
+            except Exception as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        state["status"] = "failed"
+        state["failed_at"] = now_iso()
+        state["error"] = str(exc)
+        state["rollback_errors"] = rollback_errors
+        write_json(fusion_deployment_state_path(p), state)
+        return {"ok": False, "error": str(exc), "rollback_errors": rollback_errors, "state": state}
+
+
+def fusion_uninstall(project_id: str) -> dict[str, Any]:
+    p = project_path(project_id)
+    state = read_json(fusion_deployment_state_path(p), {}) or {}
+    if not isinstance(state, dict) or state.get("status") not in {"active", "active-with-conflicts"}:
+        return {"ok": False, "error": "No active Fusion deployment to restore"}
+    target_root = Path(str(state.get("target_root", ""))).expanduser().resolve()
+    conflicts: list[dict[str, Any]] = []
+    restored: list[str] = []
+
+    for record in reversed(state.get("files", [])):
+        try:
+            target = safe_child(target_root, str(record.get("target", "")))
+            installed_sha = str(record.get("installed_sha256", "") or "")
+            if target.exists() and installed_sha and _sha256_file(target) != installed_sha:
+                conflicts.append({
+                    "target": record.get("target"),
+                    "reason": "Target changed after Fusion installed it; left untouched to avoid data loss.",
+                })
+                continue
+            if record.get("existed"):
+                backup = safe_child(p, str(record.get("backup", "")))
+                if not backup.is_file():
+                    conflicts.append({"target": record.get("target"), "reason": "Original backup is missing."})
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                temp = target.with_name(target.name + ".gameforge-restoring")
+                shutil.copy2(backup, temp)
+                os.replace(temp, target)
+            elif target.exists():
+                target.unlink()
+            restored.append(str(record.get("target", "")))
+        except Exception as exc:
+            conflicts.append({"target": record.get("target"), "reason": str(exc)})
+
+    state["restored_at"] = now_iso()
+    state["restored_files"] = restored
+    state["conflicts"] = conflicts
+    state["status"] = "active-with-conflicts" if conflicts else "restored"
+    write_json(fusion_deployment_state_path(p), state)
+    return {"ok": not conflicts, "state": state, "conflicts": conflicts}
+
+
+def run_reports_path(p: Path) -> Path:
+    return p / ".gameforge" / "run_reports.json"
+
+
+def load_run_reports(p: Path) -> dict[str, Any]:
+    data = read_json(run_reports_path(p), {}) or {}
+    if not isinstance(data, dict):
+        data = {}
+    reports = data.get("reports")
+    if not isinstance(reports, list):
+        reports = []
+    data["reports"] = [x for x in reports if isinstance(x, dict)][-100:]
+    return data
+
+
+def append_run_report(project_id: str, meta: dict[str, Any], returncode: int | None) -> dict[str, Any]:
+    p = project_path(project_id)
+    data = load_run_reports(p)
+    report = {
+        "id": meta.get("run_id") or f"run-{int(time.time() * 1000)}",
+        "started_at": meta.get("started_at"),
+        "finished_at": now_iso(),
+        "command": meta.get("command", ""),
+        "log": meta.get("log", ""),
+        "returncode": returncode,
+        "worked": returncode == 0,
+        "stopped_by_user": bool(meta.get("stopped_by_user")),
+        "source": "GameForge Fusion runtime",
+    }
+    data.setdefault("reports", []).append(report)
+    data["updated_at"] = now_iso()
+    write_json(run_reports_path(p), data)
+    return report
+
+
+def fusion_manifest(p: Path, cfg: dict[str, Any], *, persist: bool = True) -> dict[str, Any]:
+    review = load_user_review(p)
+    acceptance = read_json(p / ".gameforge" / "acceptance.json", {}) or {}
+    queue = live_queue_public(p)
+    reports = load_run_reports(p).get("reports", [])
+    manifest = {
+        "format": "GameForgeAI.Fusion",
+        "format_version": 1,
+        "generated_at": now_iso(),
+        "project_id": cfg.get("id"),
+        "name": cfg.get("name"),
+        "goal": cfg.get("goal"),
+        "commands": cfg.get("commands", {}),
+        "strict_quality": iteration_pipeline_settings(cfg),
+        "acceptance": acceptance,
+        "pending_feedback": [
+            x for x in review.get("feedback", [])
+            if isinstance(x, dict) and not bool(x.get("addressed"))
+        ],
+        "live_queue": {
+            "queued_count": queue.get("queued_count", 0),
+            "in_progress_count": queue.get("in_progress_count", 0),
+        },
+        "recent_run_reports": reports[-10:],
+        "melty_compatible_handoff": {
+            "agents": "AGENTS.md",
+            "goal": "goal.md",
+            "project_config": "gameforge.json",
+            "quality_evidence": ".gameforge/last_evidence.json",
+            "note": "Use local owned-game resources only; do not redistribute proprietary game content.",
+        },
+    }
+    if persist:
+        write_json(p / ".gameforge" / "fusion_manifest.json", manifest)
+    return manifest
+
+
 def managed_process_public(project_id: str) -> dict[str, Any]:
     proc = MANAGED_PROCESSES.get(project_id)
     meta = dict(MANAGED_PROCESS_META.get(project_id, {}))
@@ -2966,6 +3586,14 @@ def managed_process_public(project_id: str) -> dict[str, Any]:
         return {"running": False, **meta}
     rc = proc.poll()
     meta.update({"running": rc is None, "pid": proc.pid, "returncode": rc})
+    if rc is not None and not meta.get("reported"):
+        try:
+            report = append_run_report(project_id, meta, rc)
+            meta["reported"] = True
+            meta["report_id"] = report.get("id")
+            MANAGED_PROCESS_META[project_id] = meta
+        except Exception:
+            pass
     return meta
 
 
@@ -2988,7 +3616,13 @@ def start_managed_process(project_id: str, command: str | None = None) -> dict[s
         kwargs["start_new_session"] = True
     proc = subprocess.Popen(command, **kwargs)
     MANAGED_PROCESSES[project_id] = proc
-    MANAGED_PROCESS_META[project_id] = {"command": command, "started_at": now_iso(), "log": str(log_path.relative_to(p)).replace("\\", "/")}
+    MANAGED_PROCESS_META[project_id] = {
+        "run_id": f"run-{int(time.time() * 1000)}",
+        "command": command,
+        "started_at": now_iso(),
+        "log": str(log_path.relative_to(p)).replace("\\", "/"),
+        "reported": False,
+    }
     return {"ok": True, **managed_process_public(project_id)}
 
 
@@ -2996,6 +3630,7 @@ def stop_managed_process(project_id: str) -> dict[str, Any]:
     proc = MANAGED_PROCESSES.get(project_id)
     if not proc or proc.poll() is not None:
         return {"ok": True, **managed_process_public(project_id)}
+    MANAGED_PROCESS_META.setdefault(project_id, {})["stopped_by_user"] = True
     try:
         if os.name == "nt":
             # Managed Windows processes are created in their own process group.
@@ -3349,6 +3984,12 @@ class Handler(SimpleHTTPRequestHandler):
                     "assets": read_json(p / ".gameforge/asset_analysis.json", {"count":0,"items":[]}),
                     "git": git_status(p),
                     "experiment": experiment_status(p),
+                    "live_queue": live_queue_public(p),
+                    "fusion": cfg.get("fusion", DEFAULT_FUSION_POLICY),
+                    "fusion_manifest": fusion_manifest(p, cfg, persist=False),
+                    "run_reports": load_run_reports(p),
+                    "game_inventory": read_json(p / ".gameforge" / "game_inventory.json", {"count": 0, "games": []}),
+                    "fusion_deployment": fusion_deployment_status(p),
                 })
             if path.startswith("/api/project/") and path.endswith("/index"):
                 pid = path.split("/")[3]
@@ -3435,7 +4076,7 @@ class Handler(SimpleHTTPRequestHandler):
             p = project_path(pid); cfg = project_config(pid)
             if action == "config":
                 body = self.body_json()
-                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","agent","visual","log_globs"}
+                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","fusion","agent","visual","log_globs"}
                 for k,v in body.items():
                     if k in allowed: cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
@@ -3447,6 +4088,41 @@ class Handler(SimpleHTTPRequestHandler):
                 body = self.body_json()
                 result = promote_experimental_copy(pid, bool(body.get("confirm")))
                 return self.send_json(result, 200 if result.get("ok") else int(result.get("status", 409)))
+            if action in {"live/queue", "live/interrupt"}:
+                body = self.body_json()
+                text_value = str(body.get("text", "") or "").strip()
+                mode = "interrupt" if action == "live/interrupt" else "queue"
+                item = enqueue_live_instruction(p, text_value, mode=mode, source="user")
+                review = load_user_review(p)
+                if review.get("user_done"):
+                    review["user_done"] = False
+                    review["reopened_at"] = now_iso()
+                    save_user_review(p, review)
+                st = AGENTS.get(pid)
+                restart = None
+                if mode == "interrupt":
+                    restart = interrupt_agent_and_restart(pid, reason=f"interrupted for {item['id']}")
+                elif (not st or not st.thread or not st.thread.is_alive()) and not load_user_input_request(p):
+                    restart = {"restarting": False, "agent": start_agent(pid)}
+                return self.send_json({
+                    "ok": True,
+                    "item": item,
+                    "queue": live_queue_public(p),
+                    "restart": restart,
+                })
+            if action == "live/cancel":
+                body = self.body_json()
+                item_id = str(body.get("id", "") or "")
+                data = load_live_queue(p)
+                changed = False
+                for item in data.get("items", []):
+                    if item.get("id") == item_id and item.get("status") == "queued":
+                        item["status"] = "cancelled"
+                        item["cancelled_at"] = now_iso()
+                        changed = True
+                if changed:
+                    save_live_queue(p, data)
+                return self.send_json({"ok": changed, "queue": live_queue_public(p)}, 200 if changed else 404)
             if action == "agent/start":
                 return self.send_json(start_agent(pid))
             if action == "agent/pause":
@@ -3509,20 +4185,40 @@ class Handler(SimpleHTTPRequestHandler):
                 if not req:
                     return self.send_json({"error": "no pending input request"}, 409)
                 kind = req.get("kind", "text")
-                if kind in {"text","url","choice","confirm"}:
-                    response = body.get("value")
-                    if kind == "url" and response and not re.match(r"^https?://", str(response), re.I):
-                        return self.send_json({"error": "A valid http(s) URL is required"}, 400)
-                    if kind == "choice" and response not in req.get("choices", []):
-                        return self.send_json({"error": "Invalid choice"}, 400)
-                    write_json(p / ".gameforge" / "user_input_response.json",
-                               {"request_id": req.get("id"), "kind": kind, "value": response, "received_at": now_iso()})
+                response = body.get("value")
+                if kind == "url" and response and not re.match(r"^https?://", str(response), re.I):
+                    return self.send_json({"error": "A valid http(s) URL is required"}, 400)
+                if kind == "choice" and response not in req.get("choices", []):
+                    return self.send_json({"error": "Invalid choice"}, 400)
+                if kind == "file":
+                    filename = str(response or "").strip()
+                    if not filename:
+                        return self.send_json({"error": "Uploaded file name is required"}, 400)
+                    validate_requested_upload(req, filename)
+                    category = slugify(req.get("upload_category") or "REFERENCE").upper()
+                    supplied = f"UPLOAD/{category}/{filename}"
+                else:
+                    supplied = str(response)
+                write_json(p / ".gameforge" / "user_input_response.json",
+                           {"request_id": req.get("id"), "kind": kind, "value": response, "received_at": now_iso()})
+                enqueue_live_instruction(
+                    p,
+                    (
+                        f"Answer to your user-input question '{req.get('title') or 'GameForge question'}': "
+                        f"{supplied}. Continue from this answer and the current project state."
+                    ),
+                    mode="queue",
+                    source="agent-answer",
+                    metadata={"request_id": req.get("id"), "kind": kind},
+                )
                 req["status"] = "fulfilled"
                 req["fulfilled_at"] = now_iso()
                 write_json(user_input_request_path(p), req)
                 st = AGENTS.get(pid)
+                if st:
+                    st.input_request = None
                 if st and st.status == "waiting_for_user":
-                    st.status = "paused"; st.message = "User input received; ready to resume"
+                    st.status = "paused"; st.message = "User input received and queued; ready to resume"
                 return self.send_json({"ok": True, "resume_after_submit": bool(req.get("resume_after_submit", True))})
             if action == "review/feedback":
                 body = self.body_json()
@@ -3597,6 +4293,14 @@ class Handler(SimpleHTTPRequestHandler):
             if action == "git/rollback":
                 body = self.body_json()
                 return self.send_json(git_rollback(p, body.get("revision", "")))
+            if action == "games/scan":
+                inventory = discover_installed_games()
+                write_json(p / ".gameforge" / "game_inventory.json", inventory)
+                return self.send_json(inventory)
+            if action == "fusion/install":
+                return self.send_json(fusion_install(pid))
+            if action == "fusion/restore":
+                return self.send_json(fusion_uninstall(pid))
             if action == "process/start":
                 body = self.body_json()
                 return self.send_json(start_managed_process(pid, body.get("command")))

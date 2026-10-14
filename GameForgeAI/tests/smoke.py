@@ -47,6 +47,11 @@ with tempfile.TemporaryDirectory() as td:
     assert rp == p.resolve()
     idx = app.scan_project_tree(p)
     assert idx["file_count"] > 0
+    assert (p / "design" / "project.json").is_file()
+    assert (p / "tasks" / "MVP.md").is_file()
+    fusion_design = app.read_json(p / "design" / "project.json", {})
+    assert fusion_design["format"] == "GameForgeAI.FusionProject"
+    assert "configured original full regression passes" in fusion_design["release_gates"]
 
     # The strict fast pipeline is now production behavior on main. Targeted
     # diagnostics may accelerate iteration, but they cannot close feedback or
@@ -62,6 +67,32 @@ with tempfile.TemporaryDirectory() as td:
     prompt_smoke = app.build_agent_prompt(p, production_cfg, 1, None, None, None)
     assert '.gameforge/cleanup_candidates.json' in prompt_smoke
     assert '{"path":"relative/path","safe_to_delete":true' in prompt_smoke
+    assert "LIVE FUSION INTERACTION" in prompt_smoke
+    assert "FUSION RUNTIME" in prompt_smoke
+
+    # Fusion live steering is durable, priority ordered, and injected into the
+    # next coding-agent prompt without weakening the normal quality gates.
+    queued_normal = app.enqueue_live_instruction(p, "Do this after the current turn.", mode="queue")
+    queued_now = app.enqueue_live_instruction(p, "Do this immediately.", mode="interrupt")
+    claimed = app.claim_live_instructions(p, 2)
+    assert claimed[0]["id"] == queued_now["id"], claimed
+    assert {x["id"] for x in claimed} >= {queued_normal["id"], queued_now["id"]}
+    app.settle_live_instructions(p, 2, delivered=True)
+    assert app.live_queue_public(p)["queued_count"] == 0
+
+    retry_item = app.enqueue_live_instruction(p, "Do not lose me if interrupted.", mode="queue")
+    retry_claim = app.claim_live_instructions(p, 3)
+    assert any(x["id"] == retry_item["id"] for x in retry_claim)
+    app.requeue_live_instructions(p, reason="smoke interrupt")
+    assert any(x["id"] == retry_item["id"] for x in app.live_queue_public(p)["queued"])
+
+    prompt_item = app.enqueue_live_instruction(p, "Use the live steering message in this turn.", mode="queue")
+    prompt_live = app.build_agent_prompt(p, production_cfg, 4, None, None, None)
+    assert "LIVE USER INSTRUCTIONS" in prompt_live
+    assert "Use the live steering message in this turn." in prompt_live
+    app.settle_live_instructions(p, 4, delivered=True)
+    assert any(x["id"] == prompt_item["id"] and x["status"] == "delivered"
+               for x in app.load_live_queue(p)["items"])
 
     before_review = app.append_user_feedback(p, "Strict quality smoke feedback.", "general")
     candidate = app.load_user_review(p)
@@ -168,6 +199,73 @@ with tempfile.TemporaryDirectory() as td:
     assert transient["ok"] is True, transient
     assert transient.get("transient_retries") == 1, transient
 
+    # Melty-style local run reports become Fusion evidence while GameForge
+    # remains the authority for strict build/test acceptance.
+    launch_script = p / "smoke_launch.py"
+    launch_script.write_text("print('fusion launch ok')\n", encoding="utf-8")
+    cfg_run = app.project_config(cfg["id"])
+    cfg_run["commands"]["launch"] = f'"{sys.executable}" smoke_launch.py'
+    app.write_json(p / "gameforge.json", cfg_run)
+    launched = app.start_managed_process(cfg["id"])
+    assert launched["ok"], launched
+    deadline = time.time() + 8
+    managed = launched
+    while time.time() < deadline:
+        managed = app.managed_process_public(cfg["id"])
+        if not managed.get("running"):
+            break
+        time.sleep(0.1)
+    assert managed.get("returncode") == 0, managed
+    reports = app.load_run_reports(p)["reports"]
+    assert reports and reports[-1]["worked"] is True, reports
+    manifest = app.fusion_manifest(p, app.project_config(cfg["id"]))
+    assert manifest["format"] == "GameForgeAI.Fusion"
+    assert manifest["recent_run_reports"][-1]["worked"] is True
+
+    # Fusion deployment provides the Melty-style reversible install property:
+    # replace a file only after backing it up, then restore the exact original.
+    game_root = Path(td) / "owned-game"
+    game_target = game_root / "mods" / "example.dat"
+    game_target.parent.mkdir(parents=True, exist_ok=True)
+    game_target.write_text("original-game-file", encoding="utf-8")
+    built_file = p / "release" / "example.dat"
+    built_file.parent.mkdir(parents=True, exist_ok=True)
+    built_file.write_text("fusion-built-file", encoding="utf-8")
+    app.write_json(app.fusion_deploy_config_path(p), {
+        "target_root": str(game_root),
+        "files": [{"source": "release/example.dat", "target": "mods/example.dat"}],
+    })
+    install = app.fusion_install(cfg["id"])
+    assert install["ok"], install
+    assert game_target.read_text(encoding="utf-8") == "fusion-built-file"
+    assert app.fusion_deployment_status(p)["state"]["status"] == "active"
+    restore = app.fusion_uninstall(cfg["id"])
+    assert restore["ok"], restore
+    assert game_target.read_text(encoding="utf-8") == "original-game-file"
+    assert app.fusion_deployment_status(p)["state"]["status"] == "restored"
+
+    # If the installed file changes after deployment, restore must refuse to
+    # overwrite it. This preserves user/game changes instead of blindly rolling back.
+    game_target.write_text("original-game-file-2", encoding="utf-8")
+    install2 = app.fusion_install(cfg["id"])
+    assert install2["ok"], install2
+    game_target.write_text("changed-after-install", encoding="utf-8")
+    restore_conflict = app.fusion_uninstall(cfg["id"])
+    assert restore_conflict["ok"] is False, restore_conflict
+    assert restore_conflict["conflicts"], restore_conflict
+    assert game_target.read_text(encoding="utf-8") == "changed-after-install"
+    assert app.fusion_deployment_status(p)["state"]["status"] == "active-with-conflicts"
+
+    # Reset the fixture so later smoke work is not left with an active deployment.
+    state_reset = app.read_json(app.fusion_deployment_state_path(p), {})
+    state_reset["status"] = "restored"
+    app.write_json(app.fusion_deployment_state_path(p), state_reset)
+
+    inventory = app.discover_installed_games()
+    assert inventory["local_only"] is True
+    assert isinstance(inventory["games"], list)
+    app.write_json(p / ".gameforge" / "game_inventory.json", inventory)
+
     # Automatic cleanup archives old logs before deletion, prunes only old
     # iteration-specific research/capture groups, and honors explicit AI-safe
     # workspace candidates.
@@ -214,6 +312,36 @@ with tempfile.TemporaryDirectory() as td:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/status", timeout=5) as r:
             data = json.loads(r.read())
             assert "python" in data
+
+        # Agent questions feed their answers back into the same durable live
+        # queue used for user steering.
+        app.write_json(app.user_input_request_path(p), {
+            "id": "smoke-question",
+            "status": "pending",
+            "kind": "text",
+            "title": "Which option?",
+            "message": "Choose the smoke option.",
+            "resume_after_submit": False,
+        })
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/project/{cfg['id']}/input-request/respond",
+            data=json.dumps({"value": "option-a"}).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            answer_result = json.loads(r.read())
+            assert answer_result["ok"] is True
+        answer_items = app.load_live_queue(p)["items"]
+        assert any(x.get("source") == "agent-answer" and "option-a" in x.get("text", "")
+                   for x in answer_items), answer_items
+
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/project/{cfg['id']}/state", timeout=5) as r:
+            state_payload = json.loads(r.read())
+            assert "live_queue" in state_payload
+            assert state_payload["fusion_manifest"]["format"] == "GameForgeAI.Fusion"
+            assert "fusion_deployment" in state_payload
+            assert "game_inventory" in state_payload
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5) as r:
             page = r.read().decode("utf-8", "replace")
             assert "GameForge" in page

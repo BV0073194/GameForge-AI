@@ -54,7 +54,7 @@
               <h3>Autonomous developer</h3>
               <p id="agentMessage" class="muted">Idle</p>
               <div id="inputRequest" class="criterion" hidden>
-                <h3 id="inputRequestTitle">GameForge needs input</h3>
+                <h3 id="inputRequestTitle">Agent question</h3>
                 <p id="inputRequestMessage"></p>
                 <p id="inputRequestWhy" class="tiny"></p>
                 <div id="inputRequestControl"></div>
@@ -79,6 +79,22 @@
               <pre id="liveTaskDetail" class="compact">Start or resume the autonomous developer to see what GameForge is doing on the computer.</pre>
               <div id="liveTaskHistory"></div>
               <p class="tiny">Updates from actual AI/tool/build/test activity. Long WSL installs, compiler runs, file edits, research, and self-repair steps will stay visible here so a busy task does not look frozen.</p>
+            </article>
+
+            <article class="card" id="liveSteeringCard">
+              <div class="row between wrap">
+                <h3>Live agent queue</h3>
+                <span class="badge">Fusion</span>
+              </div>
+              <p class="muted">Steer the coding agent while it is working. Queue an instruction for the next safe turn, or stop only the current task and run your new instruction immediately.</p>
+              <textarea id="liveInstruction" rows="4" placeholder="Add a requirement, change direction, answer a follow-up, or tell the agent what to do next…"></textarea>
+              <div class="actions">
+                <button id="queueLiveInstruction" class="primary">Queue next</button>
+                <button id="interruptLiveInstruction" class="danger">End current task &amp; run now</button>
+              </div>
+              <p id="liveQueueStatus" class="muted">Nothing queued.</p>
+              <div id="liveQueueList"></div>
+              <p class="tiny">Ctrl+Enter queues. Ctrl+Shift+Enter interrupts the active Codex/build/test task, preserves current files, and immediately starts a fresh turn with your instruction.</p>
             </article>
 
             <article class="card">
@@ -176,6 +192,21 @@
             <article class="card"><h3>Asset intelligence</h3><p>Analyze uploaded models/textures so the agent can plan optimization, conversion and art-style adaptation.</p><div class="actions"><button id="analyzeAssets">Analyze assets</button></div><pre id="assetOutput" class="console"></pre></article>
             <article class="card"><h3>Git safety</h3><div class="actions"><button id="gitStatusBtn">Refresh Git</button></div><pre id="gitOutput" class="console"></pre><label>Rollback revision<input id="rollbackRev" placeholder="commit hash"></label><button id="rollbackBtn" class="danger">Rollback to revision</button></article>
           </div>
+
+          <article class="card" id="fusionRuntimeCard">
+            <div class="row between wrap"><h3>Fusion runtime &amp; handoff</h3><span class="badge">GameForge + Melty-style flow</span></div>
+            <p class="muted">GameForge keeps the strict autonomous QA loop while adding local game discovery, reversible mod deployment, runtime reports, and a portable coding-agent handoff.</p>
+            <div class="actions">
+              <button id="scanFusionGames">Scan installed games</button>
+              <button id="fusionInstall" class="primary">Install / apply Fusion build</button>
+              <button id="fusionRestore" class="danger">Restore original game files</button>
+            </div>
+            <p id="fusionDeployStatus" class="muted">No Fusion deployment configured.</p>
+            <div id="fusionGameInventory"></div>
+            <div id="fusionRunReports"></div>
+            <details><summary>Fusion handoff manifest</summary><pre id="fusionManifest" class="compact"></pre></details>
+            <p class="tiny">Deployment config: <code>.gameforge/fusion_deploy.json</code>. Handoff: <code>.gameforge/fusion_manifest.json</code>. GameForge backs up every replaced file and will not overwrite restore conflicts.</p>
+          </article>
         </div>
 
         <div id="tab-settings" class="tab">

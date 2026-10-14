@@ -47,3 +47,36 @@ jobs:
           set -euxo pipefail
           cd GameForgeAI
           python tests/smoke.py
+
+
+  windows-smoke:
+    runs-on: windows-2025
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        shell: pwsh
+        run: |
+          Set-Location GameForgeAI
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Compile backend
+        shell: pwsh
+        run: |
+          Set-Location GameForgeAI
+          python -m py_compile server/app.py
+
+      - name: Run source smoke
+        shell: pwsh
+        env:
+          PYNPUT_BACKEND: dummy
+        run: |
+          Set-Location GameForgeAI
+          python tests/smoke.py

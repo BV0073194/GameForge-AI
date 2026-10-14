@@ -7,7 +7,7 @@ async function loadSystem(){try{const s=await api('/api/status');const codexText
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function selectProject(id){stopProjectPolling();current=id;inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;acceptanceVisibleCount=5;activityVisibleCount=5;lastAcceptance=null;lastLiveAgent=null;lastManagedProcess=null;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();startProjectPolling()}
-async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#cleanCmd').value=c.commands?.clean||'';$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#cleanCmd').value=c.commands?.clean||'';$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);renderLiveQueue(d.live_queue,d.input_request,d.agent);renderFusionRuntime(d.run_reports,d.fusion_manifest,d.game_inventory,d.fusion_deployment);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
 function activityAge(iso){
  if(!iso)return 'No activity yet';
  const ms=Date.now()-Date.parse(iso);if(!Number.isFinite(ms))return '';
@@ -57,6 +57,75 @@ function renderLiveTask(agent,managed){
  $('#liveTaskHistory').innerHTML=html;
  const more=$('#showMoreActivity');if(more)more.onclick=()=>{activityVisibleCount=Math.min(all.length,activityVisibleCount+5);renderLiveTask(lastLiveAgent,lastManagedProcess)};
  const collapse=$('#collapseActivity');if(collapse)collapse.onclick=()=>{activityVisibleCount=5;renderLiveTask(lastLiveAgent,lastManagedProcess);$('#liveTaskHistory').scrollIntoView({block:'nearest'})};
+}
+function renderLiveQueue(q,question,agent){
+ q=q||{queued:[],in_progress:[],recent:[],queued_count:0,in_progress_count:0};
+ const status=$('#liveQueueStatus');
+ const box=$('#liveQueueList');
+ if(!status||!box)return;
+ const active=q.in_progress||[];
+ const queued=q.queued||[];
+ const recent=(q.recent||[]).slice(-5).reverse();
+ const parts=[];
+ if(active.length)parts.push(active.length+' instruction'+(active.length===1?' is':'s are')+' in the current AI turn');
+ if(queued.length)parts.push(queued.length+' queued');
+ if(question)parts.push('agent is waiting for your answer');
+ status.textContent=parts.length?parts.join(' • '):((agent?.status==='running')?'Agent is working; you can steer it live.':'Nothing queued.');
+ let html='';
+ if(active.length){
+   html+='<h4>In progress</h4>'+active.map(x=>'<div class="criterion pass"><strong>'+esc(x.priority==='immediate'?'Immediate':'Current')+'</strong> — '+esc(x.text||'')+'<br><small>'+esc(x.created_at||'')+'</small></div>').join('');
+ }
+ if(queued.length){
+   html+='<h4>Queued next</h4>'+queued.map(x=>'<div class="criterion pending"><strong>'+esc(x.priority==='immediate'?'Immediate':'Queued')+'</strong> — '+esc(x.text||'')+'<br><small>'+esc(x.created_at||'')+'</small><div class="actions"><button class="cancelLiveInstruction" data-live-id="'+esc(x.id||'')+'">Cancel</button></div></div>').join('');
+ }
+ if(recent.length){
+   html+='<details><summary>Recent delivered instructions</summary>'+recent.map(x=>'<div class="criterion"><strong>'+esc(x.status||'delivered')+'</strong> — '+esc(x.text||'')+'<br><small>'+esc(x.delivered_at||x.cancelled_at||x.created_at||'')+'</small></div>').join('')+'</details>';
+ }
+ box.innerHTML=html;
+ box.querySelectorAll('.cancelLiveInstruction').forEach(b=>b.onclick=async()=>{
+   try{await postAction('live/cancel',{id:b.dataset.liveId});await refreshState()}catch(e){alert(e.message)}
+ });
+}
+
+async function sendLiveInstruction(interrupt){
+ const input=$('#liveInstruction');
+ const textValue=(input?.value||'').trim();
+ if(!textValue)return alert('Type an instruction for the agent first.');
+ const status=$('#liveQueueStatus');
+ status.textContent=interrupt?'Stopping the current task and handing your instruction to a fresh turn…':'Queueing instruction for the next agent turn…';
+ try{
+   await postAction(interrupt?'live/interrupt':'live/queue',{text:textValue});
+   input.value='';
+   await refreshState();
+ }catch(e){status.textContent=e.message}
+}
+function renderFusionRuntime(runReports,manifest,inventory,deployment){
+ const box=$('#fusionRunReports');
+ const pre=$('#fusionManifest');
+ const inv=$('#fusionGameInventory');
+ const dep=$('#fusionDeployStatus');
+ if(pre)pre.textContent=manifest?JSON.stringify(manifest,null,2):'Fusion manifest not generated yet.';
+ const depState=deployment?.state||{};
+ const depCfg=deployment?.config||{};
+ if(dep){
+   if(depState.status==='active')dep.textContent='Fusion deployment active • '+(depState.files?.length||0)+' file(s) installed into '+(depState.target_root||'target game')+'.';
+   else if(depState.status==='active-with-conflicts')dep.textContent='Restore has conflicts. GameForge left changed files untouched to avoid data loss.';
+   else if(depState.status==='restored')dep.textContent='Original game files restored.';
+   else if(deployment?.configured)dep.textContent='Fusion deployment ready for '+(depCfg.target_root||'configured target')+'.';
+   else dep.textContent='No Fusion deployment configured yet. The agent can create .gameforge/fusion_deploy.json when a mod needs reversible installation.';
+ }
+ if(inv){
+   const games=(inventory?.games||[]).filter(g=>g.installed).slice(0,20);
+   inv.innerHTML=games.length?'<h4>Detected local games</h4>'+games.map(g=>'<div class="criterion"><strong>'+esc(g.name||'Game')+'</strong> — '+esc(g.store||'')+(g.build_id?' • build '+esc(g.build_id):'')+'<br><small>'+esc(g.install_path||'')+'</small></div>').join(''):'<p class="muted">No local game inventory yet. Scan installed games to let the agent target owned copies without redistributing game content.</p>';
+ }
+ if(!box)return;
+ const reports=(runReports?.reports||[]).slice(-8).reverse();
+ if(!reports.length){box.innerHTML='<p class="muted">No managed game runs recorded yet.</p>';return}
+ box.innerHTML='<h4>Recent local play/install outcomes</h4>'+reports.map(r=>{
+   const label=r.stopped_by_user?'Stopped by user':(r.worked?'Worked':'Failed');
+   const klass=r.worked?'pass':(r.stopped_by_user?'':'pending');
+   return '<div class="criterion '+klass+'"><strong>'+esc(label)+'</strong> — '+esc(r.command||'managed launch')+'<br><small>'+esc(r.finished_at||r.started_at||'')+(r.returncode!=null?' • exit '+esc(r.returncode):'')+(r.log?' • '+esc(r.log):'')+'</small></div>';
+ }).join('');
 }
 function renderInputRequest(r){
  const box=$('#inputRequest');if(!r){box.hidden=true;inputRequestBusy=false;inputRequestPending=false;return}inputRequestPending=true;stopProjectPolling();box.hidden=false;
@@ -249,6 +318,14 @@ $('#reopenUserDone').onclick=async()=>{
    await refreshState();
  }catch(e){status.textContent=e.message;delete status.dataset.local}
 };
+$('#queueLiveInstruction').onclick=()=>sendLiveInstruction(false);
+$('#interruptLiveInstruction').onclick=()=>sendLiveInstruction(true);
+$('#liveInstruction').addEventListener('keydown',e=>{
+ if(e.key==='Enter'&&e.ctrlKey){
+   e.preventDefault();
+   sendLiveInstruction(!!e.shiftKey);
+ }
+});
 $('#scanUploads').onclick=async()=>{try{const r=await postAction('uploads/scan');renderUploads(r)}catch(e){alert(e.message)}};
 $('#uploadBtn').onclick=async()=>{if(!current)return;const files=[...$('#uploadFiles').files];if(!files.length)return alert('Select files.');const cat=$('#uploadCategory').value;for(let i=0;i<files.length;i++){const f=files[i];$('#uploadStatus').textContent=`Uploading ${i+1}/${files.length}: ${f.name}`;const r=await fetch(`/api/project/${current}/upload?category=${encodeURIComponent(cat)}&path=${encodeURIComponent(f.webkitRelativePath||f.name)}`,{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':f.name},body:f});if(!r.ok)throw new Error(await r.text())}$('#uploadStatus').textContent='Upload complete. Scanning…';const m=await postAction('uploads/scan');renderUploads(m);$('#uploadStatus').textContent='Upload intake complete.'};
 $('#refreshLogs').onclick=async()=>{if(!current)return;try{const d=await api(`/api/project/${current}/logs`);$('#logs').innerHTML=d.files.map(f=>`<details class="logbox"><summary>${esc(f.name)}</summary><pre>${esc(f.text)}</pre></details>`).join('')||'<p>No logs yet.</p>'}catch(e){alert(e.message)}};
@@ -258,6 +335,22 @@ const requestedProject=new URLSearchParams(location.search).get('project');
 loadProjects(requestedProject);
 
 $('#runResearch').onclick=async()=>{if(!current)return;$('#researchOutput').textContent='Researching…';try{const r=await postAction('research/run',{question:$('#researchQuestion').value||'Research whatever is currently most important to completing the playable game goal professionally.'});$('#researchOutput').textContent=r.output||JSON.stringify(r,null,2)}catch(e){$('#researchOutput').textContent=e.message}};
+$('#scanFusionGames').onclick=async()=>{
+ const status=$('#fusionDeployStatus');status.textContent='Scanning local Steam libraries…';
+ try{const r=await postAction('games/scan',{});status.textContent='Found '+(r.count||0)+' Steam game entries.';await refreshState()}catch(e){status.textContent=e.message}
+};
+$('#fusionInstall').onclick=async()=>{
+ const status=$('#fusionDeployStatus');
+ if(!confirm('Apply the configured Fusion deployment to the target game folder? GameForge will back up every replaced file first.'))return;
+ status.textContent='Applying Fusion deployment with transactional backups…';
+ try{const r=await postAction('fusion/install',{});status.textContent=r.ok?'Fusion deployment installed.':(r.error||'Install failed.');await refreshState()}catch(e){status.textContent=e.message}
+};
+$('#fusionRestore').onclick=async()=>{
+ const status=$('#fusionDeployStatus');
+ if(!confirm('Restore the original game files from the Fusion backup? Files changed after installation will be left untouched and reported as conflicts.'))return;
+ status.textContent='Restoring original game files…';
+ try{const r=await postAction('fusion/restore',{});status.textContent=r.ok?'Original game files restored.':(r.error||'Restore completed with conflicts.');await refreshState()}catch(e){status.textContent=e.message}
+};
 $('#managedLaunch').onclick=async()=>{try{const r=await postAction('process/start',{});$('#processStatus').textContent=JSON.stringify(r,null,2);await refreshState()}catch(e){alert(e.message)}};
 $('#managedStop').onclick=async()=>{try{const r=await postAction('process/stop',{});$('#processStatus').textContent=JSON.stringify(r,null,2);await refreshState()}catch(e){alert(e.message)}};
 $('#refreshProcesses').onclick=async()=>{if(!current)return;try{const r=await api(`/api/project/${current}/processes`);$('#processList').textContent=r.processes.slice(0,120).map(p=>`${p.pid}\t${p.name}\t${p.exe}`).join('\n')}catch(e){$('#processList').textContent=e.message}};
