@@ -3242,7 +3242,8 @@ def fusion_manifest(p: Path, cfg: dict[str, Any]) -> dict[str, Any]:
     return manifest
 
 
-def managed_process_public(project_id: str) -> dict[str, Any]:    proc = MANAGED_PROCESSES.get(project_id)
+def managed_process_public(project_id: str) -> dict[str, Any]:
+    proc = MANAGED_PROCESSES.get(project_id)
     meta = dict(MANAGED_PROCESS_META.get(project_id, {}))
     if not proc:
         return {"running": False, **meta}
