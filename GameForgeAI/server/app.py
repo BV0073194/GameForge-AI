@@ -1356,6 +1356,52 @@ def promote_experimental_copy(project_id: str, confirmed: bool) -> dict[str, Any
     }
 
 
+def ensure_fusion_project_scaffold(p: Path, cfg: dict[str, Any]) -> None:
+    """Add Melty-style agent/design/task handoff files without overwriting project work."""
+    (p / "design").mkdir(parents=True, exist_ok=True)
+    (p / "tasks").mkdir(parents=True, exist_ok=True)
+    design_path = p / "design" / "project.json"
+    if not design_path.exists():
+        write_json(design_path, {
+            "format": "GameForgeAI.FusionProject",
+            "format_version": 1,
+            "name": cfg.get("name", cfg.get("id", "Game Project")),
+            "goal": cfg.get("goal", ""),
+            "project_id": cfg.get("id", ""),
+            "release_gates": [
+                "requested behavior implemented",
+                "configured full build passes",
+                "configured original full regression passes",
+                "pending user feedback is resolved with evidence",
+                "managed runtime/play evidence is captured when applicable",
+            ],
+            "owned_game_policy": "Use locally owned game installations; never redistribute proprietary game content.",
+            "handoff_files": {
+                "agents": "AGENTS.md",
+                "goal": "goal.md",
+                "acceptance": ".gameforge/acceptance.json",
+                "live_queue": ".gameforge/live_queue.json",
+                "fusion_manifest": ".gameforge/fusion_manifest.json",
+            },
+        })
+    tasks_path = p / "tasks" / "MVP.md"
+    if not tasks_path.exists():
+        tasks_path.write_text(
+            "# Fusion delivery checklist\n\n"
+            f"## Goal\n{str(cfg.get('goal', '')).strip()}\n\n"
+            "## Required delivery flow\n"
+            "- [ ] Implement the user-visible requested behavior, not only diagnostics.\n"
+            "- [ ] Run focused tests while developing.\n"
+            "- [ ] Pass the configured full build.\n"
+            "- [ ] Pass the configured original full regression.\n"
+            "- [ ] Resolve every user feedback work order with concrete evidence.\n"
+            "- [ ] Record a real local runtime/play result when applicable.\n"
+            "- [ ] Package/deploy reversibly when the target game requires file installation.\n"
+            "- [ ] Do not claim completion until GameForge acceptance is verified.\n",
+            encoding="utf-8",
+        )
+
+
 def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[str, Any]:
     pid_base = slugify(name)
     pid = pid_base
@@ -1367,7 +1413,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
     for rel in [
         "UPLOAD/MODELS", "UPLOAD/TEXTURES", "UPLOAD/ANIMATIONS", "UPLOAD/AUDIO", "UPLOAD/UI",
         "UPLOAD/REFERENCE", "UPLOAD/MODS", "UPLOAD/SOURCE", "UPLOAD/REPOS", "UPLOAD/TOOLS",
-        "UPLOAD/DOCS", "UPLOAD/ROMS_LOCAL", "workspace", "research", "logs", "captures", ".gameforge"
+        "UPLOAD/DOCS", "UPLOAD/ROMS_LOCAL", "workspace", "research", "logs", "captures", ".gameforge", "design", "tasks"
     ]:
         (p / rel).mkdir(parents=True, exist_ok=True)
 
@@ -1401,6 +1447,7 @@ def create_project(name: str, goal: str, research_mode: str = "deep") -> dict[st
     }
     write_json(p / "gameforge.json", cfg)
     (p / "goal.md").write_text(f"# User Goal\n\n{goal.strip()}\n", encoding="utf-8")
+    ensure_fusion_project_scaffold(p, cfg)
     acceptance = {
         "project_complete": False,
         "updated_at": now_iso(),
@@ -2233,7 +2280,7 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
         prior += "\nAutomatic recovery context:\n" + json.dumps(recovery_context, indent=2)[-16000:]
     research = cfg.get("research_mode", "deep")
     if fast_pipeline:
-        startup = """FAST STRICT PIPELINE: Start with .gameforge/compact_state.json, goal.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
+        startup = """FAST STRICT PIPELINE: Start with .gameforge/compact_state.json, goal.md, design/project.json, tasks/MVP.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
 
 During the AI turn, prefer short targeted tests for the code you are actively changing. Do not rerun the configured full build/regression merely as an end-of-turn ritual because GameForge will run the configured build and ORIGINAL configured full test once after this turn returns. You MAY run the full suite inside the turn when the change is high-risk (save format, camera/player core, collision/damage, scene transition, object loading, input/render hooks), when diagnosing a failure, or when targeted evidence is insufficient.
 
@@ -2598,7 +2645,8 @@ def agent_loop(project_id: str) -> None:
 
 def start_agent(project_id: str) -> dict[str, Any]:
     p = project_path(project_id)
-    project_config(project_id)
+    cfg = project_config(project_id)
+    ensure_fusion_project_scaffold(p, cfg)
     with STATE_LOCK:
         existing = AGENTS.get(project_id)
         if existing and existing.thread and existing.thread.is_alive():
