@@ -2589,18 +2589,54 @@ def agent_loop(project_id: str) -> None:
 
 
 def start_agent(project_id: str) -> dict[str, Any]:
+    p = project_path(project_id)
     project_config(project_id)
     with STATE_LOCK:
         existing = AGENTS.get(project_id)
         if existing and existing.thread and existing.thread.is_alive():
             existing.pause_event.clear()
             return agent_public(existing)
-        state = AgentState(project_id=project_id)
+        persisted_iteration = int((read_json(p / ".gameforge" / "last_evidence.json", {}) or {}).get("iteration", 0) or 0)
+        resume_iteration = max(persisted_iteration, existing.iteration if existing else 0)
+        state = AgentState(project_id=project_id, iteration=resume_iteration)
         AGENTS[project_id] = state
         t = threading.Thread(target=agent_loop, args=(project_id,), daemon=True, name=f"agent-{project_id}")
         state.thread = t
         t.start()
         return agent_public(state)
+
+
+def interrupt_agent_and_restart(project_id: str, reason: str = "live user instruction") -> dict[str, Any]:
+    """Kill only the current work pass, then immediately continue from current files."""
+    p = project_path(project_id)
+    requeue_live_instructions(p, reason=reason)
+    state = AGENTS.get(project_id)
+    if not state or not state.thread or not state.thread.is_alive():
+        return {"restarting": False, "agent": start_agent(project_id)}
+
+    stop_agent_now(state)
+
+    def restart() -> None:
+        thread = state.thread
+        if thread:
+            thread.join(timeout=20)
+        if thread and thread.is_alive():
+            state.status = "error"
+            state.message = "Current task did not exit after interrupt; automatic restart was withheld to avoid overlapping agents."
+            set_agent_activity(state, "Interrupt needs attention", state.message, "error")
+            return
+        try:
+            start_agent(project_id)
+        except Exception as exc:
+            state.status = "error"
+            state.message = f"Interrupted task stopped, but restart failed: {exc}"
+
+    threading.Thread(
+        target=restart,
+        daemon=True,
+        name=f"live-interrupt-restart-{project_id}",
+    ).start()
+    return {"restarting": True, "agent": agent_public(state)}
 
 
 def agent_public(s: AgentState) -> dict[str, Any]:
@@ -3525,6 +3561,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "assets": read_json(p / ".gameforge/asset_analysis.json", {"count":0,"items":[]}),
                     "git": git_status(p),
                     "experiment": experiment_status(p),
+                    "live_queue": live_queue_public(p),
+                    "fusion": cfg.get("fusion", DEFAULT_FUSION_POLICY),
                 })
             if path.startswith("/api/project/") and path.endswith("/index"):
                 pid = path.split("/")[3]
@@ -3623,6 +3661,41 @@ class Handler(SimpleHTTPRequestHandler):
                 body = self.body_json()
                 result = promote_experimental_copy(pid, bool(body.get("confirm")))
                 return self.send_json(result, 200 if result.get("ok") else int(result.get("status", 409)))
+            if action in {"live/queue", "live/interrupt"}:
+                body = self.body_json()
+                text_value = str(body.get("text", "") or "").strip()
+                mode = "interrupt" if action == "live/interrupt" else "queue"
+                item = enqueue_live_instruction(p, text_value, mode=mode, source="user")
+                review = load_user_review(p)
+                if review.get("user_done"):
+                    review["user_done"] = False
+                    review["reopened_at"] = now_iso()
+                    save_user_review(p, review)
+                st = AGENTS.get(pid)
+                restart = None
+                if mode == "interrupt":
+                    restart = interrupt_agent_and_restart(pid, reason=f"interrupted for {item['id']}")
+                elif (not st or not st.thread or not st.thread.is_alive()) and not load_user_input_request(p):
+                    restart = {"restarting": False, "agent": start_agent(pid)}
+                return self.send_json({
+                    "ok": True,
+                    "item": item,
+                    "queue": live_queue_public(p),
+                    "restart": restart,
+                })
+            if action == "live/cancel":
+                body = self.body_json()
+                item_id = str(body.get("id", "") or "")
+                data = load_live_queue(p)
+                changed = False
+                for item in data.get("items", []):
+                    if item.get("id") == item_id and item.get("status") == "queued":
+                        item["status"] = "cancelled"
+                        item["cancelled_at"] = now_iso()
+                        changed = True
+                if changed:
+                    save_live_queue(p, data)
+                return self.send_json({"ok": changed, "queue": live_queue_public(p)}, 200 if changed else 404)
             if action == "agent/start":
                 return self.send_json(start_agent(pid))
             if action == "agent/pause":
@@ -3685,20 +3758,40 @@ class Handler(SimpleHTTPRequestHandler):
                 if not req:
                     return self.send_json({"error": "no pending input request"}, 409)
                 kind = req.get("kind", "text")
-                if kind in {"text","url","choice","confirm"}:
-                    response = body.get("value")
-                    if kind == "url" and response and not re.match(r"^https?://", str(response), re.I):
-                        return self.send_json({"error": "A valid http(s) URL is required"}, 400)
-                    if kind == "choice" and response not in req.get("choices", []):
-                        return self.send_json({"error": "Invalid choice"}, 400)
-                    write_json(p / ".gameforge" / "user_input_response.json",
-                               {"request_id": req.get("id"), "kind": kind, "value": response, "received_at": now_iso()})
+                response = body.get("value")
+                if kind == "url" and response and not re.match(r"^https?://", str(response), re.I):
+                    return self.send_json({"error": "A valid http(s) URL is required"}, 400)
+                if kind == "choice" and response not in req.get("choices", []):
+                    return self.send_json({"error": "Invalid choice"}, 400)
+                if kind == "file":
+                    filename = str(response or "").strip()
+                    if not filename:
+                        return self.send_json({"error": "Uploaded file name is required"}, 400)
+                    validate_requested_upload(req, filename)
+                    category = slugify(req.get("upload_category") or "REFERENCE").upper()
+                    supplied = f"UPLOAD/{category}/{filename}"
+                else:
+                    supplied = str(response)
+                write_json(p / ".gameforge" / "user_input_response.json",
+                           {"request_id": req.get("id"), "kind": kind, "value": response, "received_at": now_iso()})
+                enqueue_live_instruction(
+                    p,
+                    (
+                        f"Answer to your user-input question '{req.get('title') or 'GameForge question'}': "
+                        f"{supplied}. Continue from this answer and the current project state."
+                    ),
+                    mode="queue",
+                    source="agent-answer",
+                    metadata={"request_id": req.get("id"), "kind": kind},
+                )
                 req["status"] = "fulfilled"
                 req["fulfilled_at"] = now_iso()
                 write_json(user_input_request_path(p), req)
                 st = AGENTS.get(pid)
+                if st:
+                    st.input_request = None
                 if st and st.status == "waiting_for_user":
-                    st.status = "paused"; st.message = "User input received; ready to resume"
+                    st.status = "paused"; st.message = "User input received and queued; ready to resume"
                 return self.send_json({"ok": True, "resume_after_submit": bool(req.get("resume_after_submit", True))})
             if action == "review/feedback":
                 body = self.body_json()
