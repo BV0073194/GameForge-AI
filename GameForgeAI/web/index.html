@@ -195,10 +195,17 @@
 
           <article class="card" id="fusionRuntimeCard">
             <div class="row between wrap"><h3>Fusion runtime &amp; handoff</h3><span class="badge">GameForge + Melty-style flow</span></div>
-            <p class="muted">GameForge keeps the strict autonomous QA loop while recording Melty-style local run outcomes and a portable handoff manifest for coding-agent/runtime workflows.</p>
+            <p class="muted">GameForge keeps the strict autonomous QA loop while adding local game discovery, reversible mod deployment, runtime reports, and a portable coding-agent handoff.</p>
+            <div class="actions">
+              <button id="scanFusionGames">Scan installed games</button>
+              <button id="fusionInstall" class="primary">Install / apply Fusion build</button>
+              <button id="fusionRestore" class="danger">Restore original game files</button>
+            </div>
+            <p id="fusionDeployStatus" class="muted">No Fusion deployment configured.</p>
+            <div id="fusionGameInventory"></div>
             <div id="fusionRunReports"></div>
             <details><summary>Fusion handoff manifest</summary><pre id="fusionManifest" class="compact"></pre></details>
-            <p class="tiny">Manifest: <code>.gameforge/fusion_manifest.json</code>. It references AGENTS.md, goal.md, project config, quality evidence, queued steering, and recent local run reports without bundling proprietary game content.</p>
+            <p class="tiny">Deployment config: <code>.gameforge/fusion_deploy.json</code>. Handoff: <code>.gameforge/fusion_manifest.json</code>. GameForge backs up every replaced file and will not overwrite restore conflicts.</p>
           </article>
         </div>
 
