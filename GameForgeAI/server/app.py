@@ -27,11 +27,6 @@ from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
-try:
-    from . import fusion as fusion_runtime
-except ImportError:
-    import fusion as fusion_runtime  # type: ignore
-
 def _resource_root() -> Path:
     # PyInstaller one-file/one-dir extracts bundled resources to sys._MEIPASS.
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
