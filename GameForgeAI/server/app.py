@@ -2161,6 +2161,7 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     pipeline = iteration_pipeline_settings(cfg)
     fast_pipeline = bool(pipeline.get("enabled"))
     review = load_user_review(p)
+    live_inputs = claim_live_instructions(p, iteration)
     if fast_pipeline and pipeline.get("compact_context", True):
         compact = {
             "generated_at": now_iso(),
@@ -2172,6 +2173,7 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
             "last_self_heal": read_json(p / ".gameforge/last_self_heal.json", {}),
             "delivery_state": delivery_state_for_prompt(p, review),
             "last_cleanup": read_json(p / ".gameforge/last_cleanup.json", {}),
+            "live_user_inputs": live_inputs,
             "iteration_notes_tail": tail_text(p / ".gameforge/iteration_notes.md", 14000),
             "git": git_status(p),
         }
@@ -2180,6 +2182,27 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     else:
         evidence = collect_logs(p, cfg)
     prior = ""
+    if live_inputs:
+        prior += (
+            "\nLIVE USER INSTRUCTIONS — THESE ARRIVED WHILE THE AGENT WAS RUNNING. "
+            "Honor them before lower-priority roadmap work. If an instruction conflicts with an older plan, "
+            "the newer live instruction wins unless doing so would be unsafe or would violate an explicit immutable user requirement.\n"
+            + json.dumps(
+                [
+                    {
+                        "id": x.get("id"),
+                        "created_at": x.get("created_at"),
+                        "priority": x.get("priority"),
+                        "source": x.get("source"),
+                        "text": x.get("text"),
+                    }
+                    for x in live_inputs
+                ],
+                indent=2,
+                ensure_ascii=False,
+            )[-18000:]
+            + "\n"
+        )
     feedback_items = [x for x in review.get("feedback", []) if isinstance(x, dict)]
     pending_feedback = [x for x in feedback_items if not bool(x.get("addressed"))]
     if pending_feedback:
@@ -2215,6 +2238,8 @@ During the AI turn, prefer short targeted tests for the code you are actively ch
 STRICT ORIGINAL QUALITY MODE: The original configured build/test commands are the trusted quality gate and must not be weakened, replaced, shortened, fast-forwarded, or rewritten merely to make the experiment look faster. Savestates, direct scene warps, test-only state injection, fast-forward, native-save checkpoints, or other shortcuts may be used ONLY as development diagnostics. They are NEVER trusted acceptance evidence and NEVER sufficient to close a user-feedback work order. After a targeted check looks good, keep addressed=false and set ready_for_verification=true with a concrete resolution and targeted evidence; GameForge will close it only after the unchanged configured full build and full regression pass. Final project completion still requires the original full regression path.
 
 DELIVERY-FIRST RULE: User-visible implementation is the purpose of the loop; diagnostics exist only to unblock implementation. Never spend more than two consecutive iterations on diagnostic-only research/probes/verifier construction for pending user work. Prefer modifying production gameplay/code/assets and then testing that result. If a diagnostic path remains ambiguous after two passes, implement the safest evidence-backed candidate, try an alternate production approach, or explicitly record a genuine blocker and work a different pending requirement. Do not indefinitely investigate one edge case while other requested features remain unimplemented.
+
+LIVE FUSION INTERACTION: The user can type steering instructions while you work. Any LIVE USER INSTRUCTIONS in this prompt are fresh and should be treated as the highest-priority steering for this pass. The user may also interrupt a running turn to run a new instruction immediately; preserve already-good work and continue from the current files rather than starting over. When you genuinely need a user-only answer, use the structured user_input_request.json contract below so the UI can present the question and feed the answer directly into the next turn.
 
 When multiple pending user-feedback work orders are closely related, batch them into one coherent milestone and verify them together instead of spending separate iterations on tiny adjacent changes. This changes workflow efficiency only; it does NOT lower acceptance, regression, evidence, user-feedback completion, visual, physics, audio, gameplay, persistence, or polish requirements."""
     else:
