@@ -7,7 +7,7 @@ async function loadSystem(){try{const s=await api('/api/status');const codexText
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function selectProject(id){stopProjectPolling();current=id;inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;acceptanceVisibleCount=5;activityVisibleCount=5;lastAcceptance=null;lastLiveAgent=null;lastManagedProcess=null;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();startProjectPolling()}
-async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#cleanCmd').value=c.commands?.clean||'';$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);renderLiveQueue(d.live_queue,d.input_request,d.agent);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#cleanCmd').value=c.commands?.clean||'';$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);renderLiveQueue(d.live_queue,d.input_request,d.agent);renderFusionRuntime(d.run_reports,d.fusion_manifest);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
 function activityAge(iso){
  if(!iso)return 'No activity yet';
  const ms=Date.now()-Date.parse(iso);if(!Number.isFinite(ms))return '';
@@ -98,6 +98,19 @@ async function sendLiveInstruction(interrupt){
    input.value='';
    await refreshState();
  }catch(e){status.textContent=e.message}
+}
+function renderFusionRuntime(runReports,manifest){
+ const box=$('#fusionRunReports');
+ const pre=$('#fusionManifest');
+ if(pre)pre.textContent=manifest?JSON.stringify(manifest,null,2):'Fusion manifest not generated yet.';
+ if(!box)return;
+ const reports=(runReports?.reports||[]).slice(-8).reverse();
+ if(!reports.length){box.innerHTML='<p class="muted">No managed game runs recorded yet.</p>';return}
+ box.innerHTML='<h4>Recent local play/install outcomes</h4>'+reports.map(r=>{
+   const label=r.stopped_by_user?'Stopped by user':(r.worked?'Worked':'Failed');
+   const klass=r.worked?'pass':(r.stopped_by_user?'':'pending');
+   return '<div class="criterion '+klass+'"><strong>'+esc(label)+'</strong> — '+esc(r.command||'managed launch')+'<br><small>'+esc(r.finished_at||r.started_at||'')+(r.returncode!=null?' • exit '+esc(r.returncode):'')+(r.log?' • '+esc(r.log):'')+'</small></div>';
+ }).join('');
 }
 function renderInputRequest(r){
  const box=$('#inputRequest');if(!r){box.hidden=true;inputRequestBusy=false;inputRequestPending=false;return}inputRequestPending=true;stopProjectPolling();box.hidden=false;
