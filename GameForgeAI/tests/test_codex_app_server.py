@@ -107,6 +107,41 @@ class AppServerTest(unittest.TestCase):
         self.assertEqual(results[0].returncode, 130)
         self.assertFalse(self.client.active)
 
+    def test_persistent_turn_reuse(self):
+        stop = threading.Event()
+        interrupt = threading.Event()
+        first = self.client.run_turn("First iteration", timeout=5,
+            trace_path=self.path / "one.jsonl", stop_event=stop, interrupt_event=interrupt)
+        self.assertEqual(first.returncode, 0)
+        pid = self.client.process.pid
+        second = self.client.run_turn("Second iteration", timeout=5,
+            trace_path=self.path / "two.jsonl", stop_event=stop, interrupt_event=interrupt)
+        self.assertEqual(second.returncode, 0)
+        self.assertEqual(self.client.process.pid, pid)
+        self.assertEqual(self.client.thread_id, "test-thread")
+
+    def test_gameforge_agent_wrapper_uses_persistent_transport(self):
+        from unittest.mock import patch
+        from server import app
+        state = app.AgentState(project_id="test-fixture")
+        try:
+            with patch.object(app, "_command_invocation", return_value=(
+                [sys.executable, "-u", "-c", FAKE_SERVER], False
+            )), patch.object(app, "_codex_process_env", return_value=os.environ.copy()):
+                result = app.run_codex_fusion_stream(
+                    ["exec", "--json", "-"], cwd=self.path,
+                    input_text="GameForge integration test",
+                    timeout=5, trace_path=self.path / "gameforge.jsonl",
+                    state=state, permission_mode="full-auto",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIsNotNone(state.transport)
+                self.assertEqual(state.transport.thread_id, "test-thread")
+                self.assertEqual(state.active_process_kind, "codex-app-server")
+        finally:
+            if state.transport:
+                state.transport.close()
+
     def test_unavailable_fails_closed(self):
         self.client.close()
         broken = CodexAppServer(
