@@ -134,6 +134,47 @@ function renderInputRequest(r){
  $('#inputRequestMessage').textContent=r.message||'The agent needs additional input.';
  $('#inputRequestWhy').textContent=r.why_user_required||'';
  const c=$('#inputRequestControl');c.innerHTML='';
+ if(r.protocol==='codex-app-server'&&Array.isArray(r.questions)&&r.questions.length){
+   const controls=[];
+   for(const q of r.questions){
+     if(!q?.id)continue;
+     const wrapper=document.createElement('label');
+     wrapper.textContent=q.header||'Agent question';
+     const description=document.createElement('span');
+     description.className='tiny';
+     description.textContent=q.question||'';
+     wrapper.appendChild(description);
+     let field;
+     if(q.options?.length){
+       field=document.createElement('select');
+       for(const option of q.options){
+         const item=document.createElement('option');
+         item.value=option.label;
+         item.textContent=option.label+(option.description?' — '+option.description:'');
+         field.appendChild(item);
+       }
+     }else{
+       field=document.createElement('input');
+       field.type=(q.isSecret||q.is_secret)?'password':'text';
+       field.placeholder='Your answer';
+     }
+     field.addEventListener('focus',beginInputRequestInteraction);
+     field.addEventListener('input',beginInputRequestInteraction);
+     wrapper.appendChild(field);
+     controls.push({id:q.id,field});
+     c.appendChild(wrapper);
+   }
+   const submit=document.createElement('button');
+   submit.className='primary';
+   submit.textContent='Answer agent & continue turn';
+   submit.onclick=()=>{
+     const values=Object.fromEntries(controls.map(x=>[x.id,x.field.value]));
+     if(Object.values(values).some(x=>!String(x||'').trim()))return alert('Answer each agent question first.');
+     submitRequestedValue(r,values);
+   };
+   c.appendChild(submit);
+   return;
+ }
  if(r.kind==='file'){
    const input=document.createElement('input');input.type='file';input.id='requestedFile';
    if(r.accept_extensions?.length)input.accept=r.accept_extensions.join(',');
