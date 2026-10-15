@@ -26,6 +26,8 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+from server.codex_app_server import CodexAppServer, AppServerUnavailable, AppServerProtocolError
 
 def _resource_root() -> Path:
     # PyInstaller one-file/one-dir extracts bundled resources to sys._MEIPASS.
@@ -1546,6 +1548,8 @@ class AgentState:
     active_process: subprocess.Popen | None = field(default=None, repr=False)
     active_process_kind: str = ""
     active_process_started_at: str | None = None
+    transport: CodexAppServer | None = field(default=None, repr=False)
+    interrupt_event: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
@@ -1564,6 +1568,7 @@ MANAGED_PROCESSES: dict[str, subprocess.Popen] = {}
 MANAGED_PROCESS_META: dict[str, dict[str, Any]] = {}
 PROJECT_COMMAND_LOCKS: dict[str, threading.RLock] = {}
 PROJECT_COMMAND_LOCKS_GUARD = threading.Lock()
+LIVE_QUEUE_LOCK = threading.RLock()
 APP_SERVER: ThreadingHTTPServer | None = None
 WEB_SESSION = {"last_heartbeat": time.monotonic(), "closing": False, "shutdown_started": False}
 
@@ -1743,6 +1748,105 @@ def run_codex_agent_stream(
     return subprocess.CompletedProcess(command, returncode, "".join(stdout_lines), "".join(stderr_lines))
 
 
+
+def _fusion_agent_question(p: Path, state: AgentState, message: dict[str, Any]) -> bool:
+    """Surface Codex's actual pending JSON-RPC question, not a guessed answer."""
+    if message.get("method") != "item/tool/requestUserInput":
+        return False
+    params = message.get("params") or {}
+    questions = params.get("questions") or []
+    if not isinstance(questions, list) or not questions:
+        return False
+    first = questions[0] if isinstance(questions[0], dict) else {}
+    options = first.get("options") or []
+    choices = [str(x.get("label")) for x in options if isinstance(x, dict) and x.get("label")]
+    request = {
+        "id": "codex-" + str(message.get("id")),
+        "protocol": "codex-app-server",
+        "rpc_request_id": message.get("id"),
+        "kind": "choice" if choices else "text",
+        "title": str(first.get("header") or "Codex needs your input")[:180],
+        "message": str(first.get("question") or "How should Codex proceed?")[:3000],
+        "choices": choices,
+        "questions": questions,
+        "status": "pending",
+        "resume_after_submit": False,
+        "created_at": now_iso(),
+    }
+    write_json(user_input_request_path(p), request)
+    state.input_request = request
+    state.status = "waiting_for_user"
+    set_agent_activity(state, "Waiting for your answer", request["message"], "question")
+    return True
+
+
+def run_codex_fusion_stream(
+    args: list[str], *, cwd: Path, input_text: str, timeout: int,
+    trace_path: Path, state: AgentState, permission_mode: str = "full-auto",
+    transport_mode: str = "auto",
+) -> subprocess.CompletedProcess[str]:
+    """Prefer a persistent, steerable Codex session; fall back only before work starts."""
+    if transport_mode == "exec":
+        return run_codex_agent_stream(
+            args, cwd=cwd, input_text=input_text, timeout=timeout,
+            trace_path=trace_path, state=state,
+        )
+    if state.transport is None:
+        command, use_shell = _command_invocation("codex", ["app-server"])
+        state.transport = CodexAppServer(
+            command, shell=use_shell, cwd=cwd, env=_codex_process_env(),
+            permission_mode=permission_mode,
+            on_event=lambda event: (
+                set_agent_activity(state, *activity) if (
+                    activity := _codex_event_activity(json.dumps({
+                        "type": event.get("method", ""), **(event.get("params") or {})
+                    }))
+                ) else None
+            ),
+            on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
+        )
+    transport = state.transport
+    assert transport is not None
+    try:
+        transport.open()
+    except AppServerUnavailable as exc:
+        state.transport = None
+        set_agent_activity(state, "Using compatible Codex engine", 
+                           "App-server handshake unavailable; using the verified Codex exec path.", "fallback")
+        auth_trace("codex_app_server_fallback", reason=str(exc)[:800])
+        return run_codex_agent_stream(
+            args, cwd=cwd, input_text=input_text, timeout=timeout,
+            trace_path=trace_path, state=state,
+        )
+    _bind_active_process(state, transport.process, "codex-app-server")
+    try:
+        return transport.run_turn(
+            input_text, timeout=timeout, trace_path=trace_path,
+            stop_event=state.stop_event, interrupt_event=state.interrupt_event,
+        )
+    except AppServerProtocolError as exc:
+        # Once a turn may have started, NEVER replay it via exec: that can duplicate edits.
+        transport.close()
+        state.transport = None
+        return subprocess.CompletedProcess(args, 1, "", f"Codex app-server protocol failed: {exc}")
+    finally:
+        if state.active_process is transport.process and transport.process is None:
+            _bind_active_process(state, None, "")
+
+
+def mark_live_instruction_steered(p: Path, item_id: str) -> bool:
+    with LIVE_QUEUE_LOCK:
+        data = load_live_queue(p)
+        for item in data.get("items", []):
+            if item.get("id") == item_id and item.get("status") == "queued":
+                item["status"] = "delivered"
+                item["delivered_at"] = now_iso()
+                item["delivery"] = "in-turn-steer"
+                save_live_queue(p, data)
+                return True
+    return False
+
+
 def git_checkpoint(p: Path, message: str) -> dict[str, Any]:
     if not command_exists("git"):
         return {"ok": False, "error": "git not installed"}
@@ -1770,6 +1874,14 @@ def collect_logs(p: Path, cfg: dict[str, Any]) -> str:
 
 
 
+def live_queue_atomic(fn):
+    """Serialize read-modify-write queue transactions across concurrent HTTP requests."""
+    def wrapped(*args, **kwargs):
+        with LIVE_QUEUE_LOCK:
+            return fn(*args, **kwargs)
+    return wrapped
+
+
 def live_queue_path(p: Path) -> Path:
     return p / ".gameforge" / "live_queue.json"
 
@@ -1782,14 +1894,17 @@ def load_live_queue(p: Path) -> dict[str, Any]:
     if not isinstance(items, list):
         items = []
     data["version"] = 1
-    data["items"] = [x for x in items if isinstance(x, dict)][-200:]
+    data["items"] = [x for x in items if isinstance(x, dict)]
     return data
 
 
 def save_live_queue(p: Path, data: dict[str, Any]) -> dict[str, Any]:
     data["version"] = 1
     data["updated_at"] = now_iso()
-    data["items"] = [x for x in data.get("items", []) if isinstance(x, dict)][-200:]
+    items = [x for x in data.get("items", []) if isinstance(x, dict)]
+    pending = [x for x in items if x.get("status") in {"queued", "in_progress"}]
+    recent = [x for x in items if x.get("status") not in {"queued", "in_progress"}][-200:]
+    data["items"] = sorted(pending + recent, key=lambda x: str(x.get("created_at", "")))
     write_json(live_queue_path(p), data)
     return data
 
@@ -1810,6 +1925,7 @@ def live_queue_public(p: Path) -> dict[str, Any]:
     }
 
 
+@live_queue_atomic
 def enqueue_live_instruction(
     p: Path,
     text_value: str,
@@ -1826,7 +1942,7 @@ def enqueue_live_instruction(
     mode = "interrupt" if mode == "interrupt" else "queue"
     data = load_live_queue(p)
     item = {
-        "id": f"live-{int(time.time() * 1000)}-{len(data.get('items', []))}",
+        "id": f"live-{uuid4().hex}",
         "created_at": now_iso(),
         "text": text_value,
         "mode": mode,
@@ -1836,11 +1952,14 @@ def enqueue_live_instruction(
         "attempts": 0,
         "metadata": metadata or {},
     }
+    if sum(1 for x in data.get("items", []) if x.get("status") in {"queued", "in_progress"}) >= 1000:
+        raise ValueError("Live queue is full (1000 pending instructions)")
     data.setdefault("items", []).append(item)
     save_live_queue(p, data)
     return item
 
 
+@live_queue_atomic
 def requeue_live_instructions(p: Path, *, reason: str) -> None:
     data = load_live_queue(p)
     changed = False
@@ -1855,6 +1974,7 @@ def requeue_live_instructions(p: Path, *, reason: str) -> None:
         save_live_queue(p, data)
 
 
+@live_queue_atomic
 def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[dict[str, Any]]:
     data = load_live_queue(p)
     changed = False
@@ -1883,6 +2003,7 @@ def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[di
     return [dict(x) for x in claimed]
 
 
+@live_queue_atomic
 def settle_live_instructions(p: Path, iteration: int, *, delivered: bool, reason: str = "") -> None:
     data = load_live_queue(p)
     changed = False
@@ -2400,13 +2521,15 @@ def agent_loop(project_id: str) -> None:
             try:
                 trace_path.write_text("", encoding="utf-8")
                 set_agent_activity(state, "AI is working on the project", "Codex is reading, editing, diagnosing, building, or testing. Live command activity will appear here.", "agent")
-                proc = run_codex_agent_stream(
+                proc = run_codex_fusion_stream(
                     codex_args,
                     cwd=p,
                     input_text=prompt,
                     timeout=max(timeout, 3600),
                     trace_path=trace_path,
                     state=state,
+                    permission_mode=permission_mode,
+                    transport_mode=str(cfg.get("agent", {}).get("transport", "auto")),
                 )
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 if state.stop_event.is_set():
@@ -2418,6 +2541,12 @@ def agent_loop(project_id: str) -> None:
                     state.message = "Stopped by user; active Codex work was interrupted and project state was preserved."
                     set_agent_activity(state, "Stopped", state.message, "stopped")
                     return
+                if state.interrupt_event.is_set():
+                    state.interrupt_event.clear()
+                    settle_live_instructions(p, iteration, delivered=False, reason="priority instruction interrupted this turn")
+                    reconcile_feedback_work_orders(p, review_before_iteration, verification_complete=False)
+                    set_agent_activity(state, "Switching to priority instruction", "Previous turn was interrupted; starting the queued urgent work.", "interrupt")
+                    continue
                 pending_input = detect_agent_input_request(p)
                 if pending_input:
                     settle_live_instructions(
@@ -2647,6 +2776,9 @@ def agent_loop(project_id: str) -> None:
         state.status = "error"
         state.message = f"{exc}\n{traceback.format_exc()[-4000:]}"
     finally:
+        if state.transport is not None:
+            state.transport.close()
+            state.transport = None
         if state.stop_event.is_set() and state.status not in {"complete", "error"}:
             state.status = "stopped"
             state.message = "Stopped by user; project state preserved."
@@ -2680,6 +2812,12 @@ def interrupt_agent_and_restart(project_id: str, reason: str = "live user instru
     if not state or not state.thread or not state.thread.is_alive():
         return {"restarting": False, "agent": start_agent(project_id)}
 
+    if state.transport is not None and state.transport.active:
+        state.interrupt_event.set()
+        state.message = "Interrupting the active Codex turn; priority instruction runs next."
+        set_agent_activity(state, "Interrupting current agent turn", state.message, "interrupt")
+        return {"restarting": True, "mode": "app-server", "agent": agent_public(state)}
+
     stop_agent_now(state)
 
     def restart() -> None:
@@ -2708,6 +2846,8 @@ def interrupt_agent_and_restart(project_id: str, reason: str = "live user instru
 def agent_public(s: AgentState) -> dict[str, Any]:
     return {
         "project_id": s.project_id,
+        "transport": "app-server" if s.transport is not None else "exec",
+        "steering_available": bool(s.transport and s.transport.active),
         "status": s.status,
         "iteration": s.iteration,
         "message": s.message,
@@ -4088,7 +4228,7 @@ class Handler(SimpleHTTPRequestHandler):
                 body = self.body_json()
                 result = promote_experimental_copy(pid, bool(body.get("confirm")))
                 return self.send_json(result, 200 if result.get("ok") else int(result.get("status", 409)))
-            if action in {"live/queue", "live/interrupt"}:
+            if action in {"live/queue", "live/interrupt", "live/steer"}:
                 body = self.body_json()
                 text_value = str(body.get("text", "") or "").strip()
                 mode = "interrupt" if action == "live/interrupt" else "queue"
@@ -4100,6 +4240,14 @@ class Handler(SimpleHTTPRequestHandler):
                     save_user_review(p, review)
                 st = AGENTS.get(pid)
                 restart = None
+                steered = False
+                if action == "live/steer" and st and st.transport and st.transport.active:
+                    try:
+                        steered = st.transport.steer(text_value)
+                        if steered:
+                            mark_live_instruction_steered(p, item["id"])
+                    except AppServerProtocolError:
+                        steered = False  # durable queue fallback
                 if mode == "interrupt":
                     restart = interrupt_agent_and_restart(pid, reason=f"interrupted for {item['id']}")
                 elif (not st or not st.thread or not st.thread.is_alive()) and not load_user_input_request(p):
@@ -4109,19 +4257,21 @@ class Handler(SimpleHTTPRequestHandler):
                     "item": item,
                     "queue": live_queue_public(p),
                     "restart": restart,
+                    "steered": steered,
                 })
             if action == "live/cancel":
                 body = self.body_json()
                 item_id = str(body.get("id", "") or "")
-                data = load_live_queue(p)
-                changed = False
-                for item in data.get("items", []):
-                    if item.get("id") == item_id and item.get("status") == "queued":
-                        item["status"] = "cancelled"
-                        item["cancelled_at"] = now_iso()
-                        changed = True
-                if changed:
-                    save_live_queue(p, data)
+                with LIVE_QUEUE_LOCK:
+                    data = load_live_queue(p)
+                    changed = False
+                    for item in data.get("items", []):
+                        if item.get("id") == item_id and item.get("status") == "queued":
+                            item["status"] = "cancelled"
+                            item["cancelled_at"] = now_iso()
+                            changed = True
+                    if changed:
+                        save_live_queue(p, data)
                 return self.send_json({"ok": changed, "queue": live_queue_public(p)}, 200 if changed else 404)
             if action == "agent/start":
                 return self.send_json(start_agent(pid))
@@ -4201,6 +4351,21 @@ class Handler(SimpleHTTPRequestHandler):
                     supplied = str(response)
                 write_json(p / ".gameforge" / "user_input_response.json",
                            {"request_id": req.get("id"), "kind": kind, "value": response, "received_at": now_iso()})
+                st = AGENTS.get(pid)
+                if req.get("protocol") == "codex-app-server":
+                    if not st or not st.transport or not st.transport.active:
+                        return self.send_json({"error": "The Codex question is no longer active"}, 409)
+                    answers = {}
+                    for q in req.get("questions", []):
+                        if isinstance(q, dict) and q.get("id"):
+                            answers[str(q["id"])] = {"answers": [str(response)]}
+                    st.transport.reply(req["rpc_request_id"], {"answers": answers})
+                    req["status"] = "fulfilled"
+                    req["fulfilled_at"] = now_iso()
+                    write_json(user_input_request_path(p), req)
+                    st.input_request = None
+                    st.status = "running"
+                    return self.send_json({"ok": True, "resume_after_submit": False})
                 enqueue_live_instruction(
                     p,
                     (
