@@ -90,11 +90,12 @@
               <textarea id="liveInstruction" rows="4" placeholder="Add a requirement, change direction, answer a follow-up, or tell the agent what to do next…"></textarea>
               <div class="actions">
                 <button id="queueLiveInstruction" class="primary">Queue next</button>
+                <button id="steerLiveInstruction" disabled>Steer active turn</button>
                 <button id="interruptLiveInstruction" class="danger">End current task &amp; run now</button>
               </div>
               <p id="liveQueueStatus" class="muted">Nothing queued.</p>
               <div id="liveQueueList"></div>
-              <p class="tiny">Ctrl+Enter queues. Ctrl+Shift+Enter interrupts the active Codex/build/test task, preserves current files, and immediately starts a fresh turn with your instruction.</p>
+              <p class="tiny">Ctrl+Enter queues. Ctrl+Shift+Enter interrupts and prioritizes your instruction. Steer active turn injects directly into a live Codex app-server turn; if unavailable, the instruction remains safely queued.</p>
             </article>
 
             <article class="card">
