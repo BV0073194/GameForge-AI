@@ -33,12 +33,22 @@ for line in sys.stdin:
     elif method == "thread/start" or method == "thread/resume":
         send({"id":rid,"result":{"thread":{"id":"test-thread"}}})
     elif method == "turn/start":
-        turn = "turn-" + str(rid)
+        wants_question = "NEED_INPUT" in obj["params"]["input"][0]["text"]
+        turn = "question-turn" if wants_question else "turn-" + str(rid)
         pending[turn] = True
         send({"id":rid,"result":{"turn":{"id":turn,"status":"inProgress"}}})
-        timer = threading.Timer(0.8, emit, args=(turn, "completed"))
-        timer.daemon = True
-        timer.start()
+        if wants_question:
+            send({"method":"item/tool/requestUserInput","id":"question-1",
+                  "params":{"threadId":"test-thread","turnId":turn,
+                  "questions":[{"id":"target","header":"Target","question":"Which game?",
+                                "options":[{"label":"Game A"},{"label":"Game B"}]}]}})
+        else:
+            timer = threading.Timer(0.8, emit, args=(turn, "completed"))
+            timer.daemon = True
+            timer.start()
+    elif method is None and rid == "question-1":
+        send({"method":"fusion/questionAnswered","params":{"answers":obj.get("result",{}).get("answers",{})}})
+        emit("question-turn", "completed")
     elif method == "turn/steer":
         send({"id":rid,"result":{"turnId":obj["params"]["expectedTurnId"]}})
     elif method == "turn/interrupt":
@@ -106,6 +116,26 @@ class AppServerTest(unittest.TestCase):
         self.assertFalse(task.is_alive())
         self.assertEqual(results[0].returncode, 130)
         self.assertFalse(self.client.active)
+
+    def test_agent_question_round_trip(self):
+        received = []
+        self.client.on_question = lambda msg: received.append(msg) or True
+        results = []
+        task = threading.Thread(target=lambda: results.append(
+            self.client.run_turn("NEED_INPUT", timeout=5,
+                trace_path=self.path / "question.jsonl",
+                stop_event=threading.Event(), interrupt_event=threading.Event())))
+        task.start()
+        for _ in range(100):
+            if received and self.client.active:
+                break
+            time.sleep(.02)
+        self.assertTrue(received, "The app-server question was not forwarded")
+        self.assertEqual(received[0]["method"], "item/tool/requestUserInput")
+        self.client.reply("question-1", {"answers":{"target":{"answers":["Game B"]}}})
+        task.join(7)
+        self.assertFalse(task.is_alive())
+        self.assertEqual(results[0].returncode, 0)
 
     def test_persistent_turn_reuse(self):
         stop = threading.Event()
