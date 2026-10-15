@@ -1,2 +1,47 @@
 :root{color-scheme:dark;--bg:#0c0f14;--panel:#151a22;--card:#1b2230;--text:#edf2f7;--muted:#9aa7b7;--border:#2b3545;--accent:#5bb7ff;--danger:#ff6b6b;--good:#68d391;--warn:#f6c85f}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}header,main,footer{max-width:1500px;margin:auto}header{padding:22px 24px 10px;display:flex;justify-content:space-between;gap:16px;align-items:flex-start}h1,h2,h3{margin:.2em 0}.muted,.tiny{color:var(--muted)}.tiny{font-size:12px}main{padding:12px 24px 30px}.panel,.card{background:var(--panel);border:1px solid var(--border);border-radius:14px}.panel{padding:18px}.card{background:var(--card);padding:16px}.create-panel{margin-bottom:14px}.layout{display:grid;grid-template-columns:280px minmax(0,1fr);gap:14px}.projects-panel{align-self:start}.project-list{display:grid;gap:8px}.project-item{width:100%;text-align:left;padding:12px;border:1px solid var(--border);background:var(--card);color:var(--text);border-radius:10px}.project-item.active{border-color:var(--accent)}.project-item small{display:block;color:var(--muted);margin-top:4px}.row{display:flex;gap:10px;align-items:center}.between{justify-content:space-between}.wrap{flex-wrap:wrap}.grid{display:grid;gap:12px}.grid.two{grid-template-columns:repeat(2,minmax(0,1fr))}.cards{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;margin:12px 0}label{display:grid;gap:6px;margin:10px 0;color:var(--muted)}input,textarea,select,button{font:inherit}input,textarea,select{width:100%;background:#0f141c;color:var(--text);border:1px solid var(--border);border-radius:9px;padding:10px}textarea{resize:vertical}.check{display:flex;align-items:center;gap:8px}.check input{width:auto}button{background:#263244;color:var(--text);border:1px solid var(--border);border-radius:9px;padding:9px 12px;cursor:pointer}button:hover{border-color:#64748b}.primary{background:#163e5b;border-color:#2b7eb8}.danger{background:#552326;border-color:#8b3e44}.actions{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}.badges{display:flex;gap:8px;flex-wrap:wrap}.badge{background:#202b39;border:1px solid var(--border);padding:5px 8px;border-radius:999px;font-size:12px}.tabs{display:flex;gap:6px;border-bottom:1px solid var(--border);margin:12px 0}.tabs button{border-radius:8px 8px 0 0;border-bottom:0}.tabs button.active{background:#223144;border-color:var(--accent)}.tab{display:none}.tab.active{display:block}.console,pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0d1219;border:1px solid var(--border);border-radius:8px;padding:10px;max-height:360px;overflow:auto}.compact{max-height:180px;font-size:12px}.capture{width:100%;max-height:360px;object-fit:contain;background:#000;border:1px solid var(--border);border-radius:8px}.criterion{padding:8px 0;border-bottom:1px solid var(--border)}.criterion:last-child{border-bottom:0}.criterion.pass{color:var(--good)}.criterion.pending{color:var(--warn)}.logbox{margin:8px 0}footer{padding:0 24px 30px;color:var(--muted);font-size:12px}@media(max-width:900px){.layout,.cards,.grid.two{grid-template-columns:1fr}header{flex-direction:column}.projects-panel{position:static}}
+
+
+/* Fusion workspace refinement: retains GameForge's existing DOM and controls. */
+:root{--bg:#090d15;--panel:#111927;--card:#172234;--text:#eff5ff;--muted:#a0b0c5;--border:#29384d;--accent:#73bdff;--focus:#a8d8ff;--shadow:0 14px 36px rgba(0,0,0,.19)}
+html{scroll-behavior:smooth}body{background:radial-gradient(ellipse 100% 460px at 50% -160px,#1a3454 0%,transparent 75%),var(--bg);line-height:1.55}
+header{padding-top:26px;padding-bottom:18px;border-bottom:1px solid rgba(132,169,213,.12)}
+header h1{font-size:clamp(1.7rem,2.6vw,2.3rem);letter-spacing:-.045em;font-weight:750}
+header p{color:var(--muted);margin:.35rem 0}
+main{padding-top:22px}.panel,.card{box-shadow:var(--shadow)}
+.panel{background:linear-gradient(145deg,rgba(23,34,51,.98),rgba(15,23,36,.98));border-color:rgba(139,169,210,.18)}
+.card{background:linear-gradient(160deg,rgba(30,43,63,.95),rgba(21,31,47,.95));border-color:rgba(144,178,221,.16);transition:border-color .18s ease,box-shadow .18s ease}
+.card:hover{border-color:rgba(137,183,242,.32)}
+.layout{grid-template-columns:minmax(230px,265px) minmax(0,1fr);gap:18px}
+.projects-panel{position:sticky;top:16px;max-height:calc(100vh - 32px);overflow:auto}
+.project-item{transition:background .15s ease,border-color .15s ease,transform .15s ease}
+.project-item:hover{background:#22334a;transform:translateY(-1px)}
+.project-item.active{border-color:var(--accent);background:#203651;box-shadow:inset 3px 0 0 var(--accent)}
+button{transition:background .15s ease,border-color .15s ease,transform .15s ease}
+button:hover:not(:disabled){background:#34465e;transform:translateY(-1px)}
+button:active:not(:disabled){transform:translateY(0)}
+button:disabled{opacity:.5;cursor:not-allowed}
+button.primary,.primary{background:#205581;border-color:#3e94d3}
+button.primary:hover:not(:disabled){background:#2a6a9d}
+button.danger,.danger{background:#622b38;border-color:#b65767}
+button.danger:hover:not(:disabled){background:#793444}
+input,textarea,select{background:#0e1725;border-color:#34445a;transition:border-color .15s ease,box-shadow .15s ease}
+:where(button,input,textarea,select,.project-item):focus-visible{outline:2px solid var(--focus);outline-offset:2px;box-shadow:0 0 0 4px rgba(115,189,255,.12)}
+textarea:focus,input:focus,select:focus{border-color:var(--accent)}
+.tabs{gap:5px;overflow-x:auto;scrollbar-width:thin;padding-bottom:1px}
+.tabs button{white-space:nowrap;padding:10px 15px}
+.tabs button.active{background:#243d59;border-color:var(--accent);color:#fff}
+.badge{background:#23344a;border-color:#38516b;font-weight:600;letter-spacing:.01em}
+#liveSteeringCard{border-color:rgba(115,189,255,.42);background:linear-gradient(145deg,#1a2b42,#132338)}
+#liveSteeringCard h3{letter-spacing:-.02em}
+#liveInstruction{min-height:112px;line-height:1.6}
+#liveQueueStatus{padding:9px 12px;background:rgba(115,189,255,.07);border:1px solid rgba(115,189,255,.16);border-radius:9px}
+#inputRequest:not([hidden]){padding:14px;border:1px solid rgba(246,200,95,.45);border-radius:10px;background:rgba(246,200,95,.06)}
+.console,pre{background:#0a1320;border-color:#304159;scrollbar-width:thin}
+#liveTaskDetail{font-family:ui-monospace,SFMono-Regular,Consolas,monospace}
+#liveQueueList .criterion{padding:12px 4px}
+.workspace-panel{min-width:0}
+@media(max-width:1100px){.layout{grid-template-columns:220px minmax(0,1fr)}.cards{grid-template-columns:1fr}}
+@media(max-width:900px){.layout,.cards,.grid.two{grid-template-columns:1fr}.projects-panel{position:static;max-height:none}header{flex-direction:column}}
+@media(max-width:600px){header{padding:20px 16px 14px}main{padding:14px 12px 28px}.panel{padding:13px}.card{padding:14px}.actions button{flex:1 1 auto}.tabs button{padding:10px 12px}}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
