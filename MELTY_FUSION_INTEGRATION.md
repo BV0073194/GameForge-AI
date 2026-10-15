@@ -53,6 +53,19 @@ Bound message size and queue growth; redact auth tokens from logs; validate proj
 9. Native Windows frozen executable integration test, not just source smoke.
 10. UI accessibility: keyboard, narrow viewport, reduced motion, status announcements.
 
-## Integration status
+## Implemented on the Fusion branch
 
-The dashboard visual polish is committed separately. This document is an implementation contract, **not a claim that the persistent protocol transport is already implemented or tested**. Do not merge to main until the transport and native integration tests pass.
+- Added `server/codex_app_server.py` for persistent JSON-RPC Codex sessions: handshake, thread resume, streamed turns, in-flight steering, interruption and child-process cleanup.
+- Wired GameForge to prefer app-server, with the original `codex exec` preserved as a fallback when the initial handshake fails. Active turn failures are never silently replayed.
+- Wired `live/queue`, `live/steer`, `live/interrupt`, agent-question responses, command/file approval requests and priority work scheduling into the existing GameForge dashboard.
+- Preserved GameForge's original build/test/runtime/evidence/acceptance loop and reversible Git checkpoints.
+- Added transaction locking and unique IDs to the durable queue. Cached successful Codex inference preflight for 30 minutes to reduce redundant work.
+- Added a project-level execution engine selector and upgraded responsive visuals and accessibility.
+- Added offline simulated app-server tests and cross-platform CI coverage (Windows + Ubuntu) including JavaScript parsing checks.
+
+## Outstanding live verification
+
+- Tests use a simulated app-server. A real signed-in Codex session has not yet been exercised against this branch, nor has a native packaged executable been tested.
+- Command/file approvals and Codex tool questions are bridged; advanced permission requests and MCP elicitation remain unsupported and default to rejection.
+- A failed app-server handshake falls back to CLI. An error after turn start is reported rather than blindly replaying edits.
+- Do not merge this development branch to `main` before real Codex and native Windows validation.
