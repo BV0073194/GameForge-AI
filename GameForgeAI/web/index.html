@@ -52,13 +52,13 @@
           <div class="cards">
             <article class="card">
               <h3>Autonomous developer</h3>
-              <p id="agentMessage" class="muted">Idle</p>
+              <p id="agentMessage" class="muted" role="status" aria-live="polite">Idle</p>
               <div id="inputRequest" class="criterion" hidden>
                 <h3 id="inputRequestTitle">Agent question</h3>
                 <p id="inputRequestMessage"></p>
                 <p id="inputRequestWhy" class="tiny"></p>
                 <div id="inputRequestControl"></div>
-                <p id="inputRequestStatus" class="muted"></p>
+                <p id="inputRequestStatus" class="muted" role="status" aria-live="polite"></p>
               </div>
               <div class="actions">
                 <button id="startAgent" class="primary">Start / continue</button>
@@ -93,7 +93,7 @@
                 <button id="steerLiveInstruction" disabled>Steer active turn</button>
                 <button id="interruptLiveInstruction" class="danger">End current task &amp; run now</button>
               </div>
-              <p id="liveQueueStatus" class="muted">Nothing queued.</p>
+              <p id="liveQueueStatus" class="muted" role="status" aria-live="polite">Nothing queued.</p>
               <div id="liveQueueList"></div>
               <p class="tiny">Ctrl+Enter queues. Ctrl+Shift+Enter interrupts and prioritizes your instruction. Steer active turn injects directly into a live Codex app-server turn; if unavailable, the instruction remains safely queued.</p>
             </article>
@@ -212,6 +212,18 @@
 
         <div id="tab-settings" class="tab">
           <h3>Project controls</h3>
+          <div class="card" style="margin:12px 0">
+            <h3>AI execution engine</h3>
+            <p class="muted">Choose how GameForge communicates with Codex. Persistent app-server sessions support active-turn steering and context reuse. The automatic setting falls back to the classic CLI when app-server is unavailable.</p>
+            <label>Agent transport
+              <select id="agentTransport">
+                <option value="auto">Automatic — persistent Codex, compatible fallback</option>
+                <option value="app-server">Persistent Codex app-server (fallback on handshake failure)</option>
+                <option value="exec">Classic Codex CLI execution</option>
+              </select>
+            </label>
+            <p class="tiny">Change takes effect the next time you start the autonomous agent.</p>
+          </div>
           <div class="grid two">
             <label>Research depth<select id="researchMode"><option value="off">Off</option><option value="normal">Normal</option><option value="deep">Deep</option><option value="exhaustive">Exhaustive / professional</option></select></label>
             <label class="check"><input id="internetResearch" type="checkbox"> Request internet research whenever useful</label>
