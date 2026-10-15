@@ -80,6 +80,27 @@ with tempfile.TemporaryDirectory() as td:
     app.settle_live_instructions(p, 2, delivered=True)
     assert app.live_queue_public(p)["queued_count"] == 0
 
+    # Race regression: concurrent API-style queue submissions must not overwrite
+    # each other or generate identical IDs.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        parallel = list(pool.map(
+            lambda i: app.enqueue_live_instruction(p, f"Parallel request {i}"),
+            range(48)
+        ))
+    assert len({item["id"] for item in parallel}) == 48
+    queued_parallel = app.live_queue_public(p)["queued"]
+    assert {item["id"] for item in parallel}.issubset({x["id"] for x in queued_parallel})
+    batch = app.claim_live_instructions(p, 20, limit=64)
+    assert len(batch) == 48
+    app.settle_live_instructions(p, 20, delivered=True)
+    assert app.live_queue_public(p)["queued_count"] == 0
+
+    steered = app.enqueue_live_instruction(p, "Steer in flight")
+    assert app.mark_live_instruction_steered(p, steered["id"])
+    assert not app.mark_live_instruction_steered(p, steered["id"])
+    assert app.live_queue_public(p)["queued_count"] == 0
+
     retry_item = app.enqueue_live_instruction(p, "Do not lose me if interrupted.", mode="queue")
     retry_claim = app.claim_live_instructions(p, 3)
     assert any(x["id"] == retry_item["id"] for x in retry_claim)
