@@ -115,6 +115,22 @@ with tempfile.TemporaryDirectory() as td:
     assert any(x["id"] == prompt_item["id"] and x["status"] == "delivered"
                for x in app.load_live_queue(p)["items"])
 
+    # Native app-server approval requests must require a real user decision.
+    # Unrecognized requests remain denied at the JSON-RPC transport layer.
+    approval_state = app.AgentState(project_id=cfg["id"])
+    forwarded = app._fusion_agent_question(
+        p, approval_state, {
+            "id": "approve-1", "method": "item/commandExecution/requestApproval",
+            "params": {"reason": "Command needs approval", "command": "python -m pytest"},
+        }
+    )
+    approval = app.load_user_input_request(p)
+    assert forwarded and approval is not None
+    assert approval["choices"] == ["Approve once", "Decline"]
+    assert approval["rpc_method"] == "item/commandExecution/requestApproval"
+    approval["status"] = "fulfilled"
+    app.write_json(app.user_input_request_path(p), approval)
+
     before_review = app.append_user_feedback(p, "Strict quality smoke feedback.", "general")
     candidate = app.load_user_review(p)
     candidate["feedback"][-1]["ready_for_verification"] = True
