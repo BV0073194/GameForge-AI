@@ -309,12 +309,36 @@ class CodexAppServer:
         self.turn_active = False
         self.turn_id = None
         if proc and proc.poll() is None:
+            # App-server is a process-group leader; terminate descendants too.
+            # In particular, Windows npm .cmd wrappers can outlive their shell.
+            if os.name == "nt":
+                try:
+                    subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=8, check=False)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            else:
+                import signal
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except (OSError, ProcessLookupError):
+                    pass
             try:
-                proc.terminate()
-                proc.wait(timeout=1)
-            except Exception:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                if os.name != "nt":
+                    import signal
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
                 try:
                     proc.kill()
-                except Exception:
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
                     pass
         self._closed.set()
