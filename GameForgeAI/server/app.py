@@ -1750,23 +1750,36 @@ def run_codex_agent_stream(
 
 
 def _fusion_agent_question(p: Path, state: AgentState, message: dict[str, Any]) -> bool:
-    """Surface Codex's actual pending JSON-RPC question, not a guessed answer."""
-    if message.get("method") != "item/tool/requestUserInput":
-        return False
+    """Bridge actual Codex questions and permission requests to the GameForge UI."""
+    method = str(message.get("method", ""))
     params = message.get("params") or {}
     questions = params.get("questions") or []
-    if not isinstance(questions, list) or not questions:
+    approvals = {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}
+    if method == "item/tool/requestUserInput":
+        if not isinstance(questions, list) or not questions:
+            return False
+        first = questions[0] if isinstance(questions[0], dict) else {}
+        options = first.get("options") or []
+        choices = [str(x.get("label")) for x in options if isinstance(x, dict) and x.get("label")]
+        title = str(first.get("header") or "Codex needs your input")[:180]
+        detail = str(first.get("question") or "How should Codex proceed?")[:3000]
+    elif method in approvals:
+        choices = ["Approve once", "Decline"]
+        title = "Approve Codex command?" if "commandExecution" in method else "Approve Codex file changes?"
+        reason = str(params.get("reason") or "The coding agent requested permission.")
+        cmd = str(params.get("command") or "")
+        detail = str(_auth_redact(reason + ("\nCommand: " + cmd if cmd else "")))[:3000]
+        questions = []
+    else:
         return False
-    first = questions[0] if isinstance(questions[0], dict) else {}
-    options = first.get("options") or []
-    choices = [str(x.get("label")) for x in options if isinstance(x, dict) and x.get("label")]
     request = {
         "id": "codex-" + str(message.get("id")),
         "protocol": "codex-app-server",
         "rpc_request_id": message.get("id"),
+        "rpc_method": method,
         "kind": "choice" if choices else "text",
-        "title": str(first.get("header") or "Codex needs your input")[:180],
-        "message": str(first.get("question") or "How should Codex proceed?")[:3000],
+        "title": title,
+        "message": detail,
         "choices": choices,
         "questions": questions,
         "status": "pending",
@@ -1778,7 +1791,6 @@ def _fusion_agent_question(p: Path, state: AgentState, message: dict[str, Any]) 
     state.status = "waiting_for_user"
     set_agent_activity(state, "Waiting for your answer", request["message"], "question")
     return True
-
 
 def run_codex_fusion_stream(
     args: list[str], *, cwd: Path, input_text: str, timeout: int,
@@ -4371,6 +4383,20 @@ class Handler(SimpleHTTPRequestHandler):
                 if req.get("protocol") == "codex-app-server":
                     if not st or not st.transport or not st.transport.active:
                         return self.send_json({"error": "The Codex question is no longer active"}, 409)
+                    if req.get("rpc_method") in {
+                        "item/commandExecution/requestApproval", "item/fileChange/requestApproval"
+                    }:
+                        if response not in {"Approve once", "Decline"}:
+                            return self.send_json({"error": "Choose Approve once or Decline"}, 400)
+                        st.transport.reply(req["rpc_request_id"], {
+                            "decision": "accept" if response == "Approve once" else "decline"
+                        })
+                        req["status"] = "fulfilled"
+                        req["fulfilled_at"] = now_iso()
+                        write_json(user_input_request_path(p), req)
+                        st.input_request = None
+                        st.status = "running"
+                        return self.send_json({"ok": True, "resume_after_submit": False})
                     answers = {}
                     values = response if isinstance(response, dict) else {}
                     for q in req.get("questions", []):
