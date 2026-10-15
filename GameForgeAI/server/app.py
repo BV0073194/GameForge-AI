@@ -1830,7 +1830,13 @@ def run_codex_fusion_stream(
         state.transport = None
         return subprocess.CompletedProcess(args, 1, "", f"Codex app-server protocol failed: {exc}")
     finally:
-        if state.active_process is transport.process and transport.process is None:
+        req = load_user_input_request(cwd)
+        if req and req.get("protocol") == "codex-app-server":
+            req["status"] = "expired"
+            req["expired_at"] = now_iso()
+            write_json(user_input_request_path(cwd), req)
+            state.input_request = None
+        if transport.process is None or transport.process.poll() is not None:
             _bind_active_process(state, None, "")
 
 
@@ -2451,6 +2457,7 @@ def agent_loop(project_id: str) -> None:
     max_auto_recovery = int(cfg.get("agent", {}).get("max_auto_recovery_attempts", 8) or 8)
     recovery_failures = 0
     recovery_context: dict[str, Any] | None = None
+    auth_verified_at = 0.0
     build_result = test_result = None
     state.status = "running"
     state.started_at = now_iso()
@@ -2477,13 +2484,15 @@ def agent_loop(project_id: str) -> None:
             # report logged in yet send Responses requests with no Authorization
             # header. Verify the real request path before consuming an iteration.
             # Run this before incrementing so a failed auth check remains iteration 0.
-            set_agent_activity(state, "Checking AI runtime", "Verifying Codex authentication and inference before starting this iteration.", "check")
-            auth_check = codex_auth_preflight(p)
-            if not auth_check.get("ok"):
-                state.status = "blocked"
-                state.message = auth_check.get("message", "Codex authentication preflight failed")
-                RUNTIME_STATE["codex_login_message"] = state.message
-                return
+            if time.monotonic() - auth_verified_at >= 1800:
+                set_agent_activity(state, "Checking AI runtime", "Verifying Codex authentication and inference before starting this iteration.", "check")
+                auth_check = codex_auth_preflight(p)
+                if not auth_check.get("ok"):
+                    state.status = "blocked"
+                    state.message = auth_check.get("message", "Codex authentication preflight failed")
+                    RUNTIME_STATE["codex_login_message"] = state.message
+                    return
+                auth_verified_at = time.monotonic()
 
             state.iteration += 1
             if max_iter and state.iteration > max_iter:
@@ -4338,7 +4347,7 @@ class Handler(SimpleHTTPRequestHandler):
                 response = body.get("value")
                 if kind == "url" and response and not re.match(r"^https?://", str(response), re.I):
                     return self.send_json({"error": "A valid http(s) URL is required"}, 400)
-                if kind == "choice" and response not in req.get("choices", []):
+                if kind == "choice" and req.get("protocol") != "codex-app-server" and response not in req.get("choices", []):
                     return self.send_json({"error": "Invalid choice"}, 400)
                 if kind == "file":
                     filename = str(response or "").strip()
@@ -4349,16 +4358,23 @@ class Handler(SimpleHTTPRequestHandler):
                     supplied = f"UPLOAD/{category}/{filename}"
                 else:
                     supplied = str(response)
-                write_json(p / ".gameforge" / "user_input_response.json",
-                           {"request_id": req.get("id"), "kind": kind, "value": response, "received_at": now_iso()})
                 st = AGENTS.get(pid)
                 if req.get("protocol") == "codex-app-server":
                     if not st or not st.transport or not st.transport.active:
                         return self.send_json({"error": "The Codex question is no longer active"}, 409)
                     answers = {}
+                    values = response if isinstance(response, dict) else {}
                     for q in req.get("questions", []):
-                        if isinstance(q, dict) and q.get("id"):
-                            answers[str(q["id"])] = {"answers": [str(response)]}
+                        if not isinstance(q, dict) or not q.get("id"):
+                            continue
+                        question_id = str(q["id"])
+                        value = str(values.get(question_id, "") if isinstance(response, dict) else response or "").strip()
+                        if not value:
+                            return self.send_json({"error": "Every question requires an answer"}, 400)
+                        choices = [str(o.get("label")) for o in (q.get("options") or []) if isinstance(o, dict)]
+                        if choices and value not in choices and not q.get("isOther", q.get("is_other", False)):
+                            return self.send_json({"error": "Invalid choice for " + question_id}, 400)
+                        answers[question_id] = {"answers": [value if value in choices else "user_note: " + value]}
                     st.transport.reply(req["rpc_request_id"], {"answers": answers})
                     req["status"] = "fulfilled"
                     req["fulfilled_at"] = now_iso()
@@ -4366,6 +4382,8 @@ class Handler(SimpleHTTPRequestHandler):
                     st.input_request = None
                     st.status = "running"
                     return self.send_json({"ok": True, "resume_after_submit": False})
+                write_json(p / ".gameforge" / "user_input_response.json",
+                           {"request_id": req.get("id"), "kind": kind, "value": response, "received_at": now_iso()})
                 enqueue_live_instruction(
                     p,
                     (
