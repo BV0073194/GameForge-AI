@@ -4227,7 +4227,16 @@ class Handler(SimpleHTTPRequestHandler):
                 body = self.body_json()
                 allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","fusion","agent","visual","log_globs"}
                 for k,v in body.items():
-                    if k in allowed: cfg[k] = v
+                    if k not in allowed:
+                        continue
+                    if k == "agent" and isinstance(v, dict):
+                        existing = cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
+                        allowed_agent = {"transport", "permission_mode", "max_iterations", "cooldown_sec", "max_auto_recovery_attempts"}
+                        cfg["agent"] = {**existing, **{key: value for key, value in v.items() if key in allowed_agent}}
+                        if cfg["agent"].get("transport") not in {"auto", "app-server", "exec"}:
+                            return self.send_json({"error": "Unsupported agent transport"}, 400)
+                    else:
+                        cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
                 return self.send_json(cfg)
             if action == "experiment/create":
