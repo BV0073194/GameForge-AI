@@ -1792,6 +1792,20 @@ def _fusion_agent_question(p: Path, state: AgentState, message: dict[str, Any]) 
     set_agent_activity(state, "Waiting for your answer", request["message"], "question")
     return True
 
+def _fusion_codex_activity(state: AgentState, event: dict[str, Any]) -> None:
+    """Publish meaningful task transitions, not every token delta (disk/CPU hot path)."""
+    method = str(event.get("method") or "")
+    if method.endswith("/delta") or method.endswith("Delta"):
+        state.last_activity_at = now_iso()
+        return
+    params = event.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+    summary = _codex_event_activity(json.dumps({"type": method, **params}))
+    if summary:
+        set_agent_activity(state, *summary)
+
+
 def run_codex_fusion_stream(
     args: list[str], *, cwd: Path, input_text: str, timeout: int,
     trace_path: Path, state: AgentState, permission_mode: str = "full-auto",
@@ -1808,13 +1822,7 @@ def run_codex_fusion_stream(
         state.transport = CodexAppServer(
             command, shell=use_shell, cwd=cwd, env=_codex_process_env(),
             permission_mode=permission_mode,
-            on_event=lambda event: (
-                set_agent_activity(state, *activity) if (
-                    activity := _codex_event_activity(json.dumps({
-                        "type": event.get("method", ""), **(event.get("params") or {})
-                    }))
-                ) else None
-            ),
+            on_event=lambda event: _fusion_codex_activity(state, event),
             on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
         )
     transport = state.transport
