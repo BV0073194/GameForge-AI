@@ -1895,7 +1895,7 @@ def run_codex_fusion_stream(
             if not isinstance(acp_command, list) or not acp_command or not all(isinstance(x, str) and x for x in acp_command):
                 return subprocess.CompletedProcess(args, 1, "", "Configure agent.acp_command as an executable and argument list")
             state.transport = AcpAgentTransport(
-                acp_command, cwd=cwd, env=_codex_process_env(),
+                acp_command, cwd=cwd, env=_gameforge_process_env(),
                 mcp_servers=mcp_servers or [],
                 on_event=lambda event: _fusion_codex_activity(state, event),
                 on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
