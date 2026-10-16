@@ -6,6 +6,7 @@ on:
       - main
       - "experimental/**"
       - "fusion/**"
+      - "fix/**"
   pull_request:
     branches:
       - main
@@ -38,9 +39,10 @@ jobs:
         run: |
           set -euxo pipefail
           cd GameForgeAI
-          python -m py_compile server/app.py server/codex_app_server.py server/acp_transport.py server/fusion_mcp.py server/wsl_cleanup.py
+          python -m py_compile server/app.py server/codex_app_server.py server/acp_transport.py server/fusion_mcp.py server/wsl_cleanup.py server/iteration_state.py
           python -m unittest discover -s tests -p "test_codex_app_server.py" -v
           python -m unittest discover -s tests -p "test_fusion_protocols.py" -v
+          python -m unittest discover -s tests -p "test_live_agent_accountability.py" -v
           python -m unittest discover -s tests -p "test_wsl_cleanup.py" -v
           node --check web/app.js
 
@@ -76,9 +78,10 @@ jobs:
         shell: pwsh
         run: |
           Set-Location GameForgeAI
-          python -m py_compile server/app.py server/codex_app_server.py server/acp_transport.py server/fusion_mcp.py server/wsl_cleanup.py
+          python -m py_compile server/app.py server/codex_app_server.py server/acp_transport.py server/fusion_mcp.py server/wsl_cleanup.py server/iteration_state.py
           python -m unittest discover -s tests -p "test_codex_app_server.py" -v
           python -m unittest discover -s tests -p "test_fusion_protocols.py" -v
+          python -m unittest discover -s tests -p "test_live_agent_accountability.py" -v
           python -m unittest discover -s tests -p "test_wsl_cleanup.py" -v
           node --check web/app.js
 
