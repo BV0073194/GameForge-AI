@@ -76,6 +76,7 @@
                 <span id="liveTaskAge" class="badge">No activity yet</span>
               </div>
               <p id="liveTaskTitle"><strong>Nothing is running right now.</strong></p>
+              <p id="liveTaskFocus" class="muted" role="status" aria-live="polite">No user instruction assigned.</p>
               <pre id="liveTaskDetail" class="compact">Start or resume the autonomous developer to see what GameForge is doing on the computer.</pre>
               <div id="liveTaskHistory"></div>
               <p class="tiny">Updates from actual AI/tool/build/test activity. Long WSL installs, compiler runs, file edits, research, and self-repair steps will stay visible here so a busy task does not look frozen.</p>
@@ -95,7 +96,8 @@
               </div>
               <p id="liveQueueStatus" class="muted" role="status" aria-live="polite">Nothing queued.</p>
               <div id="liveQueueList"></div>
-              <p class="tiny">Instructions remain pending until implementation evidence and the configured full build/test gates pass. Receiving an instruction is not verification.</p>
+              <p id="iterationDetail" class="tiny">Agent iterations count GameForge runs; project progress is recorded separately.</p>
+              <p class="tiny">The timeline distinguishes received → assigned → delivered to agent → implemented → verified. Every completed item links its evidence, changed files, and configured build/test gates; passing gates are not a substitute for human gameplay review.</p>
               <p class="tiny">Ctrl+Enter queues. Ctrl+Shift+Enter interrupts and prioritizes your instruction. Steer active turn injects directly into a live Codex app-server turn; if unavailable, the instruction remains safely queued.</p>
             </article>
 
