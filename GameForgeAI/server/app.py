@@ -1565,6 +1565,7 @@ class AgentState:
     active_process_kind: str = ""
     active_process_started_at: str | None = None
     transport: CodexAppServer | AcpAgentTransport | None = field(default=None, repr=False)
+    configured_transport: str = "auto"
     interrupt_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -3066,7 +3067,8 @@ def start_agent(project_id: str) -> dict[str, Any]:
             return agent_public(existing)
         persisted_iteration = int((read_json(p / ".gameforge" / "last_evidence.json", {}) or {}).get("iteration", 0) or 0)
         resume_iteration = max(persisted_iteration, existing.iteration if existing else 0)
-        state = AgentState(project_id=project_id, iteration=resume_iteration)
+        state = AgentState(project_id=project_id, iteration=resume_iteration,
+                           configured_transport=str(cfg.get("agent", {}).get("transport", "auto")))
         AGENTS[project_id] = state
         t = threading.Thread(target=agent_loop, args=(project_id,), daemon=True, name=f"agent-{project_id}")
         state.thread = t
@@ -3116,7 +3118,7 @@ def interrupt_agent_and_restart(project_id: str, reason: str = "live user instru
 def agent_public(s: AgentState) -> dict[str, Any]:
     return {
         "project_id": s.project_id,
-        "transport": ("acp" if isinstance(s.transport, AcpAgentTransport) else ("app-server" if s.transport is not None else s.active_process_kind or "exec")),
+        "transport": ("acp" if isinstance(s.transport, AcpAgentTransport) else ("app-server" if s.transport is not None else s.active_process_kind or s.configured_transport)),
         "steering_available": bool(s.transport and s.transport.active and not isinstance(s.transport, AcpAgentTransport)),
         "status": s.status,
         "iteration": s.iteration,
