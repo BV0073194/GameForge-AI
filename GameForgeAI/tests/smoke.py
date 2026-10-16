@@ -112,7 +112,33 @@ with tempfile.TemporaryDirectory() as td:
     assert "LIVE USER INSTRUCTIONS" in prompt_live
     assert "Use the live steering message in this turn." in prompt_live
     app.settle_live_instructions(p, 4, delivered=True)
-    assert any(x["id"] == prompt_item["id"] and x["status"] == "delivered"
+    assert any(x["id"] == prompt_item["id"] and x["status"] == "awaiting_verification"
+               for x in app.load_live_queue(p)["items"])
+
+    # Delivery is NOT implementation. A bare successful turn cannot close user
+    # requirements; evidence plus both configured full gates must be present.
+    app.write_json(p / ".gameforge" / "live_instruction_results.json", {
+        "results": [{
+            "id": prompt_item["id"], "ready_for_verification": True,
+            "resolution": "Implemented the requested gameplay change.",
+            "evidence": "Explicit targeted smoke and full configured regression evidence.",
+            "changed_paths": ["workspace/verified_gameplay.py"],
+        }]
+    })
+    implemented_file = p / "workspace" / "verified_gameplay.py"
+    implemented_file.parent.mkdir(parents=True, exist_ok=True)
+    implemented_file.write_text("# Simulated implementation\n", encoding="utf-8")
+    failure = app.reconcile_live_instruction_results(
+        p, 4, {"configured": True, "ok": True}, {"configured": False, "ok": True}
+    )
+    assert not failure["gates_passed"]
+    assert any(x["id"] == prompt_item["id"] and x["status"] == "awaiting_verification"
+               for x in app.load_live_queue(p)["items"])
+    success = app.reconcile_live_instruction_results(
+        p, 4, {"configured": True, "ok": True}, {"configured": True, "ok": True}
+    )
+    assert prompt_item["id"] in success["verified_ids"]
+    assert any(x["id"] == prompt_item["id"] and x["status"] == "verified"
                for x in app.load_live_queue(p)["items"])
 
     # Native app-server approval requests must require a real user decision.
