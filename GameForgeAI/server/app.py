@@ -2065,6 +2065,16 @@ def load_live_queue(p: Path) -> dict[str, Any]:
         items = []
     data["version"] = 3
     data["items"] = [x for x in items if isinstance(x, dict) and isinstance(x.get("id"), str)]
+    # ISO timestamps can share the same second. Preserve true submission order
+    # with a project-local sequence rather than relying on timestamp sorting.
+    highest = 0
+    for position, item in enumerate(data["items"], start=1):
+        value = item.get("sequence")
+        if not isinstance(value, int) or value <= 0:
+            item["sequence"] = max(highest + 1, position)
+        highest = max(highest, item["sequence"])
+    data["next_sequence"] = max(highest, data.get("next_sequence", 0)
+                                if isinstance(data.get("next_sequence"), int) else 0)
     for item in data["items"]:
         if item.get("status") in {"delivered", "awaiting_verification"}:
             # Earlier Fusion versions called a finished turn "delivered".
@@ -2086,8 +2096,8 @@ def save_live_queue(p: Path, data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-def _focus_sort(item: dict[str, Any]) -> tuple[int, str]:
-    return (1 if item.get("priority") == "immediate" else 0, str(item.get("created_at", "")))
+def _focus_sort(item: dict[str, Any]) -> tuple[int, int]:
+    return (1 if item.get("priority") == "immediate" else 0, int(item.get("sequence", 0)))
 
 
 def live_queue_public(p: Path) -> dict[str, Any]:
@@ -2134,8 +2144,11 @@ def enqueue_live_instruction(
     data = load_live_queue(p)
     if sum(1 for x in data.get("items", []) if x.get("status") in LIVE_PENDING_STATUSES) >= 1000:
         raise ValueError("Live queue is full (1000 unfinished instructions)")
+    sequence = int(data.get("next_sequence", 0)) + 1
+    data["next_sequence"] = sequence
     item: dict[str, Any] = {
         "id": f"live-{uuid4().hex}",
+        "sequence": sequence,
         "created_at": now_iso(),
         "text": text_value,
         "mode": mode,
