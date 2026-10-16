@@ -157,6 +157,9 @@ class LiveWorkOrderTests(unittest.TestCase):
         self.assertEqual(progress["verification_claim"]["tests"][0]["log_path"], "logs/shot-test.log")
         self.assertTrue(progress["last_full_gates"]["build"]["passed"])
         self.assertFalse(progress["last_full_gates"]["test"]["passed"])
+        app.link_live_instruction_checkpoint(self.p, 1, "base-rev", "new-git-rev")
+        self.assertEqual(self._status(item)["verification_claim"]["git_checkpoint"], "new-git-rev")
+        self.assertEqual(self._status(item)["verification_claim"]["git_diff_base"], "base-rev")
         good_gates = app.reconcile_live_instruction_results(
             self.p, 2, {"configured": True, "ok": True},
             {"configured": True, "ok": True}, {"production_paths": []},
@@ -237,6 +240,27 @@ class LiveWorkOrderTests(unittest.TestCase):
                          {f"User request number {i}" for i in range(40)})
         app.write_json(app.user_review_path(self.p), {"feedback": []})
         self.assertEqual(len(app.load_user_review(self.p)["feedback"]), 40)
+
+    def test_latest_feedback_beats_stale_delivery_state(self):
+        app.write_json(self.p / ".gameforge/user_review.json", {
+            "user_done": False, "feedback": [
+                {"id": "feedback-older", "text": "An older user request",
+                 "created_at": "2026-10-15T18:17:06Z", "addressed": False},
+                {"id": "feedback-newer", "text": "The latest urgent feedback",
+                 "created_at": "2026-10-15T18:17:06Z", "addressed": False},
+            ],
+        })
+        app.write_json(self.p / ".gameforge/delivery_state.json", {
+            "focus_feedback_id": "feedback-older",
+            "consecutive_diagnostic_only": 3,
+        })
+        state = app.delivery_state_for_prompt(self.p, app.load_user_review(self.p))
+        self.assertEqual(state["focus_feedback_id"], "feedback-newer")
+        cfg = {"goal": "Playable game", "research_mode": "off",
+               "iteration_pipeline": {"enabled": True, "compact_context": True}}
+        prompt = app.build_agent_prompt(self.p, cfg, 1, None, None)
+        self.assertIn("MANDATORY CURRENT USER FEEDBACK", prompt)
+        self.assertIn("feedback-newer", prompt.split("MANDATORY CURRENT USER FEEDBACK")[-1])
 
     def test_linked_feedback_cannot_be_falsely_closed(self):
         item = app.enqueue_live_instruction(self.p, "Use original user feedback",
