@@ -3112,14 +3112,14 @@ def _wsl_cleanup_target(p: Path, policy: dict[str, Any]) -> tuple[str, str]:
         return "", distro
     try:
         script = wrapper.read_text(encoding="utf-8", errors="replace")
-        match = re.search(r"(?m)^mod=(?:\"([^\"]+)\"|'([^']+)'|([^\\s#]+))\\s*$", script)
+        match = re.search(r"(?m)^mod=(?:\"([^\"]+)\"|'([^']+)'|([^\s#]+))\s*$", script)
         if not match:
             return "", distro
         root = next((part for part in match.groups() if part), "")
         ps1 = p / "workspace" / "tools" / "build_mod.ps1"
         if ps1.is_file() and not distro:
             ps = ps1.read_text(encoding="utf-8", errors="replace")
-            dm = re.search(r"(?i)\\bwsl\\s+-d\\s+([A-Za-z0-9_.-]+)", ps)
+            dm = re.search(r"(?i)\bwsl\s+-d\s+([A-Za-z0-9_.-]+)", ps)
             if dm:
                 distro = dm.group(1)
         return root, distro
