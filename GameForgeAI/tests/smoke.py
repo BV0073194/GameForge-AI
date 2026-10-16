@@ -112,7 +112,7 @@ with tempfile.TemporaryDirectory() as td:
     assert "LIVE USER INSTRUCTIONS" in prompt_live
     assert "Use the live steering message in this turn." in prompt_live
     app.settle_live_instructions(p, 4, delivered=True)
-    assert any(x["id"] == prompt_item["id"] and x["status"] == "awaiting_verification"
+    assert any(x["id"] == prompt_item["id"] and x["status"] == "delivered_to_agent"
                for x in app.load_live_queue(p)["items"])
 
     # Delivery is NOT implementation. A bare successful turn cannot close user
@@ -133,7 +133,8 @@ with tempfile.TemporaryDirectory() as td:
         {"production_paths": ["workspace/verified_gameplay.py"]}
     )
     assert not failure["gates_passed"]
-    assert any(x["id"] == prompt_item["id"] and x["status"] == "awaiting_verification"
+    assert prompt_item["id"] in failure["implemented_ids"]
+    assert any(x["id"] == prompt_item["id"] and x["status"] == "implemented"
                for x in app.load_live_queue(p)["items"])
     success = app.reconcile_live_instruction_results(
         p, 4, {"configured": True, "ok": True}, {"configured": True, "ok": True},
