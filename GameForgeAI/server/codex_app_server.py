@@ -221,6 +221,7 @@ class CodexAppServer:
     def steer(self, text: str) -> bool:
         if not self.active or not text.strip():
             return False
+        text = text.encode("utf-8", errors="replace").decode("utf-8")
         self._request("turn/steer", {
             "threadId": self.thread_id,
             "expectedTurnId": self.turn_id,
