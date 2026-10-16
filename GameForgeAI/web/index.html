@@ -224,6 +224,22 @@
                 <option value="acp">External ACP agent (configured command)</option>
               </select>
             </label>
+            <div class="grid two">
+              <label>Codex model (optional)
+                <input id="agentCodexModel" placeholder="Use the CLI default model">
+              </label>
+              <label>Codex reasoning effort
+                <select id="agentCodexEffort">
+                  <option value="">Use CLI default</option>
+                  <option value="minimal">Minimal</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="xhigh">Extra high</option>
+                </select>
+              </label>
+            </div>
+            <p class="tiny">Model and effort settings apply to Codex app-server and its CLI fallback, not to external ACP providers.</p>
             <label>ACP executable and arguments (JSON array)
               <textarea id="agentAcpCommand" rows="3" spellcheck="false" placeholder='["C:\\\\tools\\\\agent.exe","acp"]'></textarea>
             </label>
