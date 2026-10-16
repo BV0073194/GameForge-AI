@@ -17,7 +17,7 @@ document.addEventListener('visibilitychange',()=>{
 });
 async function api(path,opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const t=await r.text();let data;try{data=JSON.parse(t)}catch{data={error:t}}if(!r.ok)throw new Error(data.error||r.statusText);return data}
 function badge(text,ok){return `<span class="badge" style="border-color:${ok?'#3c8':'#a66'}">${text}</span>`}
-async function loadSystem(){try{const s=await api('/api/status');const codexText=s.codex?`Codex ${s.codex_version||''}`:(s.codex_installing?'Codex installing…':'Codex unavailable');ui.setHtml($('#systemBadges'),badge(`Python ${s.python}`,true)+badge(s.git?'Git':'Git missing',s.git)+badge(codexText,s.codex)+badge(s.opencv&&s.mss?'OpenCV ready':'OpenCV deps missing',s.opencv&&s.mss));const auth=!!s.codex_auth?.authenticated;const loggingIn=!!s.codex_login_in_progress;$('#codexLogin').hidden=auth;$('#codexLogout').hidden=!auth;$('#codexLogin').disabled=loggingIn||s.codex_installing;$('#saveLogin').disabled=auth||loggingIn;$('#codexLogin').textContent=loggingIn?'Signing in…':'Sign in with ChatGPT';ui.setText($('#codexAuthMessage'),auth?'Authenticated':(loggingIn?(s.codex_login_message||'Complete sign-in in your browser…'):(s.codex_install_error||s.codex_login_message||s.codex_auth?.message||s.codex_install_message||'Sign in required')));}catch(e){$('#systemBadges').textContent=e.message}}
+async function loadSystem(){try{const s=await api('/api/status');const codexText=s.codex?`Codex ${s.codex_version||''}`:(s.codex_installing?'Codex installing…':'Codex unavailable');ui.setHtml($('#systemBadges'),badge(`Python ${s.python}`,true)+badge(s.git?'Git':'Git missing',s.git)+badge(codexText,s.codex)+badge(s.opencv&&s.mss?'OpenCV ready':'OpenCV deps missing',s.opencv&&s.mss));const auth=!!s.codex_auth?.authenticated;const loggingIn=!!s.codex_login_in_progress;$('#codexLogin').hidden=auth;$('#codexLogout').hidden=!auth;$('#codexLogin').disabled=loggingIn||s.codex_installing;$('#saveLogin').disabled=auth||loggingIn;$('#codexLogin').textContent=loggingIn?'Signing in…':'Sign in with ChatGPT';ui.setText($('#codexAuthMessage'),auth?'Authenticated':(loggingIn?(s.codex_login_message||'Complete sign-in in your browser…'):(s.codex_install_error||s.codex_login_message||s.codex_auth?.message||s.codex_install_message||'Sign in required')));}catch(e){ui.setText($('#systemBadges'),e.message)}}
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function selectProject(id){
@@ -367,7 +367,7 @@ async function submitRequestedValue(r,value){beginInputRequestInteraction();try{
 function renderUserReview(r){
  r=r||{user_done:false,satisfaction:null,feedback:[]};
  const satisfaction=$('#userSatisfaction');
- if(satisfaction && document.activeElement!==satisfaction)satisfaction.value=r.satisfaction==null?'':String(r.satisfaction);
+ if(satisfaction)ui.setField(satisfaction,r.satisfaction==null?'':String(r.satisfaction));
  const done=!!r.user_done;
  $('#markUserDone').hidden=done;
  $('#reopenUserDone').hidden=!done;
@@ -375,15 +375,15 @@ function renderUserReview(r){
  const pendingCount=allFeedback.filter(x=>!x?.addressed).length;
  if(done){
    const checkpoint=r.done_checkpoint?(' • checkpoint '+r.done_checkpoint.slice(0,10)):'';
-   $('#userReviewStatus').textContent='You marked this result done. GameForge is holding this state'+checkpoint+'. You can reopen it at any time.';
+   ui.setText($('#userReviewStatus'),'You marked this result done. GameForge is holding this state'+checkpoint+'. You can reopen it at any time.');
  }else if(!$('#userReviewStatus').dataset.local){
    const satisfactionText=r.satisfaction?(' • satisfaction '+r.satisfaction+'/5'):'';
-   $('#userReviewStatus').textContent=pendingCount
+   ui.setText($('#userReviewStatus'),pendingCount
      ? pendingCount+' feedback work order'+(pendingCount===1?' is':'s are')+' still pending'+satisfactionText+'.'
-     : (r.satisfaction?('No pending feedback • satisfaction '+r.satisfaction+'/5'):'Add feedback whenever what you see differs from what you want.');
+     : (r.satisfaction?('No pending feedback • satisfaction '+r.satisfaction+'/5') :'Add feedback whenever what you see differs from what you want.'));
  }
  const items=allFeedback.slice(-10).reverse();
- $('#userReviewHistory').innerHTML=items.length
+ ui.setHtml($('#userReviewHistory'),items.length
    ? '<h4>Recent feedback</h4>'+items.map(x=>{
        const addressed=!!x.addressed;
        const state=addressed?'Addressed':'Pending';
@@ -392,7 +392,7 @@ function renderUserReview(r){
        const validation=!addressed&&x.verification_error?`<br><small><strong>Still pending:</strong> ${esc(x.verification_error)}</small>`:'';
        return `<div class="criterion ${addressed?'pass':'pending'}"><strong>${esc(x.category||'feedback')}</strong> — ${esc(x.text||'')}<br><small><strong>${state}</strong> • ${esc(x.created_at||'')}</small>${resolution}${evidence}${validation}</div>`;
      }).join('')
-   : '';
+   : '');
 }
 async function continueAfterReview(){
  try{
@@ -416,11 +416,11 @@ function renderAcceptance(a){
    if(acceptanceVisibleCount>5)html+='<button id="collapseAcceptance">Collapse to first 5</button>';
    html+='</div>';
  }
- box.innerHTML=html;
+ ui.setHtml(box,html);
  const more=$('#showMoreAcceptance');if(more)more.onclick=()=>{acceptanceVisibleCount=Math.min(all.length,acceptanceVisibleCount+5);renderAcceptance(lastAcceptance)};
  const collapse=$('#collapseAcceptance');if(collapse)collapse.onclick=()=>{acceptanceVisibleCount=5;renderAcceptance(lastAcceptance);box.scrollIntoView({block:'nearest'})};
 }
-function renderUploads(u){$('#uploadList').innerHTML=`<p>${u?.count||0} scanned items</p>`+(u?.items||[]).slice(0,100).map(x=>`<div class="criterion"><strong>${esc(x.path)}</strong><br><small>${x.bytes||0} bytes • ${esc(x.sha256||x.error||'')}</small></div>`).join('')}
+function renderUploads(u){ui.setHtml($('#uploadList'),`<p>${u?.count||0} scanned items</p>`+(u?.items||[]).slice(0,100).map(x=>`<div class="criterion"><strong>${esc(x.path)}</strong><br><small>${x.bytes||0} bytes • ${esc(x.sha256||x.error||'')}</small></div>`).join(''))}
 async function postAction(action,body={}){if(!current)return;return api(`/api/project/${current}/${action}`,{method:'POST',body:JSON.stringify(body)})}
 $('#createBtn').onclick=async()=>{const goal=$('#newGoal').value.trim();if(!goal)return alert('Describe the playable result first.');try{const p=await api('/api/projects/create',{method:'POST',body:JSON.stringify({name:$('#newName').value||'Game Project',goal,research_mode:$('#newResearch').value})});$('#newGoal').value='';await loadProjects(p.id)}catch(e){alert(e.message)}};
 $('#refreshBtn').onclick=()=>loadProjects();
