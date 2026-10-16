@@ -33,6 +33,9 @@
     if (el.textContent === text) return false;
     if (!options.force && (hasSelectionInside(el) || hasFocusedEditorInside(el))) return false;
     el.textContent = text;
+    // An error/status replacement must invalidate a previously cached HTML
+    // render so a subsequent recovery redraws it correctly.
+    rendered.delete(el);
     return true;
   }
 
@@ -76,13 +79,21 @@
     return true;
   }
 
+  function updateDirtyIndicator() {
+    const node = root.document && root.document.getElementById('settingsDraftStatus');
+    if (!node) return;
+    setText(node, dirtyFields.size
+      ? dirtyFields.size + ' unsaved setting change(s). Live polling will not overwrite them.'
+      : 'Settings changes are saved only when you choose Save settings.');
+  }
+
   function trackSettings(ids) {
     ids.forEach(id => settingIds.add(id));
     if (editsBound || !root.document) return;
     editsBound = true;
     const markDirty = event => {
       const target = event.target;
-      if (target && settingIds.has(target.id)) dirtyFields.add(target.id);
+      if (target && settingIds.has(target.id)) {dirtyFields.add(target.id);updateDirtyIndicator()}
     };
     // Capture changes before a refresh response can overwrite the user's choice.
     root.document.addEventListener('input', markDirty, true);
@@ -112,11 +123,13 @@
       const current = field.type === 'checkbox' ? Boolean(field.checked) : field.value;
       if (current === submitted) dirtyFields.delete(id);
     });
+    updateDirtyIndicator();
   }
 
   function resetProject() {
     rendered = new WeakMap();
     dirtyFields.clear();
+    updateDirtyIndicator();
   }
 
   async function copyText(text) {
