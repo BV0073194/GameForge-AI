@@ -172,6 +172,18 @@ with tempfile.TemporaryDirectory() as td:
     cfg3["commands"]["clean"] = f'"{sys.executable}" smoke_clean.py'
     cfg3["commands"]["build"] = f'"{sys.executable}" smoke_build.py'
     cfg3["cleanup"].update({"log_keep_files": 10, "capture_keep_groups": 2, "research_keep_iterations": 3})
+    # Legacy projects retain older limits; lean mode caps them automatically.
+    legacy_policy = app.cleanup_policy_settings({"cleanup": {
+        "enabled": True, "auto_after_iteration": True,
+        "log_keep_files": 60, "capture_keep_groups": 4,
+        "research_keep_iterations": 8,
+    }})
+    assert legacy_policy["log_keep_files"] == 12
+    assert legacy_policy["capture_keep_groups"] == 2
+    assert legacy_policy["research_keep_iterations"] == 3
+    assert app.cleanup_policy_settings({"cleanup": {"lean_mode": False,
+        "log_keep_files": 60}})["log_keep_files"] == 60
+
     app.write_json(p / "gameforge.json", cfg3)
     clean_build = app.run_clean_build(cfg["id"])
     assert clean_build["ok"], clean_build
