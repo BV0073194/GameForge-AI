@@ -1768,38 +1768,71 @@ def run_codex_agent_stream(
 
 
 def _fusion_agent_question(p: Path, state: AgentState, message: dict[str, Any]) -> bool:
-    """Bridge actual Codex questions and permission requests to the GameForge UI."""
+    """Persist real agent requests for explicit approval, MCP elicitation or answers."""
     method = str(message.get("method", ""))
     params = message.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
     questions = params.get("questions") or []
-    approvals = {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}
+    approvals = {
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/permissions/requestApproval",
+        "execCommandApproval",
+        "applyPatchApproval",
+    }
+    protocol = "acp" if isinstance(state.transport, AcpAgentTransport) else "codex-app-server"
+    permission_options = []
     if method == "item/tool/requestUserInput":
         if not isinstance(questions, list) or not questions:
             return False
         first = questions[0] if isinstance(questions[0], dict) else {}
-        options = first.get("options") or []
-        choices = [str(x.get("label")) for x in options if isinstance(x, dict) and x.get("label")]
+        choices = [str(x.get("label")) for x in (first.get("options") or []) if isinstance(x, dict) and x.get("label")]
         title = str(first.get("header") or "Codex needs your input")[:180]
         detail = str(first.get("question") or "How should Codex proceed?")[:3000]
+        kind = "choice" if choices else "text"
+    elif method == "session/request_permission":
+        raw_options = params.get("options") or []
+        permission_options = [
+            {"id": str(x["optionId"]), "label": str(x.get("name") or x.get("kind") or x["optionId"])}
+            for x in raw_options if isinstance(x, dict) and x.get("optionId")
+        ]
+        if not permission_options:
+            return False
+        choices = [x["label"] for x in permission_options] + ["Decline"]
+        title = "ACP agent requests permission"
+        tool = params.get("toolCall") or {}
+        detail = str(_auth_redact(str(params.get("title") or (tool.get("title") if isinstance(tool, dict) else "") or "Approve an agent action?")))[:3000]
+        kind = "choice"
     elif method in approvals:
         choices = ["Approve once", "Decline"]
-        title = "Approve Codex command?" if "commandExecution" in method else "Approve Codex file changes?"
-        reason = str(params.get("reason") or "The coding agent requested permission.")
+        title = "Approve agent permissions?" if "permissions" in method else "Approve Codex command or file edit?"
+        reason = str(params.get("reason") or "The coding agent requested your authorization.")
         cmd = str(params.get("command") or "")
         detail = str(_auth_redact(reason + ("\nCommand: " + cmd if cmd else "")))[:3000]
         questions = []
+        kind = "choice"
+    elif method in {"mcpServer/elicitation/request", "elicitation/create"}:
+        choices = []
+        questions = []
+        kind = "json"
+        title = "MCP server needs your input"
+        detail = str(_auth_redact(str(params.get("message") or params.get("title") or "Review the requested fields before responding.")))[:3000]
     else:
         return False
     request = {
-        "id": "codex-" + str(message.get("id")),
-        "protocol": "codex-app-server",
+        "id": "fusion-request-" + str(message.get("id")),
+        "protocol": protocol,
         "rpc_request_id": message.get("id"),
         "rpc_method": method,
-        "kind": "choice" if choices else "text",
+        "kind": kind,
         "title": title,
         "message": detail,
         "choices": choices,
         "questions": questions,
+        "permission_options": permission_options,
+        "requested_schema": params.get("requestedSchema") if kind == "json" else None,
+        "requested_permissions": params.get("permissions") if method == "item/permissions/requestApproval" else None,
         "status": "pending",
         "resume_after_submit": False,
         "created_at": now_iso(),
@@ -1809,6 +1842,7 @@ def _fusion_agent_question(p: Path, state: AgentState, message: dict[str, Any]) 
     state.status = "waiting_for_user"
     set_agent_activity(state, "Waiting for your answer", request["message"], "question")
     return True
+
 
 def _fusion_codex_activity(state: AgentState, event: dict[str, Any]) -> None:
     """Publish meaningful task transitions, not every token delta (disk/CPU hot path)."""
@@ -4493,17 +4527,53 @@ class Handler(SimpleHTTPRequestHandler):
                 else:
                     supplied = str(response)
                 st = AGENTS.get(pid)
-                if req.get("protocol") == "codex-app-server":
+                if req.get("protocol") in {"codex-app-server", "acp"}:
                     if not st or not st.transport or not st.transport.active:
                         return self.send_json({"error": "The Codex question is no longer active"}, 409)
-                    if req.get("rpc_method") in {
-                        "item/commandExecution/requestApproval", "item/fileChange/requestApproval"
+                    rpc_method = str(req.get("rpc_method") or "")
+                    if rpc_method == "session/request_permission":
+                        choice = next((x for x in (req.get("permission_options") or []) if x.get("label") == response), None)
+                        if response != "Decline" and not choice:
+                            return self.send_json({"error": "Select a listed permission option or Decline"}, 400)
+                        outcome = {"outcome": "selected", "optionId": choice["id"]} if choice else {"outcome": "cancelled"}
+                        st.transport.reply(req["rpc_request_id"], {"outcome": outcome})
+                    elif rpc_method in {"mcpServer/elicitation/request", "elicitation/create"}:
+                        if response == "Decline":
+                            answer = {"action": "decline", "content": None}
+                        else:
+                            try:
+                                values = json.loads(response) if isinstance(response, str) else response
+                            except ValueError:
+                                return self.send_json({"error": "Provide valid JSON or Decline"}, 400)
+                            if not isinstance(values, dict):
+                                return self.send_json({"error": "MCP elicitation requires a JSON object"}, 400)
+                            schema = req.get("requested_schema") or {}
+                            required = schema.get("required", []) if isinstance(schema, dict) else []
+                            if any(field not in values for field in required):
+                                return self.send_json({"error": "Some required MCP form fields are missing"}, 400)
+                            answer = {"action": "accept", "content": values}
+                        st.transport.reply(req["rpc_request_id"], answer)
+                    elif rpc_method in {
+                        "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                        "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval",
                     }:
                         if response not in {"Approve once", "Decline"}:
                             return self.send_json({"error": "Choose Approve once or Decline"}, 400)
-                        st.transport.reply(req["rpc_request_id"], {
-                            "decision": "accept" if response == "Approve once" else "decline"
-                        })
+                        approved = response == "Approve once"
+                        if rpc_method == "item/permissions/requestApproval":
+                            answer = {"permissions": req.get("requested_permissions") or {}, "scope": "turn"} if approved else {"permissions": {}, "scope": "turn"}
+                        elif rpc_method in {"execCommandApproval", "applyPatchApproval"}:
+                            answer = {"decision": "approved" if approved else "denied"}
+                        else:
+                            answer = {"decision": "accept" if approved else "decline"}
+                        st.transport.reply(req["rpc_request_id"], answer)
+                    else:
+                        answers = None
+                    if rpc_method in {
+                        "session/request_permission", "mcpServer/elicitation/request", "elicitation/create",
+                        "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                        "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval",
+                    }:
                         req["status"] = "fulfilled"
                         req["fulfilled_at"] = now_iso()
                         write_json(user_input_request_path(p), req)
