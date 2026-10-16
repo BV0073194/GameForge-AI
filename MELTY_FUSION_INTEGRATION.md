@@ -69,3 +69,22 @@ Bound message size and queue growth; redact auth tokens from logs; validate proj
 - Command/file approvals and Codex tool questions are bridged; advanced permission requests and MCP elicitation remain unsupported and default to rejection.
 - A failed app-server handshake falls back to CLI. An error after turn start is reported rather than blindly replaying edits.
 - Do not merge this development branch to `main` before real Codex and native Windows validation.
+
+## Automatic project-scoped WSL cleanup
+
+After each completed iteration, the existing artifact cleanup also checks for a
+WSL project worktree. It may discover the `mod=/absolute/path` value from
+`workspace/tools/build_mod.sh` and the distro from `build_mod.ps1`, or use
+`gameforge.json` cleanup settings `wsl_project_root` and `wsl_distro`.
+The worktree must contain a GameForge-owned `.gameforge/` directory.
+
+Only old files in `.gameforge/tmp`, `.gameforge/temp`, `.gameforge/cache`,
+and `.gameforge/scratch` are pruned (default minimum age: 48 hours). The
+cleaner never runs `apt clean`, `docker system prune`, `make clean`, or
+broad deletions of WSL home directories, compilers, toolchains, build outputs,
+research evidence, game assets, or user-owned caches. If the marker or WSL
+environment is missing, cleanup skips safely and records why in
+`.gameforge/last_cleanup.json`.
+
+Set `cleanup.wsl_cleanup_enabled=false` to disable, or
+`cleanup.wsl_min_age_hours` to increase the retention age.
