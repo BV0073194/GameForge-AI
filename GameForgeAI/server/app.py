@@ -1826,6 +1826,12 @@ def run_codex_fusion_stream(
     transport_mode: str = "auto",
 ) -> subprocess.CompletedProcess[str]:
     """Prefer a persistent, steerable Codex session; fall back only before work starts."""
+    # Persist a safe transport downgrade across recovery attempts. A lost
+    # turn/start response is ambiguous, so never replay that turn immediately.
+    # Subsequent iterations use exec rather than retrying a dead app-server.
+    downgrade_path = cwd / ".gameforge" / "codex_transport_downgrade.json"
+    if transport_mode == "auto" and downgrade_path.exists():
+        transport_mode = "exec"
     if transport_mode == "exec":
         return run_codex_agent_stream(
             args, cwd=cwd, input_text=input_text, timeout=timeout,
@@ -1860,9 +1866,21 @@ def run_codex_fusion_stream(
         )
     except AppServerProtocolError as exc:
         # Once a turn may have started, NEVER replay it via exec: that can duplicate edits.
+        # Record the downgrade so the recovery loop does not repeat the same
+        # failed transport eight times. The current turn remains failed to
+        # avoid duplicating edits when the response was lost after execution.
+        diagnostics = {
+            "timestamp": now_iso(),
+            "reason": str(exc)[:1200],
+            "fallback_transport": "exec",
+            "ambiguous_turn_not_replayed": True,
+            "stderr_tail": "".join(transport._stderr_lines)[-6000:],
+        }
+        write_json(cwd / ".gameforge" / "codex_transport_downgrade.json", diagnostics)
+        auth_trace("codex_app_server_protocol_downgrade", **diagnostics)
         transport.close()
         state.transport = None
-        return subprocess.CompletedProcess(args, 1, "", f"Codex app-server protocol failed: {exc}")
+        return subprocess.CompletedProcess(args, 1, "", f"Codex app-server protocol failed: {exc}; next iteration will use codex exec")
     finally:
         req = load_user_input_request(cwd)
         if req and req.get("protocol") == "codex-app-server":
