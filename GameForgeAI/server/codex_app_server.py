@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from .fusion_mcp import codex_mcp_config
+
 
 class AppServerUnavailable(RuntimeError):
     """The persistent transport could not start before agent work began."""
@@ -34,10 +36,12 @@ class CodexAppServer:
         permission_mode: str = "full-auto",
         on_event: Callable[[dict[str, Any]], None] | None = None,
         on_question: Callable[[dict[str, Any]], bool] | None = None,
+        mcp_servers: list[dict[str, Any]] | None = None,
     ) -> None:
         self.command, self.shell, self.cwd, self.env = command, shell, cwd, env
         self.permission_mode = permission_mode
         self.on_event, self.on_question = on_event, on_question
+        self.mcp_servers = mcp_servers or []
         self.process: subprocess.Popen[str] | None = None
         self.thread_id: str | None = None
         self.turn_id: str | None = None
@@ -61,7 +65,7 @@ class CodexAppServer:
         with self._write_lock:
             if self.process is None or self.process.poll() is not None or self.process.stdin is None:
                 raise AppServerProtocolError("Codex app-server is not running")
-            self.process.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            self.process.stdin.write(json.dumps(msg, ensure_ascii=True) + "\n")
             self.process.stdin.flush()
 
     def _request(self, method: str, params: dict[str, Any], timeout: float = 15) -> Any:
@@ -187,6 +191,9 @@ class CodexAppServer:
                     self.thread_id = None
             if not self.thread_id:
                 params: dict[str, Any] = {"cwd": str(self.cwd)}
+                mcp_config = codex_mcp_config(self.mcp_servers)
+                if mcp_config:
+                    params["config"] = mcp_config
                 if self.permission_mode == "full-auto":
                     params.update({"approvalPolicy": "never", "sandbox": "danger-full-access"})
                 else:
