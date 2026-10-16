@@ -1954,7 +1954,7 @@ def mark_live_instruction_steered(p: Path, item_id: str) -> bool:
         data = load_live_queue(p)
         for item in data.get("items", []):
             if item.get("id") == item_id and item.get("status") == "queued":
-                item["status"] = "delivered"
+                item["status"] = "awaiting_verification"
                 item["delivered_at"] = now_iso()
                 item["delivery"] = "in-turn-steer"
                 save_live_queue(p, data)
@@ -2008,16 +2008,22 @@ def load_live_queue(p: Path) -> dict[str, Any]:
     items = data.get("items")
     if not isinstance(items, list):
         items = []
-    data["version"] = 1
+    data["version"] = 2
     data["items"] = [x for x in items if isinstance(x, dict)]
+    # Old "delivered" records only meant Codex received the message. They
+    # never proved implementation and must not appear as completed work.
+    for item in data["items"]:
+        if item.get("status") == "delivered":
+            item["status"] = "awaiting_verification"
+            item["migration_note"] = "Legacy delivery was not proof of implementation"
     return data
 
 
 def save_live_queue(p: Path, data: dict[str, Any]) -> dict[str, Any]:
-    data["version"] = 1
+    data["version"] = 2
     data["updated_at"] = now_iso()
     items = [x for x in data.get("items", []) if isinstance(x, dict)]
-    pending = [x for x in items if x.get("status") in {"queued", "in_progress"}]
+    pending = [x for x in items if x.get("status") in {"queued", "in_progress", "awaiting_verification"}]
     recent = [x for x in items if x.get("status") not in {"queued", "in_progress"}][-200:]
     data["items"] = sorted(pending + recent, key=lambda x: str(x.get("created_at", "")))
     write_json(live_queue_path(p), data)
@@ -2029,10 +2035,13 @@ def live_queue_public(p: Path) -> dict[str, Any]:
     items = data.get("items", [])
     queued = [x for x in items if x.get("status") == "queued"]
     in_progress = [x for x in items if x.get("status") == "in_progress"]
-    recent = [x for x in items if x.get("status") in {"delivered", "cancelled"}][-20:]
+    awaiting = [x for x in items if x.get("status") == "awaiting_verification"]
+    recent = [x for x in items if x.get("status") in {"verified", "cancelled"}][-20:]
     return {
         "queued": queued,
         "in_progress": in_progress,
+        "awaiting_verification": awaiting,
+        "awaiting_count": len(awaiting),
         "recent": recent,
         "queued_count": len(queued),
         "in_progress_count": len(in_progress),
@@ -2067,7 +2076,7 @@ def enqueue_live_instruction(
         "attempts": 0,
         "metadata": metadata or {},
     }
-    if sum(1 for x in data.get("items", []) if x.get("status") in {"queued", "in_progress"}) >= 1000:
+    if sum(1 for x in data.get("items", []) if x.get("status") in {"queued", "in_progress", "awaiting_verification"}) >= 1000:
         raise ValueError("Live queue is full (1000 pending instructions)")
     data.setdefault("items", []).append(item)
     save_live_queue(p, data)
@@ -2097,10 +2106,10 @@ def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[di
     # claimed instructions. No user steering is ever discarded: at the start of
     # a fresh prompt build, return all unfinished claims to the queue first.
     for item in data.get("items", []):
-        if item.get("status") == "in_progress":
+        if item.get("status") in {"in_progress", "awaiting_verification"}:
             item["status"] = "queued"
             item["requeued_at"] = now_iso()
-            item["requeue_reason"] = "previous turn did not settle"
+            item["requeue_reason"] = "unfinished user instruction requires verification"
             item.pop("claimed_iteration", None)
             changed = True
 
@@ -2126,8 +2135,9 @@ def settle_live_instructions(p: Path, iteration: int, *, delivered: bool, reason
         if item.get("status") != "in_progress" or int(item.get("claimed_iteration", -1) or -1) != iteration:
             continue
         if delivered:
-            item["status"] = "delivered"
+            item["status"] = "awaiting_verification"
             item["delivered_at"] = now_iso()
+            item["verification_state"] = "Awaiting implementation evidence and full project gates"
         else:
             item["status"] = "queued"
             item["requeued_at"] = now_iso()
@@ -2136,6 +2146,75 @@ def settle_live_instructions(p: Path, iteration: int, *, delivered: bool, reason
         changed = True
     if changed:
         save_live_queue(p, data)
+
+
+
+def reconcile_live_instruction_results(
+    p: Path, iteration: int, build_result: dict[str, Any], test_result: dict[str, Any],
+) -> dict[str, Any]:
+    """Close only instruction IDs backed by source evidence and configured gates.
+
+    Agents write evidence claims; GameForge independently checks that claimed
+    files exist and the *original* configured build and test both pass. A
+    missing gate or incomplete claim keeps the instruction pending.
+    """
+    raw = read_json(p / ".gameforge" / "live_instruction_results.json", {}) or {}
+    results = raw.get("results", []) if isinstance(raw, dict) else []
+    by_id = {str(x.get("id")): x for x in results if isinstance(x, dict) and x.get("id")}
+    gate_passed = all(
+        bool(gate.get("configured")) and bool(gate.get("ok"))
+        for gate in (build_result, test_result)
+    )
+    verified_ids: list[str] = []
+    with LIVE_QUEUE_LOCK:
+        data = load_live_queue(p)
+        for item in data.get("items", []):
+            if item.get("status") != "awaiting_verification":
+                continue
+            claim = by_id.get(item.get("id"))
+            if not claim or not claim.get("ready_for_verification"):
+                continue
+            resolution = claim.get("resolution")
+            evidence = claim.get("evidence")
+            files = claim.get("changed_paths")
+            if not isinstance(resolution, str) or len(resolution.strip()) < 12:
+                continue
+            if not isinstance(evidence, str) or len(evidence.strip()) < 12:
+                continue
+            if not isinstance(files, list) or not files or len(files) > 60:
+                continue
+            valid_files = True
+            for relative in files:
+                if not isinstance(relative, str) or not relative or len(relative) > 400:
+                    valid_files = False
+                    break
+                try:
+                    candidate = safe_child(p, relative)
+                    if not candidate.is_file() or ".gameforge" in candidate.parts:
+                        valid_files = False
+                        break
+                except (OSError, ValueError):
+                    valid_files = False
+                    break
+            if not valid_files:
+                continue
+            item["verification_claim"] = {
+                "resolution": resolution[:2500],
+                "evidence": evidence[:3500],
+                "changed_paths": files,
+                "iteration": iteration,
+                "configured_quality_gates_passed": gate_passed,
+            }
+            if gate_passed:
+                item["status"] = "verified"
+                item["verified_at"] = now_iso()
+                item["verification_state"] = "Agent evidence accepted; configured build and tests passed"
+                verified_ids.append(item["id"])
+            else:
+                item["verification_state"] = "Implementation claimed; full build/test gates have not passed"
+        save_live_queue(p, data)
+    return {"verified_ids": verified_ids, "gates_passed": gate_passed}
+
 
 
 def user_input_request_path(p: Path) -> Path:
@@ -2478,6 +2557,14 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
         evidence = collect_logs(p, cfg)
     prior = ""
     if live_inputs:
+        prior += ("\\nIMPORTANT: Each live instruction is a persistent work order. Do not claim completion by merely reading it. "
+                  "After implementation and targeted tests, update .gameforge/live_instruction_results.json "
+                  "with {\\\"results\\\":[{\\\"id\\\":\\\"EXACT_ID\\\",\\\"ready_for_verification\\\":true,"
+                  "\\\"resolution\\\":\\\"what changed\\\",\\\"evidence\\\":\\\"specific test/runtime evidence\\\","
+                  "\\\"changed_paths\\\":[\\\"workspace/path-to-source\\\"]}]}. "
+                  "Only set ready_for_verification for truly implemented requests. The original configured "
+                  "full build and test still have to pass before GameForge marks an instruction verified. "
+                  "Otherwise leave it pending, and explain the blocker in iteration notes.\\n")
         prior += (
             "\nLIVE USER INSTRUCTIONS — THESE ARRIVED WHILE THE AGENT WAS RUNNING. "
             "Honor them before lower-priority roadmap work. If an instruction conflicts with an older plan, "
@@ -2805,6 +2892,7 @@ def agent_loop(project_id: str) -> None:
                 set_agent_activity(state, "Stopped", state.message, "stopped")
                 return
 
+            live_verification = reconcile_live_instruction_results(p, iteration, build_result, test_result)
             review_after_verification = reconcile_feedback_work_orders(
                 p,
                 review_before_iteration,
@@ -2847,6 +2935,7 @@ def agent_loop(project_id: str) -> None:
                 "test": {k:v for k,v in test_result.items() if k != "output"},
                 "visual": read_json(p / "captures/metrics.json", {}),
                 "pending_user_feedback": pending_feedback_count,
+                "live_instruction_verification": live_verification,
                 "change_summary": change_summary,
                 "delivery_state": delivery_state,
             }
