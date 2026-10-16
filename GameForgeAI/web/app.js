@@ -3,6 +3,7 @@ const ui=window.GameForgeUI;
 const SETTING_IDS=['agentTransport','agentCodexModel','agentCodexEffort','agentAcpCommand','agentMcpServers','researchMode','internetResearch','cleanCmd','buildCmd','testCmd','launchCmd','monitorNum','freezeSeconds','windowTitle','userSatisfaction'];
 ui.trackSettings(SETTING_IDS);
 let current=null,pollTimer=null,refreshInFlight=false,refreshPending=false,projectGeneration=0;
+let activeStateController=null;
 let inputRequestBusy=false,inputRequestDirty=false,inputRequestPending=false,lastInputRequestKey=null,lastCaptureKey=null;
 let acceptanceVisibleCount=5,activityVisibleCount=5,lastAcceptance=null,lastLiveAgent=null,lastManagedProcess=null;
 function stopProjectPolling(){if(pollTimer){clearTimeout(pollTimer);pollTimer=null}}
@@ -22,6 +23,7 @@ async function loadProjects(selectId=null){const d=await api('/api/projects');co
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function selectProject(id){
  stopProjectPolling();projectGeneration++;current=id;
+ if(activeStateController)activeStateController.abort();
  ui.resetProject();
  inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;lastInputRequestKey=null;lastCaptureKey=null;
  $('#inputRequest').hidden=true;$('#inputRequestControl').replaceChildren();
@@ -34,8 +36,11 @@ async function refreshState(){
  if(refreshInFlight){refreshPending=true;return}
  refreshInFlight=true;
  const projectId=current,generation=projectGeneration;
+ const controller=new AbortController();
+ activeStateController=controller;
+ const requestTimeout=setTimeout(()=>controller.abort(),15000);
  try{
-  const d=await api(`/api/project/${encodeURIComponent(projectId)}/state`);
+  const d=await api(`/api/project/${encodeURIComponent(projectId)}/state`,{signal:controller.signal});
   if(projectId!==current||generation!==projectGeneration)return;
   const c=d.config||{},agent=d.agent||{};
   ui.setText($('#projectTitle'),c.name||'');
@@ -87,6 +92,8 @@ async function refreshState(){
  }catch(e){
   if(projectId===current&&generation===projectGeneration)console.error('Dashboard refresh failed:',e);
  }finally{
+  clearTimeout(requestTimeout);
+  if(activeStateController===controller)activeStateController=null;
   refreshInFlight=false;
   if(refreshPending){refreshPending=false;void refreshState()}
   else if(projectId===current&&generation===projectGeneration)startProjectPolling();
