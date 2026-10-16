@@ -65,7 +65,8 @@ function renderLiveQueue(q,question,agent){
  const queued=q.queued||[],active=q.in_progress||[],delivered=q.delivered_to_agent||[];
  const implemented=q.implemented||[],recent=(q.recent||[]).slice(-12).reverse();
  const all=[...active,...queued,...delivered,...implemented,...recent];
- const selected=all.find(x=>x.id===agent?.active_instruction_id)
+ const activeRun=['running','self-healing','waiting_for_user'].includes(agent?.status);
+ const selected=(activeRun?all.find(x=>x.id===agent?.active_instruction_id):null)
     ||all.find(x=>x.id===q.focus_id)||q.focus;
  const focused=$('#liveTaskFocus');
  if(focused)focused.textContent=selected
@@ -94,8 +95,9 @@ function renderLiveQueue(q,question,agent){
    let body='';
    if(claim.resolution)body+='<p><strong>Implementation:</strong> '+esc(claim.resolution)+'</p>';
    if(claim.evidence)body+='<p><strong>Agent evidence:</strong> '+esc(claim.evidence)+'</p>';
+   if(claim.git_checkpoint)body+='<p><strong>Git checkpoint:</strong> <code>'+esc(claim.git_checkpoint)+'</code>'+(claim.git_diff_base?' • changes since <code>'+esc(claim.git_diff_base)+'</code>':'')+'</p>';
    if(files.length)body+='<p><strong>Modified source files:</strong></p><ul>'+files.map(p=>'<li><code>'+esc(p)+'</code></li>').join('')+'</ul>';
-   if(tests.length)body+='<p><strong>Targeted tests:</strong></p><ul>'+tests.map(t=>'<li>'+esc(t.name||'Test')+' — '+esc(t.status||'unknown')+(t.log_path?' • '+esc(t.log_path):'')+'</li>').join('')+'</ul>';
+   if(tests.length)body+='<p><strong>Agent-reported targeted tests:</strong></p><ul>'+tests.map(t=>'<li>'+esc(t.name||'Test')+' — '+esc(t.status||'unknown')+(t.log_path?' • '+esc(t.log_path):'')+'</li>').join('')+'</ul>';
    if(gates.iteration)body+='<p><strong>GameForge full gates (iteration '+esc(gates.iteration)+'):</strong> build '+(gates.build?.passed?'passed':gates.build?.configured?'failed':'not configured')+(gates.build?.log_path?' — '+esc(gates.build.log_path):'')+'; regression '+(gates.test?.passed?'passed':gates.test?.configured?'failed':'not configured')+(gates.test?.log_path?' — '+esc(gates.test.log_path):'')+'</p>';
    if(history.length)body+='<p><strong>Status history:</strong></p><ol>'+history.map(h=>'<li>'+esc(h.at||'')+' — '+esc((h.from||'received')+' → '+(h.status||''))+(h.iteration!=null?' (agent iteration '+esc(h.iteration)+')':'')+(h.reason?' • '+esc(h.reason):'')+'</li>').join('')+'</ol>';
    const expand=body?'<details><summary>View changes, tests and status timeline</summary>'+body+'</details>':'';
