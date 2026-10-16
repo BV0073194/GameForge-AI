@@ -1,13 +1,96 @@
-const $=s=>document.querySelector(s);let current=null;let pollTimer=null;let inputRequestBusy=false;let inputRequestDirty=false;let inputRequestPending=false;let acceptanceVisibleCount=5;let activityVisibleCount=5;let lastAcceptance=null;let lastLiveAgent=null;let lastManagedProcess=null;
-function stopProjectPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
-function startProjectPolling(){if(current&&!pollTimer)pollTimer=setInterval(refreshState,1800)}
+const $=s=>document.querySelector(s);
+const ui=window.GameForgeUI;
+const SETTING_IDS=['agentTransport','agentCodexModel','agentCodexEffort','agentAcpCommand','agentMcpServers','researchMode','internetResearch','cleanCmd','buildCmd','testCmd','launchCmd','monitorNum','freezeSeconds','windowTitle','userSatisfaction'];
+ui.trackSettings(SETTING_IDS);
+let current=null,pollTimer=null,refreshInFlight=false,refreshPending=false,projectGeneration=0;
+let inputRequestBusy=false,inputRequestDirty=false,inputRequestPending=false,lastInputRequestKey=null,lastCaptureKey=null;
+let acceptanceVisibleCount=5,activityVisibleCount=5,lastAcceptance=null,lastLiveAgent=null,lastManagedProcess=null;
+function stopProjectPolling(){if(pollTimer){clearTimeout(pollTimer);pollTimer=null}}
+function startProjectPolling(){
+  if(!current||pollTimer||refreshInFlight)return;
+  // Hidden tabs do not need an 1800ms paint cycle. Keep backend heartbeat separate.
+  const delay=document.hidden?8000:2000;
+  pollTimer=setTimeout(()=>{pollTimer=null;void refreshState()},delay);
+}
+document.addEventListener('visibilitychange',()=>{
+  if(!document.hidden&&current){stopProjectPolling();void refreshState()}
+});
 async function api(path,opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const t=await r.text();let data;try{data=JSON.parse(t)}catch{data={error:t}}if(!r.ok)throw new Error(data.error||r.statusText);return data}
 function badge(text,ok){return `<span class="badge" style="border-color:${ok?'#3c8':'#a66'}">${text}</span>`}
-async function loadSystem(){try{const s=await api('/api/status');const codexText=s.codex?`Codex ${s.codex_version||''}`:(s.codex_installing?'Codex installing…':'Codex unavailable');$('#systemBadges').innerHTML=badge(`Python ${s.python}`,true)+badge(s.git?'Git':'Git missing',s.git)+badge(codexText,s.codex)+badge(s.opencv&&s.mss?'OpenCV ready':'OpenCV deps missing',s.opencv&&s.mss);const auth=!!s.codex_auth?.authenticated;const loggingIn=!!s.codex_login_in_progress;$('#codexLogin').hidden=auth;$('#codexLogout').hidden=!auth;$('#codexLogin').disabled=loggingIn||s.codex_installing;$('#saveLogin').disabled=auth||loggingIn;$('#codexLogin').textContent=loggingIn?'Signing in…':'Sign in with ChatGPT';$('#codexAuthMessage').textContent=auth?'Authenticated':(loggingIn?(s.codex_login_message||'Complete sign-in in your browser…'):(s.codex_install_error||s.codex_login_message||s.codex_auth?.message||s.codex_install_message||'Sign in required'));}catch(e){$('#systemBadges').textContent=e.message}}
+async function loadSystem(){try{const s=await api('/api/status');const codexText=s.codex?`Codex ${s.codex_version||''}`:(s.codex_installing?'Codex installing…':'Codex unavailable');ui.setHtml($('#systemBadges'),badge(`Python ${s.python}`,true)+badge(s.git?'Git':'Git missing',s.git)+badge(codexText,s.codex)+badge(s.opencv&&s.mss?'OpenCV ready':'OpenCV deps missing',s.opencv&&s.mss));const auth=!!s.codex_auth?.authenticated;const loggingIn=!!s.codex_login_in_progress;$('#codexLogin').hidden=auth;$('#codexLogout').hidden=!auth;$('#codexLogin').disabled=loggingIn||s.codex_installing;$('#saveLogin').disabled=auth||loggingIn;$('#codexLogin').textContent=loggingIn?'Signing in…':'Sign in with ChatGPT';ui.setText($('#codexAuthMessage'),auth?'Authenticated':(loggingIn?(s.codex_login_message||'Complete sign-in in your browser…'):(s.codex_install_error||s.codex_login_message||s.codex_auth?.message||s.codex_install_message||'Sign in required')));}catch(e){$('#systemBadges').textContent=e.message}}
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
-async function selectProject(id){stopProjectPolling();current=id;inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;acceptanceVisibleCount=5;activityVisibleCount=5;lastAcceptance=null;lastLiveAgent=null;lastManagedProcess=null;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();startProjectPolling()}
-async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status} • ${d.agent.transport||'exec'}`;$('#steerLiveInstruction').disabled=!d.agent.steering_available;const ip=d.iteration_progress||{};$('#iterationBadge').textContent='GameForge iteration '+(ip.agent_iteration??d.agent.iteration??0);const projectIter=ip.project_progress_iteration??d.acceptance?.iteration??0;$('#iterationDetail').textContent='GameForge agent iteration '+(ip.agent_iteration??0)+' • latest build/test evidence iteration '+(ip.last_evidence_iteration??0)+(ip.unverified_iteration_gap?' • '+ip.unverified_iteration_gap+' started iteration(s) beyond last recorded evidence':'')+' • game/project progress iteration '+projectIter+' (independent numbering).';$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#agentTransport').value=c.agent?.transport||'auto';if(document.activeElement!==$('#agentCodexModel'))$('#agentCodexModel').value=c.agent?.model||'';if(document.activeElement!==$('#agentCodexEffort'))$('#agentCodexEffort').value=c.agent?.effort||'';if(document.activeElement!==$('#agentAcpCommand'))$('#agentAcpCommand').value=JSON.stringify(c.agent?.acp_command||[],null,2);if(document.activeElement!==$('#agentMcpServers'))$('#agentMcpServers').value=JSON.stringify(c.mcp_servers||[],null,2);$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#cleanCmd').value=c.commands?.clean||'';$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);renderLiveQueue(d.live_queue,d.input_request,d.agent);renderFusionRuntime(d.run_reports,d.fusion_manifest,d.game_inventory,d.fusion_deployment);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+async function selectProject(id){
+ stopProjectPolling();projectGeneration++;current=id;
+ ui.resetProject();
+ inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;lastInputRequestKey=null;lastCaptureKey=null;
+ acceptanceVisibleCount=5;activityVisibleCount=5;lastAcceptance=null;lastLiveAgent=null;lastManagedProcess=null;
+ $('#emptyState').hidden=true;$('#workspace').hidden=false;
+ await refreshState();await loadProjects();startProjectPolling();
+}
+async function refreshState(){
+ if(!current)return;
+ if(refreshInFlight){refreshPending=true;return}
+ refreshInFlight=true;
+ const projectId=current,generation=projectGeneration;
+ try{
+  const d=await api(`/api/project/${encodeURIComponent(projectId)}/state`);
+  if(projectId!==current||generation!==projectGeneration)return;
+  const c=d.config||{},agent=d.agent||{};
+  ui.setText($('#projectTitle'),c.name||'');
+  ui.setText($('#projectGoal'),c.goal||'');
+  ui.setText($('#agentBadge'),`Agent: ${agent.status||'idle'} • ${agent.transport||'exec'}`);
+  $('#steerLiveInstruction').disabled=!agent.steering_available;
+  const ip=d.iteration_progress||{};
+  ui.setText($('#iterationBadge'),'GameForge iteration '+(ip.agent_iteration??agent.iteration??0));
+  const projectIter=ip.project_progress_iteration??d.acceptance?.iteration??0;
+  ui.setText($('#iterationDetail'),'GameForge agent iteration '+(ip.agent_iteration??0)+' • latest build/test evidence iteration '+(ip.last_evidence_iteration??0)+(ip.unverified_iteration_gap?' • '+ip.unverified_iteration_gap+' started iteration(s) beyond last recorded evidence':'')+' • game/project progress iteration '+projectIter+' (independent numbering).');
+  ui.setText($('#agentMessage'),agent.message||agent.status||'idle');
+  renderLiveTask(agent,d.managed_process);
+  ui.setText($('#cvMessage'),d.cv?.message||d.cv?.status||'idle');
+  const settings={
+    agentTransport:c.agent?.transport||'auto',
+    agentCodexModel:c.agent?.model||'',
+    agentCodexEffort:c.agent?.effort||'',
+    agentAcpCommand:JSON.stringify(c.agent?.acp_command||[],null,2),
+    agentMcpServers:JSON.stringify(c.mcp_servers||[],null,2),
+    researchMode:c.research_mode||'deep',
+    internetResearch:!!c.internet_research,
+    cleanCmd:c.commands?.clean||'',buildCmd:c.commands?.build||'',
+    testCmd:c.commands?.test||'',launchCmd:c.commands?.launch||'',
+    monitorNum:c.visual?.monitor??1,freezeSeconds:c.visual?.freeze_seconds??8,
+    windowTitle:c.visual?.window_title||''
+  };
+  for(const [id,value] of Object.entries(settings))ui.setField($('#'+id),value);
+  renderAcceptance(d.acceptance);
+  renderUserReview(d.user_review);
+  renderUploads(d.uploads);
+  renderLiveQueue(d.live_queue,d.input_request,agent);
+  renderFusionRuntime(d.run_reports,d.fusion_manifest,d.game_inventory,d.fusion_deployment);
+  inputRequestPending=!!d.input_request;
+  renderInputRequest(d.input_request);
+  ui.setText($('#visualMetrics'),Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.');
+  const captureStamp=d.visual?.timestamp;
+  if(captureStamp){
+    const img=$('#capture');
+    img.hidden=false;
+    const key=projectId+':'+captureStamp;
+    if(lastCaptureKey!==key){
+      img.src=`/api/project/${encodeURIComponent(projectId)}/capture.jpg?t=${encodeURIComponent(captureStamp)}`;
+      lastCaptureKey=key;
+    }
+  }else{
+    $('#capture').hidden=true;
+    lastCaptureKey=null;
+  }
+ }catch(e){
+  if(projectId===current&&generation===projectGeneration)console.error('Dashboard refresh failed:',e);
+ }finally{
+  refreshInFlight=false;
+  if(refreshPending){refreshPending=false;void refreshState()}
+  else if(projectId===current&&generation===projectGeneration)startProjectPolling();
+ }
+}
 function activityAge(iso){
  if(!iso)return 'No activity yet';
  const ms=Date.now()-Date.parse(iso);if(!Number.isFinite(ms))return '';
