@@ -1876,6 +1876,7 @@ def run_codex_fusion_stream(
     transport_mode: str = "auto",
     mcp_servers: list[dict[str, Any]] | None = None,
     acp_command: list[str] | None = None,
+    model: str = "", effort: str = "",
 ) -> subprocess.CompletedProcess[str]:
     """Prefer a persistent, steerable Codex session; fall back only before work starts."""
     # Persist a safe transport downgrade across recovery attempts. A lost
@@ -1885,9 +1886,14 @@ def run_codex_fusion_stream(
     input_text = input_text.encode("utf-8", errors="replace").decode("utf-8")
     if transport_mode == "auto" and downgrade_path.exists():
         transport_mode = "exec"
+    codex_args = list(args)
+    if model and transport_mode != "acp":
+        codex_args[-1:-1] = ["--model", model]
+    if effort and transport_mode != "acp":
+        codex_args[-1:-1] = ["-c", f"model_reasoning_effort={effort}"]
     if transport_mode == "exec":
         return run_codex_agent_stream(
-            args, cwd=cwd, input_text=input_text, timeout=timeout,
+            codex_args, cwd=cwd, input_text=input_text, timeout=timeout,
             trace_path=trace_path, state=state,
         )
     if state.transport is None:
@@ -1905,6 +1911,7 @@ def run_codex_fusion_stream(
             state.transport = CodexAppServer(
                 command, shell=use_shell, cwd=cwd, env=_codex_process_env(),
                 permission_mode=permission_mode, mcp_servers=mcp_servers or [],
+                model=model, effort=effort,
                 on_event=lambda event: _fusion_codex_activity(state, event),
                 on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
             )
@@ -1920,7 +1927,7 @@ def run_codex_fusion_stream(
                            "App-server handshake unavailable; using the verified Codex exec path.", "fallback")
         auth_trace("codex_app_server_fallback", reason=str(exc)[:800])
         return run_codex_agent_stream(
-            args, cwd=cwd, input_text=input_text, timeout=timeout,
+            codex_args, cwd=cwd, input_text=input_text, timeout=timeout,
             trace_path=trace_path, state=state,
         )
     _bind_active_process(state, transport.process, "acp" if transport_mode == "acp" else "codex-app-server")
@@ -2784,6 +2791,8 @@ def agent_loop(project_id: str) -> None:
                     transport_mode=str(cfg.get("agent", {}).get("transport", "auto")),
                     mcp_servers=cfg.get("mcp_servers", []),
                     acp_command=cfg.get("agent", {}).get("acp_command", []),
+                    model=str(cfg.get("agent", {}).get("model", "") or ""),
+                    effort=str(cfg.get("agent", {}).get("effort", "") or ""),
                 )
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 if state.stop_event.is_set():
@@ -4522,13 +4531,19 @@ class Handler(SimpleHTTPRequestHandler):
                         continue
                     if k == "agent" and isinstance(v, dict):
                         existing = cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
-                        allowed_agent = {"transport", "permission_mode", "max_iterations", "cooldown_sec", "max_auto_recovery_attempts", "acp_command"}
+                        allowed_agent = {"transport", "permission_mode", "max_iterations", "cooldown_sec", "max_auto_recovery_attempts", "acp_command", "model", "effort"}
                         cfg["agent"] = {**existing, **{key: value for key, value in v.items() if key in allowed_agent}}
                         if cfg["agent"].get("transport") not in {"auto", "app-server", "exec", "acp"}:
                             return self.send_json({"error": "Unsupported agent transport"}, 400)
                         command = cfg["agent"].get("acp_command", [])
                         if not isinstance(command, list) or len(command) > 64 or any(not isinstance(x, str) or not x or len(x) > 2048 for x in command):
                             return self.send_json({"error": "ACP command must be a list of executable and arguments"}, 400)
+                        model = cfg["agent"].get("model", "")
+                        effort = cfg["agent"].get("effort", "")
+                        if not isinstance(model, str) or len(model) > 100 or (model and not re.fullmatch(r"[A-Za-z0-9._:/-]+", model)):
+                            return self.send_json({"error": "Invalid Codex model identifier"}, 400)
+                        if effort not in {"", "minimal", "low", "medium", "high", "xhigh"}:
+                            return self.send_json({"error": "Unsupported Codex effort"}, 400)
                     elif k == "mcp_servers":
                         try:
                             cfg[k] = validate_mcp_servers(v)
