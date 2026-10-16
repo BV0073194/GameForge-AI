@@ -1847,6 +1847,18 @@ def _fusion_agent_question(p: Path, state: AgentState, message: dict[str, Any]) 
 def _fusion_codex_activity(state: AgentState, event: dict[str, Any]) -> None:
     """Publish meaningful task transitions, not every token delta (disk/CPU hot path)."""
     method = str(event.get("method") or "")
+    if method == "session/update":
+        update = (event.get("params") or {}).get("update") or {}
+        if isinstance(update, dict):
+            kind = str(update.get("sessionUpdate") or "")
+            if kind in {"tool_call", "tool_call_update"}:
+                title = str(_auth_redact(str(update.get("title") or update.get("toolCallId") or "Agent tool call")))[:350]
+                set_agent_activity(state, "ACP tool activity", title, "command")
+            elif kind in {"agent_message_chunk", "agent_message"}:
+                state.last_activity_at = now_iso()
+            elif kind:
+                set_agent_activity(state, "ACP agent update", kind[:120], "agent")
+        return
     if method.endswith("/delta") or method.endswith("Delta"):
         state.last_activity_at = now_iso()
         return
@@ -1937,7 +1949,9 @@ def run_codex_fusion_stream(
             auth_trace("acp_protocol_failure", reason=str(exc)[:800])
         transport.close()
         state.transport = None
-        return subprocess.CompletedProcess(args, 1, "", f"Codex app-server protocol failed: {exc}; next iteration will use codex exec")
+        label = "ACP agent" if transport_mode == "acp" else "Codex app-server"
+        suffix = "" if transport_mode == "acp" else "; next iteration will use codex exec"
+        return subprocess.CompletedProcess(args, 1, "", f"{label} protocol failed: {exc}{suffix}")
     finally:
         req = load_user_input_request(cwd)
         if req and req.get("protocol") == "codex-app-server":
@@ -2106,7 +2120,7 @@ def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[di
     # claimed instructions. No user steering is ever discarded: at the start of
     # a fresh prompt build, return all unfinished claims to the queue first.
     for item in data.get("items", []):
-        if item.get("status") in {"in_progress", "awaiting_verification"}:
+        if item.get("status") == "in_progress":
             item["status"] = "queued"
             item["requeued_at"] = now_iso()
             item["requeue_reason"] = "unfinished user instruction requires verification"
@@ -2534,6 +2548,11 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     fast_pipeline = bool(pipeline.get("enabled"))
     review = load_user_review(p)
     live_inputs = claim_live_instructions(p, iteration)
+    # Previously sent instructions are STILL requirements until verified. Keep
+    # them in the prompt without starving newer queued instructions or
+    # misleadingly claiming them in every turn.
+    awaiting_live = live_queue_public(p).get("awaiting_verification", [])
+    live_inputs.extend(awaiting_live[:12])
     if fast_pipeline and pipeline.get("compact_context", True):
         compact = {
             "generated_at": now_iso(),
@@ -2557,14 +2576,22 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
         evidence = collect_logs(p, cfg)
     prior = ""
     if live_inputs:
-        prior += ("\\nIMPORTANT: Each live instruction is a persistent work order. Do not claim completion by merely reading it. "
-                  "After implementation and targeted tests, update .gameforge/live_instruction_results.json "
-                  "with {\\\"results\\\":[{\\\"id\\\":\\\"EXACT_ID\\\",\\\"ready_for_verification\\\":true,"
-                  "\\\"resolution\\\":\\\"what changed\\\",\\\"evidence\\\":\\\"specific test/runtime evidence\\\","
-                  "\\\"changed_paths\\\":[\\\"workspace/path-to-source\\\"]}]}. "
-                  "Only set ready_for_verification for truly implemented requests. The original configured "
-                  "full build and test still have to pass before GameForge marks an instruction verified. "
-                  "Otherwise leave it pending, and explain the blocker in iteration notes.\\n")
+        prior += """
+LIVE USER WORK-ORDER CONTRACT: Receiving a message or finishing a turn
+does NOT prove the work is implemented. Every listed instruction is
+persistent and takes priority over lower-value roadmap work. After making
+real project changes and targeted tests, update
+.gameforge/live_instruction_results.json using this exact JSON format:
+{"results":[{"id":"EXACT_LIVE_ID","ready_for_verification":true,
+"resolution":"Detailed description of what changed",
+"evidence":"Specific build, test and runtime evidence",
+"changed_paths":["workspace/real-source-file"]}]}
+Use the actual IDs from the queue. Keep unfinished entries pending and
+report genuine blockers in iteration notes. Never invent evidence, and
+never delete previous valid results. GameForge independently requires
+the originally configured full build and test to pass before it accepts
+a completion claim.
+"""
         prior += (
             "\nLIVE USER INSTRUCTIONS — THESE ARRIVED WHILE THE AGENT WAS RUNNING. "
             "Honor them before lower-priority roadmap work. If an instruction conflicts with an older plan, "
@@ -4532,7 +4559,7 @@ class Handler(SimpleHTTPRequestHandler):
                     data = load_live_queue(p)
                     changed = False
                     for item in data.get("items", []):
-                        if item.get("id") == item_id and item.get("status") == "queued":
+                        if item.get("id") == item_id and item.get("status") in {"queued", "awaiting_verification"}:
                             item["status"] = "cancelled"
                             item["cancelled_at"] = now_iso()
                             changed = True
