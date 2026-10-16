@@ -2390,6 +2390,33 @@ def reconcile_live_instruction_results(
     return {"implemented_ids": implemented_ids, "verified_ids": verified_ids,
             "gates_passed": gate_passed, "pending_count": remaining}
 
+
+def link_live_instruction_checkpoint(p: Path, iteration: int, base_revision: str, revision: str) -> None:
+    """Associate accepted implementation evidence with the actual Git revision."""
+    if not revision:
+        return
+    with LIVE_QUEUE_LOCK:
+        data = load_live_queue(p)
+        updated = False
+        for item in data.get("items", []):
+            if item.get("status") not in {"implemented", "verified"}:
+                continue
+            if int(item.get("implementation_iteration") or -1) != iteration:
+                continue
+            proof = item.get("verification_claim")
+            if not isinstance(proof, dict) or not proof.get("changed_paths"):
+                continue
+            if proof.get("git_checkpoint"):
+                continue
+            proof["git_checkpoint"] = revision
+            proof["git_diff_base"] = base_revision
+            _live_transition(item, item["status"], reason="Linked production change to Git checkpoint",
+                             iteration=iteration, details={"revision": revision[:12]})
+            updated = True
+        if updated:
+            save_live_queue(p, data)
+
+
 def user_input_request_path(p: Path) -> Path:
     return p / ".gameforge" / "user_input_request.json"
 
@@ -3274,13 +3301,15 @@ def agent_loop(project_id: str) -> None:
                     })
 
             if acceptance_is_complete(p, build_result, test_result) and live_verification["pending_count"] == 0:
-                git_checkpoint(p, f"GameForge verified completion iteration {iteration}")
+                checkpoint = git_checkpoint(p, f"GameForge verified completion iteration {iteration}")
+                link_live_instruction_checkpoint(p, iteration, pre_iteration_rev, str(checkpoint.get("rev") or ""))
                 state.status = "complete"
                 state.message = "Acceptance criteria are marked complete with evidence and configured build/tests pass."
                 set_agent_activity(state, "Project verified complete", state.message, "complete")
                 return
 
-            git_checkpoint(p, f"GameForge iteration {iteration} progress")
+            checkpoint = git_checkpoint(p, f"GameForge iteration {iteration} progress")
+            link_live_instruction_checkpoint(p, iteration, pre_iteration_rev, str(checkpoint.get("rev") or ""))
             state.last_update = now_iso()
             pending_live = live_verification["pending_count"]
             if pending_live or pending_feedback_count:
