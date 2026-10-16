@@ -2255,6 +2255,10 @@ def reconcile_live_instruction_results(
     gate_passed = all(bool(gate.get("configured")) and bool(gate.get("ok"))
                       for gate in (build_result, test_result))
     observed = set((change_summary or {}).get("production_paths") or [])
+    feedback_by_id = {
+        str(f.get("id")): f for f in load_user_review(p).get("feedback", [])
+        if isinstance(f, dict) and f.get("id")
+    }
     gate_evidence = {
         "iteration": iteration,
         "build": {"configured": bool(build_result.get("configured")),
@@ -2272,6 +2276,36 @@ def reconcile_live_instruction_results(
             if item.get("status") not in {"delivered_to_agent", "implemented"}:
                 continue
             claim = claims.get(item.get("id"))
+            linked_id = str((item.get("metadata") or {}).get("feedback_id") or "")
+            feedback = feedback_by_id.get(linked_id) if item.get("source") == "user-feedback" else None
+            if feedback and feedback.get("addressed") and gate_passed:
+                # User-review reconciliation already validated the linked
+                # feedback and the original full gates. Avoid demanding two
+                # independent completion claims for the exact same request.
+                if item.get("status") == "delivered_to_agent":
+                    paths = sorted(observed)
+                    item["verification_claim"] = {
+                        "resolution": str(feedback.get("resolution") or "")[:2500],
+                        "evidence": str(feedback.get("evidence") or "")[:3500],
+                        "changed_paths": paths,
+                        "tests": [],
+                        "linked_feedback_id": linked_id,
+                        "implemented_iteration": iteration,
+                        "source_change_verified": bool(paths),
+                    }
+                    item["implemented_at"] = now_iso()
+                    item["implementation_iteration"] = iteration
+                    _live_transition(item, "implemented", reason="Linked feedback completed and verified",
+                                     iteration=iteration, details={"feedback_id": linked_id, "changed_paths": paths})
+                    implemented_ids.append(item["id"])
+                item["last_full_gates"] = gate_evidence
+                _live_transition(item, "verified", reason="Linked user feedback passed full verification",
+                                 iteration=iteration, details={"feedback_id": linked_id})
+                item["verified_at"] = now_iso()
+                item["verification_iteration"] = iteration
+                item["verification_state"] = "Linked feedback verified by GameForge original full gates"
+                verified_ids.append(item["id"])
+                continue
             if item.get("status") == "delivered_to_agent":
                 if not claim or not claim.get("ready_for_verification"):
                     continue
@@ -3081,7 +3115,6 @@ def agent_loop(project_id: str) -> None:
                 set_agent_activity(state, "Stopped", state.message, "stopped")
                 return
 
-            live_verification = reconcile_live_instruction_results(p, iteration, build_result, test_result, change_summary)
             review_after_verification = reconcile_feedback_work_orders(
                 p,
                 review_before_iteration,
@@ -3089,6 +3122,7 @@ def agent_loop(project_id: str) -> None:
                 test_result,
                 verification_complete=True,
             )
+            live_verification = reconcile_live_instruction_results(p, iteration, build_result, test_result, change_summary)
             pending_feedback_count = sum(
                 1 for item in review_after_verification.get("feedback", [])
                 if isinstance(item, dict) and not bool(item.get("addressed"))
@@ -4922,6 +4956,15 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "Feedback cannot be empty"}, 400)
                 category = str(body.get("category", "general") or "general")[:80]
                 review = append_user_feedback(p, text_value, category)
+                # Feedback is a user work order, not merely historical review text.
+                # Give it a linked durable live ID and steer an active Codex turn
+                # when the transport supports that protocol. Otherwise queue it.
+                feedback_id = str(review.get("feedback", [])[-1].get("id") or "")
+                linked = enqueue_live_instruction(
+                    p, f"User feedback {feedback_id}: {text_value}",
+                    mode="queue", source="user-feedback",
+                    metadata={"feedback_id": feedback_id},
+                )
                 # New feedback means there is new work to do even if the user previously
                 # considered the project done.
                 if review.get("user_done"):
@@ -4929,6 +4972,13 @@ class Handler(SimpleHTTPRequestHandler):
                     review["reopened_at"] = now_iso()
                     save_user_review(p, review)
                 st = AGENTS.get(pid)
+                if st and st.transport and st.transport.active and not isinstance(st.transport, AcpAgentTransport):
+                    try:
+                        if st.transport.steer(linked["text"]):
+                            mark_live_instruction_steered(p, linked["id"])
+                            st.active_instruction_id = linked["id"]
+                    except AppServerProtocolError:
+                        pass  # Persistence/next-turn dispatch remains the fallback.
                 if st and st.status == "user-complete":
                     st.status = "paused"
                     st.message = "New user feedback received; ready to continue from the current state"
