@@ -220,32 +220,34 @@ async function sendLiveInstruction(mode){
  }catch(e){status.textContent=e.message}
 }
 function renderFusionRuntime(runReports,manifest,inventory,deployment){
- const box=$('#fusionRunReports');
- const pre=$('#fusionManifest');
- const inv=$('#fusionGameInventory');
- const dep=$('#fusionDeployStatus');
- if(pre)pre.textContent=manifest?JSON.stringify(manifest,null,2):'Fusion manifest not generated yet.';
- const depState=deployment?.state||{};
- const depCfg=deployment?.config||{};
+ const box=$('#fusionRunReports'),pre=$('#fusionManifest'),inv=$('#fusionGameInventory'),dep=$('#fusionDeployStatus');
+ if(pre)ui.setText(pre,manifest?JSON.stringify(manifest,null,2):'Fusion manifest not generated yet.');
+ const depState=deployment?.state||{},depCfg=deployment?.config||{};
  if(dep){
-   if(depState.status==='active')dep.textContent='Fusion deployment active • '+(depState.files?.length||0)+' file(s) installed into '+(depState.target_root||'target game')+'.';
-   else if(depState.status==='active-with-conflicts')dep.textContent='Restore has conflicts. GameForge left changed files untouched to avoid data loss.';
-   else if(depState.status==='restored')dep.textContent='Original game files restored.';
-   else if(deployment?.configured)dep.textContent='Fusion deployment ready for '+(depCfg.target_root||'configured target')+'.';
-   else dep.textContent='No Fusion deployment configured yet. The agent can create .gameforge/fusion_deploy.json when a mod needs reversible installation.';
+   let message='No Fusion deployment configured yet. The agent can create .gameforge/fusion_deploy.json when a mod needs reversible installation.';
+   if(depState.status==='active')message='Fusion deployment active • '+(depState.files?.length||0)+' file(s) installed into '+(depState.target_root||'target game')+'.';
+   else if(depState.status==='active-with-conflicts')message='Restore has conflicts. GameForge left changed files untouched to avoid data loss.';
+   else if(depState.status==='restored')message='Original game files restored.';
+   else if(deployment?.configured)message='Fusion deployment ready for '+(depCfg.target_root||'configured target')+'.';
+   ui.setText(dep,message);
  }
  if(inv){
    const games=(inventory?.games||[]).filter(g=>g.installed).slice(0,20);
-   inv.innerHTML=games.length?'<h4>Detected local games</h4>'+games.map(g=>'<div class="criterion"><strong>'+esc(g.name||'Game')+'</strong> — '+esc(g.store||'')+(g.build_id?' • build '+esc(g.build_id):'')+'<br><small>'+esc(g.install_path||'')+'</small></div>').join(''):'<p class="muted">No local game inventory yet. Scan installed games to let the agent target owned copies without redistributing game content.</p>';
+   const markup=games.length
+     ?'<h4>Detected local games</h4>'+games.map(g=>'<div class="criterion"><strong>'+esc(g.name||'Game')+'</strong> — '+esc(g.store||'')+(g.build_id?' • build '+esc(g.build_id):'')+'<br><small>'+esc(g.install_path||'')+'</small></div>').join('')
+     :'<p class="muted">No local game inventory yet. Scan installed games to let the agent target owned copies without redistributing game content.</p>';
+   ui.setHtml(inv,markup);
  }
  if(!box)return;
  const reports=(runReports?.reports||[]).slice(-8).reverse();
- if(!reports.length){box.innerHTML='<p class="muted">No managed game runs recorded yet.</p>';return}
- box.innerHTML='<h4>Recent local play/install outcomes</h4>'+reports.map(r=>{
-   const label=r.stopped_by_user?'Stopped by user':(r.worked?'Worked':'Failed');
-   const klass=r.worked?'pass':(r.stopped_by_user?'':'pending');
-   return '<div class="criterion '+klass+'"><strong>'+esc(label)+'</strong> — '+esc(r.command||'managed launch')+'<br><small>'+esc(r.finished_at||r.started_at||'')+(r.returncode!=null?' • exit '+esc(r.returncode):'')+(r.log?' • '+esc(r.log):'')+'</small></div>';
- }).join('');
+ const markup=reports.length
+   ?'<h4>Recent local play/install outcomes</h4>'+reports.map(r=>{
+      const label=r.stopped_by_user?'Stopped by user':(r.worked?'Worked':'Failed');
+      const klass=r.worked?'pass':(r.stopped_by_user?'':'pending');
+      return '<div class="criterion '+klass+'"><strong>'+esc(label)+'</strong> — '+esc(r.command||'managed launch')+'<br><small>'+esc(r.finished_at||r.started_at||'')+(r.returncode!=null?' • exit '+esc(r.returncode):'')+(r.log?' • '+esc(r.log):'')+'</small></div>';
+    }).join('')
+   :'<p class="muted">No managed game runs recorded yet.</p>';
+ ui.setHtml(box,markup);
 }
 function renderInputRequest(r){
  const box=$('#inputRequest');if(!r){box.hidden=true;inputRequestBusy=false;inputRequestPending=false;return}inputRequestPending=true;box.hidden=false;
