@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,18 @@ def iteration_snapshot(project: Path) -> dict[str, Any]:
     compact = _read(folder / "compact_state.json")
     delivery = _read(folder / "delivery_state.json")
     acceptance = _read(folder / "acceptance.json")
+    # A legacy installation may have archived/missed live_activity.json while
+    # keeping recent Codex traces. Treat their server-generated filenames as
+    # used iteration IDs, never as acceptance/project-progress iterations.
+    trace_iteration = 0
+    log_dir = project / "logs"
+    if log_dir.is_dir():
+        for trace in log_dir.glob("codex-iteration-*"):
+            match = re.fullmatch(r"codex-iteration-(\d+)\.(?:jsonl|final\.txt)", trace.name)
+            if match:
+                trace_iteration = max(trace_iteration, _number(match.group(1)))
     sources = {
+        "trace_files": trace_iteration,
         "durable_ledger": _number(ledger.get("iteration")),
         "live_activity": _number(live.get("iteration")),
         "compact_state": _number(compact.get("iteration")),
