@@ -2135,7 +2135,7 @@ def enqueue_live_instruction(
     source: str = "user",
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    text_value = str(text_value or "").strip()
+    text_value = str(text_value or "").strip().encode("utf-8", errors="replace").decode("utf-8")
     if not text_value:
         raise ValueError("Live instruction cannot be empty")
     if len(text_value) > 20000:
@@ -2366,7 +2366,12 @@ def reconcile_live_instruction_results(
                 changed = proof.get("changed_paths")
                 if not proof.get("source_change_verified") or not isinstance(changed, list) or not changed:
                     continue
-                if not all(isinstance(path, str) and safe_child(p, path).is_file() for path in changed):
+                try:
+                    sources_present = all(isinstance(path, str) and safe_child(p, path).is_file()
+                                          for path in changed)
+                except (OSError, ValueError):
+                    sources_present = False
+                if not sources_present:
                     item["verification_state"] = "Previously implemented source files are missing"
                     continue
                 item["last_full_gates"] = gate_evidence
@@ -2431,6 +2436,7 @@ def save_user_review(p: Path, data: dict[str, Any]) -> dict[str, Any]:
 def append_user_feedback(p: Path, text: str, category: str = "general") -> dict[str, Any]:
     review = load_user_review(p)
     feedback = review.setdefault("feedback", [])
+    text = text.encode("utf-8", errors="replace").decode("utf-8")
     feedback.append({
         "id": f"feedback-{int(time.time() * 1000)}",
         "created_at": now_iso(),
@@ -3203,7 +3209,7 @@ def agent_loop(project_id: str) -> None:
                         "timestamp": now_iso(), "reason": f"iteration-{iteration}", "errors": [str(exc)]
                     })
 
-            if acceptance_is_complete(p, build_result, test_result):
+            if acceptance_is_complete(p, build_result, test_result) and live_verification["pending_count"] == 0:
                 git_checkpoint(p, f"GameForge verified completion iteration {iteration}")
                 state.status = "complete"
                 state.message = "Acceptance criteria are marked complete with evidence and configured build/tests pass."
@@ -3212,8 +3218,12 @@ def agent_loop(project_id: str) -> None:
 
             git_checkpoint(p, f"GameForge iteration {iteration} progress")
             state.last_update = now_iso()
-            if pending_feedback_count:
-                state.message = f"Iteration {iteration} incomplete; {pending_feedback_count} user feedback work order(s) still pending"
+            pending_live = live_verification["pending_count"]
+            if pending_live or pending_feedback_count:
+                state.message = (
+                    f"Iteration {iteration} incomplete; {pending_live} live user instruction(s)"
+                    f" and {pending_feedback_count} feedback work order(s) remain unverified"
+                )
             else:
                 state.message = f"Iteration {iteration} incomplete; continuing after evidence/regression checks"
             set_agent_activity(state, "Preparing the next improvement pass", state.message, "loop")
@@ -4974,7 +4984,8 @@ class Handler(SimpleHTTPRequestHandler):
                 # when the transport supports that protocol. Otherwise queue it.
                 feedback_id = str(review.get("feedback", [])[-1].get("id") or "")
                 linked = enqueue_live_instruction(
-                    p, f"User feedback {feedback_id}: {text_value}",
+                    p, f"User feedback {feedback_id}: {text_value[:18000]} "
+                       f"Read the complete authoritative entry in .gameforge/user_review.json.",
                     mode="queue", source="user-feedback",
                     metadata={"feedback_id": feedback_id},
                 )
