@@ -2038,7 +2038,7 @@ def save_live_queue(p: Path, data: dict[str, Any]) -> dict[str, Any]:
     data["updated_at"] = now_iso()
     items = [x for x in data.get("items", []) if isinstance(x, dict)]
     pending = [x for x in items if x.get("status") in {"queued", "in_progress", "awaiting_verification"}]
-    recent = [x for x in items if x.get("status") not in {"queued", "in_progress"}][-200:]
+    recent = [x for x in items if x.get("status") not in {"queued", "in_progress", "awaiting_verification"}][-200:]
     data["items"] = sorted(pending + recent, key=lambda x: str(x.get("created_at", "")))
     write_json(live_queue_path(p), data)
     return data
