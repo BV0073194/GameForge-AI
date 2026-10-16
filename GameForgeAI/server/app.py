@@ -2749,9 +2749,9 @@ def update_delivery_state(p: Path, review: dict[str, Any], iteration: int, chang
         if isinstance(x, dict) and not bool(x.get("addressed")) and x.get("id")
     ]
     pending_ids = [str(x["id"]) for x in pending]
-    focus = str(state.get("focus_feedback_id") or "")
-    if focus not in pending_ids:
-        focus = pending_ids[0] if pending_ids else ""
+    # New user feedback supersedes stale roadmap focus. Entry order, unlike
+    # second-resolution timestamps, preserves submission precedence.
+    focus = pending_ids[-1] if pending_ids else ""
 
     diagnostic_only = bool(change_summary.get("diagnostic_only"))
     production_changed = bool(change_summary.get("production_changed"))
@@ -2782,9 +2782,9 @@ def delivery_state_for_prompt(p: Path, review: dict[str, Any]) -> dict[str, Any]
         if isinstance(x, dict) and not bool(x.get("addressed")) and x.get("id")
     ]
     pending_ids = [str(x["id"]) for x in pending]
-    focus = str(state.get("focus_feedback_id") or "")
-    if focus not in pending_ids:
-        focus = pending_ids[0] if pending_ids else ""
+    # New user feedback supersedes stale roadmap focus. Entry order, unlike
+    # second-resolution timestamps, preserves submission precedence.
+    focus = pending_ids[-1] if pending_ids else ""
     state["focus_feedback_id"] = focus
     state["pending_feedback_ids"] = pending_ids
     state["delivery_enforcement"] = bool(
@@ -2914,7 +2914,7 @@ a completion claim.
               " work order pending.\n"
         )
     elif pending_feedback:
-        latest = max(pending_feedback, key=lambda x: str(x.get("created_at") or ""))
+        latest = pending_feedback[-1]
         focus_directive = (
             "\n\nMANDATORY CURRENT USER FEEDBACK (priority over roadmap/research):\n"
             + json.dumps({"id": latest.get("id"), "text": latest.get("text")},
