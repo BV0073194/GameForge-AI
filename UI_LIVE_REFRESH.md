@@ -8,8 +8,11 @@ for input, but **refreshing no longer destroys what the user is doing**.
 - **Single-flight state polling:** the dashboard allows only one project-state
   request at once. It schedules the next refresh after the previous one finishes
   (approximately every two seconds when visible, eight seconds when hidden).
-  Late responses from an older selected project are discarded. The desktop
-  backend/session heartbeat is independent from these UI paint updates.
+  Late responses from an older selected project are discarded, and obsolete
+  requests are aborted immediately when switching projects. A 15-second
+  request deadline also prevents hung network operations from permanently
+  stopping UI updates. The desktop backend/session heartbeat is independent
+  from these UI paint updates.
 - **Incremental rendering:** dynamic panels replace their DOM **only when their
   content has actually changed**. Changing a status or updating a log does not
   rebuild the rest of the page.
