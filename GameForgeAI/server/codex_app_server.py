@@ -188,9 +188,9 @@ class CodexAppServer:
             if not self.thread_id:
                 params: dict[str, Any] = {"cwd": str(self.cwd)}
                 if self.permission_mode == "full-auto":
-                    params.update({"approvalPolicy": "never", "sandbox": "dangerFullAccess"})
+                    params.update({"approvalPolicy": "never", "sandbox": "danger-full-access"})
                 else:
-                    params["sandbox"] = "workspaceWrite"
+                    params["sandbox"] = "workspace-write"
                 result = self._request("thread/start", params, timeout=12)
                 self.thread_id = (result.get("thread") or {}).get("id")
             if not self.thread_id:
