@@ -9,7 +9,7 @@ import json
 import os
 import re
 import subprocess
-from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 # This code executes *inside* the selected WSL distro using python3 -c.
@@ -83,7 +83,7 @@ def cleanup_wsl_project(
     if not isinstance(root, str) or not root.startswith("/") or "\x00" in root:
         report["errors"].append("WSL project root must be an absolute Linux path")
         return report
-    if ".." in Path(root).parts or root in ("/", "/home", "/mnt", "/tmp", "/var", "/opt", "/usr"):
+    if ".." in PurePosixPath(root).parts or root in ("/", "/home", "/mnt", "/tmp", "/var", "/opt", "/usr"):
         report["errors"].append("WSL root is too broad or contains traversal")
         return report
     if distro and not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", distro):
