@@ -250,11 +250,29 @@ function renderFusionRuntime(runReports,manifest,inventory,deployment){
  ui.setHtml(box,markup);
 }
 function renderInputRequest(r){
- const box=$('#inputRequest');if(!r){box.hidden=true;inputRequestBusy=false;inputRequestPending=false;return}inputRequestPending=true;box.hidden=false;
- $('#inputRequestTitle').textContent=r.title||'GameForge needs input';
- $('#inputRequestMessage').textContent=r.message||'The agent needs additional input.';
- $('#inputRequestWhy').textContent=r.why_user_required||'';
- const c=$('#inputRequestControl');c.innerHTML='';
+ const box=$('#inputRequest');
+ if(!r){
+   if(lastInputRequestKey!==null){box.hidden=true;$('#inputRequestControl').replaceChildren();lastInputRequestKey=null}
+   inputRequestBusy=false;inputRequestPending=false;
+   return;
+ }
+ inputRequestPending=true;box.hidden=false;
+ ui.setText($('#inputRequestTitle'),r.title||'GameForge needs input');
+ ui.setText($('#inputRequestMessage'),r.message||'The agent needs additional input.');
+ ui.setText($('#inputRequestWhy'),r.why_user_required||'');
+ // Do not recreate a text box, native select or file input on every poll.
+ // Its input value, focus, file selection and caret remain attached to the
+ // *same* DOM nodes for the lifetime of this agent question.
+ const signature=JSON.stringify({
+   id:r.id,kind:r.kind,protocol:r.protocol,rpc_request_id:r.rpc_request_id,
+   questions:r.questions,choices:r.choices,requested_schema:r.requested_schema,
+   accept_extensions:r.accept_extensions,placeholder:r.placeholder
+ });
+ if(signature===lastInputRequestKey)return;
+ const c=$('#inputRequestControl');
+ if(c.contains(document.activeElement)||ui.hasSelectionInside(c))return;
+ lastInputRequestKey=signature;
+ c.replaceChildren();
  if(r.protocol==='codex-app-server'&&Array.isArray(r.questions)&&r.questions.length){
    const controls=[];
    for(const q of r.questions){
