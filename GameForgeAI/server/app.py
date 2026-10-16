@@ -2547,12 +2547,11 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     pipeline = iteration_pipeline_settings(cfg)
     fast_pipeline = bool(pipeline.get("enabled"))
     review = load_user_review(p)
-    live_inputs = claim_live_instructions(p, iteration)
-    # Previously sent instructions are STILL requirements until verified. Keep
-    # them in the prompt without starving newer queued instructions or
-    # misleadingly claiming them in every turn.
+    newly_claimed_live = claim_live_instructions(p, iteration)
+    # Previously delivered but unverified work remains active. Put new requests
+    # last so prompt-tail context truncation never preferentially loses them.
     awaiting_live = live_queue_public(p).get("awaiting_verification", [])
-    live_inputs.extend(awaiting_live[:12])
+    live_inputs = awaiting_live[:12] + newly_claimed_live
     if fast_pipeline and pipeline.get("compact_context", True):
         compact = {
             "generated_at": now_iso(),
