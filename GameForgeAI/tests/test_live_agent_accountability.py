@@ -60,6 +60,16 @@ class IterationLedgerTests(unittest.TestCase):
         self.assertEqual(sorted(ids), list(range(76, 101)))
         self.assertEqual(iteration_snapshot(self.p)["agent_iteration"], 100)
 
+    def test_legacy_trace_names_reserve_without_replaying_failed_turns(self):
+        self.seed()
+        logs = self.p / "logs"
+        logs.mkdir()
+        (logs / "codex-iteration-0081.jsonl").write_text("", encoding="utf-8")
+        (logs / "codex-iteration-0080.final.txt").write_text("failed", encoding="utf-8")
+        (logs / "codex-iteration-not-valid.jsonl").write_text("", encoding="utf-8")
+        self.assertEqual(iteration_snapshot(self.p)["agent_iteration"], 81)
+        self.assertEqual(reserve_iteration(self.p), 82)
+
     def test_malformed_legacy_snapshots_cannot_reset_or_jump(self):
         folder = self.p / ".gameforge"
         (folder / "acceptance.json").write_text('{"iteration": 99999999}', encoding="utf-8")
