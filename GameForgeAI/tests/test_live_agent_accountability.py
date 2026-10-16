@@ -197,6 +197,37 @@ class LiveWorkOrderTests(unittest.TestCase):
         self.assertIn(old["id"], prompt)
         self.assertEqual(app.live_queue_public(self.p)["focus_id"], new["id"])
 
+    def test_feedback_inbox_recovers_stale_agent_overwrite(self):
+        submitted = app.append_user_feedback(self.p, "User asked for a full rifle mod.", "gameplay")
+        original = submitted["feedback"][-1]
+        self.assertTrue(app.user_feedback_inbox_path(self.p).exists())
+        # Model writes an obsolete snapshot, accidentally deleting the user entry.
+        app.write_json(app.user_review_path(self.p), {"user_done": False, "feedback": []})
+        recovered = app.load_user_review(self.p)["feedback"]
+        self.assertEqual(len(recovered), 1)
+        self.assertEqual(recovered[0]["id"], original["id"])
+        self.assertEqual(recovered[0]["text"], original["text"])
+        self.assertFalse(recovered[0]["addressed"])
+        # Even if the model rewrites the wording, the stored original wins.
+        recovered[0]["text"] = "The model replaced the user's request"
+        app.save_user_review(self.p, {"feedback": recovered})
+        self.assertEqual(app.load_user_review(self.p)["feedback"][0]["text"], original["text"])
+
+    def test_parallel_feedback_submission_keeps_every_message(self):
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            results = list(executor.map(
+                lambda i: app.append_user_feedback(self.p, f"User request number {i}", "gameplay"),
+                range(40),
+            ))
+        self.assertEqual(len(results), 40)
+        final = app.load_user_review(self.p)["feedback"]
+        self.assertEqual(len(final), 40)
+        self.assertEqual(len({x["id"] for x in final}), 40)
+        self.assertEqual({x["text"] for x in final},
+                         {f"User request number {i}" for i in range(40)})
+        app.write_json(app.user_review_path(self.p), {"feedback": []})
+        self.assertEqual(len(app.load_user_review(self.p)["feedback"]), 40)
+
     def test_linked_feedback_cannot_be_falsely_closed(self):
         item = app.enqueue_live_instruction(self.p, "Use original user feedback",
             source="user-feedback", metadata={"feedback_id": "feedback-test"})
