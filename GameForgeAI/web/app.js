@@ -115,8 +115,8 @@ function liveStateLabel(status){
 function renderLiveTask(agent,managed){
  lastLiveAgent=agent;lastManagedProcess=managed;
  const a=agent?.activity||{};
- $('#liveTaskState').textContent=liveStateLabel(agent?.status||'idle');
- $('#liveTaskAge').textContent=activityAge(a.last_activity_at||agent?.last_update);
+ ui.setText($('#liveTaskState'),liveStateLabel(agent?.status||'idle'));
+ ui.setText($('#liveTaskAge'),activityAge(a.last_activity_at||agent?.last_update));
  const title=a.task||((agent?.status==='running')?'Working…':'Nothing is running right now.');
  ui.setHtml($('#liveTaskTitle'),'<strong>'+esc(title)+'</strong>');
  let detail=a.detail||agent?.message||'Start or resume the autonomous developer to see what GameForge is doing on the computer.';
@@ -468,7 +468,29 @@ $('#cleanupArtifacts').onclick=async()=>{
  }catch(e){$('#runOutput').textContent=e.message}
 };
 $('#checkpoint').onclick=async()=>{try{const r=await postAction('git/checkpoint',{message:'GameForge manual checkpoint'});$('#runOutput').textContent=JSON.stringify(r,null,2)}catch(e){alert(e.message)}};
-$('#saveSettings').onclick=async()=>{try{const acp=JSON.parse($('#agentAcpCommand').value||'[]');const mcp=JSON.parse($('#agentMcpServers').value||'[]');await postAction('config',{research_mode:$('#researchMode').value,internet_research:$('#internetResearch').checked,agent:{transport:$('#agentTransport').value,acp_command:acp,model:$('#agentCodexModel').value.trim(),effort:$('#agentCodexEffort').value},mcp_servers:mcp,commands:{clean:$('#cleanCmd').value,build:$('#buildCmd').value,test:$('#testCmd').value,launch:$('#launchCmd').value},visual:{monitor:Number($('#monitorNum').value)||1,interval_sec:1,freeze_seconds:Number($('#freezeSeconds').value)||8,black_mean_threshold:8,region:null,window_title:$('#windowTitle').value}});await refreshState();alert('Saved')}catch(e){alert(e.message)}};
+$('#saveSettings').onclick=async()=>{
+ const settingsSnapshot=Object.fromEntries(SETTING_IDS.filter(id=>id!=='userSatisfaction').map(id=>{
+   const field=$('#'+id);return [id,field.type==='checkbox'?Boolean(field.checked):field.value];
+ }));
+ try{
+   const acp=JSON.parse($('#agentAcpCommand').value||'[]');
+   const mcp=JSON.parse($('#agentMcpServers').value||'[]');
+   await postAction('config',{
+     research_mode:$('#researchMode').value,internet_research:$('#internetResearch').checked,
+     agent:{transport:$('#agentTransport').value,acp_command:acp,
+            model:$('#agentCodexModel').value.trim(),effort:$('#agentCodexEffort').value},
+     mcp_servers:mcp,
+     commands:{clean:$('#cleanCmd').value,build:$('#buildCmd').value,
+               test:$('#testCmd').value,launch:$('#launchCmd').value},
+     visual:{monitor:Number($('#monitorNum').value)||1,interval_sec:1,
+             freeze_seconds:Number($('#freezeSeconds').value)||8,
+             black_mean_threshold:8,region:null,window_title:$('#windowTitle').value}
+   });
+   ui.markSaved(settingsSnapshot);
+   await refreshState();
+   alert('Saved');
+ }catch(e){alert(e.message)}
+};
 $('#submitFeedback').onclick=async()=>{
  if(!current)return;
  const textValue=$('#userFeedback').value.trim();
@@ -487,7 +509,9 @@ $('#submitFeedback').onclick=async()=>{
 $('#userSatisfaction').onchange=async()=>{
  if(!current)return;
  try{
-   const review=await postAction('review/satisfaction',{value:$('#userSatisfaction').value});
+   const submitted=$('#userSatisfaction').value;
+   const review=await postAction('review/satisfaction',{value:submitted});
+   ui.markSaved({userSatisfaction:submitted});
    renderUserReview(review);
  }catch(e){alert(e.message)}
 };
@@ -522,7 +546,22 @@ $('#liveInstruction').addEventListener('keydown',e=>{
 });
 $('#scanUploads').onclick=async()=>{try{const r=await postAction('uploads/scan');renderUploads(r)}catch(e){alert(e.message)}};
 $('#uploadBtn').onclick=async()=>{if(!current)return;const files=[...$('#uploadFiles').files];if(!files.length)return alert('Select files.');const cat=$('#uploadCategory').value;for(let i=0;i<files.length;i++){const f=files[i];$('#uploadStatus').textContent=`Uploading ${i+1}/${files.length}: ${f.name}`;const r=await fetch(`/api/project/${current}/upload?category=${encodeURIComponent(cat)}&path=${encodeURIComponent(f.webkitRelativePath||f.name)}`,{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':f.name},body:f});if(!r.ok)throw new Error(await r.text())}$('#uploadStatus').textContent='Upload complete. Scanning…';const m=await postAction('uploads/scan');renderUploads(m);$('#uploadStatus').textContent='Upload intake complete.'};
-$('#refreshLogs').onclick=async()=>{if(!current)return;try{const d=await api(`/api/project/${current}/logs`);$('#logs').innerHTML=d.files.map(f=>`<details class="logbox"><summary>${esc(f.name)}</summary><pre>${esc(f.text)}</pre></details>`).join('')||'<p>No logs yet.</p>'}catch(e){alert(e.message)}};
+$('#refreshLogs').onclick=async()=>{if(!current)return;try{const d=await api(`/api/project/${current}/logs`);ui.setHtml($('#logs'),d.files.map(f=>`<details class="logbox" data-preserve-key="log-${esc(f.name)}"><summary>${esc(f.name)}</summary><pre data-preserve-scroll="log-${esc(f.name)}">${esc(f.text)}</pre></details>`).join('')||'<p>No logs yet.</p>',{force:true})}catch(e){alert(e.message)}};
+document.addEventListener('click',async event=>{
+ const button=event.target?.closest?.('[data-copy-target]');
+ if(!button)return;
+ const source=$(button.dataset.copyTarget);
+ if(!source)return;
+ const label=button.textContent;
+ try{
+   await ui.copyText(source.innerText||source.textContent||'');
+   button.textContent='Copied!';
+ }catch(error){
+   button.textContent='Copy failed';
+   console.error('Clipboard copy failed:',error);
+ }
+ setTimeout(()=>{if(button.isConnected)button.textContent=label},1400);
+});
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));b.classList.add('active');$('#tab-'+b.dataset.tab).classList.add('active')});
 loadSystem();
 const requestedProject=new URLSearchParams(location.search).get('project');
