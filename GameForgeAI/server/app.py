@@ -31,6 +31,7 @@ from server.codex_app_server import CodexAppServer, AppServerUnavailable, AppSer
 from server.acp_transport import AcpAgentTransport
 from server.fusion_mcp import validate_mcp_servers, public_mcp_servers
 from server.wsl_cleanup import cleanup_wsl_project
+from server.iteration_state import iteration_snapshot, reserve_iteration, finish_iteration
 
 def _resource_root() -> Path:
     # PyInstaller one-file/one-dir extracts bundled resources to sys._MEIPASS.
@@ -2701,6 +2702,7 @@ def agent_loop(project_id: str) -> None:
     recovery_context: dict[str, Any] | None = None
     auth_verified_at = 0.0
     build_result = test_result = None
+    reserved_iteration: int | None = None
     state.status = "running"
     state.started_at = now_iso()
     state.message = "Starting autonomous game-development loop"
@@ -2741,13 +2743,15 @@ def agent_loop(project_id: str) -> None:
                     return
                 auth_verified_at = time.monotonic()
 
-            state.iteration += 1
-            if max_iter and state.iteration > max_iter:
+            # Reserve a durable ID before any checkpoint/prompt/tool is started.
+            # Evidence may lag after interrupted or failed turns; never reuse IDs.
+            reserved_iteration = reserve_iteration(p, maximum=max_iter)
+            if reserved_iteration is None:
                 state.status = "paused"
                 state.message = f"Reached configured max_iterations={max_iter}"
                 return
-
-            iteration = state.iteration
+            state.iteration = reserved_iteration
+            iteration = reserved_iteration
             state.last_update = now_iso()
             state.message = f"Iteration {iteration}: checkpointing and asking Codex to improve the playable result"
             set_agent_activity(state, "Saving a safety checkpoint", f"Creating the pre-iteration Git checkpoint for iteration {iteration}.", "checkpoint")
@@ -3001,6 +3005,7 @@ def agent_loop(project_id: str) -> None:
                 "delivery_state": delivery_state,
             }
             write_json(p / ".gameforge/last_evidence.json", evidence)
+            finish_iteration(p, iteration, "tested")
             try:
                 fusion_manifest(p, cfg, persist=True)
             except Exception:
@@ -3047,6 +3052,11 @@ def agent_loop(project_id: str) -> None:
         state.status = "error"
         state.message = f"{exc}\n{traceback.format_exc()[-4000:]}"
     finally:
+        if reserved_iteration is not None and state.status in {"error", "blocked", "stopped", "paused", "complete"}:
+            finish_iteration(p, reserved_iteration, {
+                "error": "failed", "blocked": "blocked", "stopped": "stopped",
+                "paused": "paused", "complete": "complete",
+            }[state.status])
         if state.transport is not None:
             state.transport.close()
             state.transport = None
@@ -3065,7 +3075,7 @@ def start_agent(project_id: str) -> dict[str, Any]:
         if existing and existing.thread and existing.thread.is_alive():
             existing.pause_event.clear()
             return agent_public(existing)
-        persisted_iteration = int((read_json(p / ".gameforge" / "last_evidence.json", {}) or {}).get("iteration", 0) or 0)
+        persisted_iteration = iteration_snapshot(p)["agent_iteration"]
         resume_iteration = max(persisted_iteration, existing.iteration if existing else 0)
         state = AgentState(project_id=project_id, iteration=resume_iteration,
                            configured_transport=str(cfg.get("agent", {}).get("transport", "auto")))
@@ -4411,7 +4421,7 @@ class Handler(SimpleHTTPRequestHandler):
                     cfg["id"] = pid
                     cfg["project_root"] = str(d.resolve())
                     cfg["gfai_files"] = [x.name for x in d.glob("*.gfai")]
-                    cfg["agent_status"] = agent_public(st) if st else {"status": "idle", "iteration": 0, "message": ""}
+                    cfg["agent_status"] = agent_public(st) if st else {"status": "idle", "iteration": iteration_snapshot(d)["agent_iteration"], "message": ""}
                     cfg["acceptance"] = read_json(d / ".gameforge/acceptance.json", {})
                     projects.append(cfg)
                 return self.send_json({"projects": projects})
@@ -4427,7 +4437,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "user_review": load_user_review(p),
                     "evidence": read_json(p / ".gameforge/last_evidence.json", {}),
                     "uploads": read_json(p / ".gameforge/upload_manifest.json", {"count": 0, "items": []}),
-                    "agent": agent_public(st) if st else {"status":"idle","iteration":0,"message":""},
+                    "agent": agent_public(st) if st else {"status":"idle","iteration":iteration_snapshot(p)["agent_iteration"],"message":""},
+                    "iteration_progress": iteration_snapshot(p),
                     "input_request": load_user_input_request(p),
                     "cv": {"status": cv.status, "message": cv.message} if cv else {"status":"idle","message":""},
                     "visual": read_json(p / "captures/metrics.json", {}),
