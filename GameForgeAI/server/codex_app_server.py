@@ -153,7 +153,7 @@ class CodexAppServer:
         kwargs: dict[str, Any] = {
             "cwd": str(self.cwd), "shell": self.shell, "env": self.env,
             "stdin": subprocess.PIPE, "stdout": subprocess.PIPE,
-            "stderr": subprocess.PIPE, "text": True, "errors": "replace",
+            "stderr": subprocess.PIPE, "text": True, "encoding": "utf-8", "errors": "replace",
             "bufsize": 1,
         }
         if os.name == "nt":
@@ -235,6 +235,7 @@ class CodexAppServer:
     ) -> subprocess.CompletedProcess[str]:
         self.open()
         assert self.thread_id
+        prompt = prompt.encode("utf-8", errors="replace").decode("utf-8")
         response = self._request("turn/start", {
             "threadId": self.thread_id, "input": [{"type": "text", "text": prompt}],
         }, timeout=20)
