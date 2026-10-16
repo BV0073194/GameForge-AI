@@ -118,13 +118,13 @@ function renderLiveTask(agent,managed){
  $('#liveTaskState').textContent=liveStateLabel(agent?.status||'idle');
  $('#liveTaskAge').textContent=activityAge(a.last_activity_at||agent?.last_update);
  const title=a.task||((agent?.status==='running')?'Working…':'Nothing is running right now.');
- $('#liveTaskTitle').innerHTML='<strong>'+esc(title)+'</strong>';
+ ui.setHtml($('#liveTaskTitle'),'<strong>'+esc(title)+'</strong>');
  let detail=a.detail||agent?.message||'Start or resume the autonomous developer to see what GameForge is doing on the computer.';
  if(managed?.running){
    const proc='Managed process active'+(managed.pid?' • PID '+managed.pid:'')+(managed.command?'\n'+managed.command:'');
    detail=detail+'\n\n'+proc;
  }
- $('#liveTaskDetail').textContent=detail;
+ ui.setText($('#liveTaskDetail'),detail);
  const all=(a.history||[]).slice().reverse();
  const shown=all.slice(0,activityVisibleCount);
  let html=shown.length
@@ -137,7 +137,7 @@ function renderLiveTask(agent,managed){
    if(activityVisibleCount>5)html+='<button id="collapseActivity">Collapse to latest 5</button>';
    html+='</div>';
  }
- $('#liveTaskHistory').innerHTML=html;
+ ui.setHtml($('#liveTaskHistory'),html);
  const more=$('#showMoreActivity');if(more)more.onclick=()=>{activityVisibleCount=Math.min(all.length,activityVisibleCount+5);renderLiveTask(lastLiveAgent,lastManagedProcess)};
  const collapse=$('#collapseActivity');if(collapse)collapse.onclick=()=>{activityVisibleCount=5;renderLiveTask(lastLiveAgent,lastManagedProcess);$('#liveTaskHistory').scrollIntoView({block:'nearest'})};
 }
@@ -152,16 +152,16 @@ function renderLiveQueue(q,question,agent){
  const selected=(activeRun?all.find(x=>x.id===agent?.active_instruction_id):null)
     ||all.find(x=>x.id===q.focus_id)||q.focus;
  const focused=$('#liveTaskFocus');
- if(focused)focused.textContent=selected
+ if(focused)ui.setText(focused,selected
     ? 'Current user work order: '+(selected.text||'').slice(0,450)+' • '+(selected.status||'queued')+' • '+(selected.id||'')
-    : 'No user work order currently assigned; following the project plan.';
+    : 'No user work order currently assigned; following the project plan.');
  const parts=[];
  if(active.length)parts.push(active.length+' assigned');
  if(queued.length)parts.push(queued.length+' queued');
  if(delivered.length)parts.push(delivered.length+' delivered but not implemented');
  if(implemented.length)parts.push(implemented.length+' implemented, awaiting full verification');
  if(question)parts.push('waiting for your answer');
- status.textContent=parts.join(' • ')||(agent?.status==='running'?'Agent running; no pending live requests.':'No pending work orders.');
+ ui.setText(status,parts.join(' • ')||(agent?.status==='running'?'Agent running; no pending live requests.':'No pending work orders.'));
  const renderItem=(x,kind,canCancel)=>{
    const focus=x.id===q.focus_id||x.id===agent?.active_instruction_id;
    const claim=x.verification_claim||{};
@@ -183,7 +183,7 @@ function renderLiveQueue(q,question,agent){
    if(tests.length)body+='<p><strong>Agent-reported targeted tests:</strong></p><ul>'+tests.map(t=>'<li>'+esc(t.name||'Test')+' — '+esc(t.status||'unknown')+(t.log_path?' • '+esc(t.log_path):'')+'</li>').join('')+'</ul>';
    if(gates.iteration)body+='<p><strong>GameForge full gates (iteration '+esc(gates.iteration)+'):</strong> build '+(gates.build?.passed?'passed':gates.build?.configured?'failed':'not configured')+(gates.build?.log_path?' — '+esc(gates.build.log_path):'')+'; regression '+(gates.test?.passed?'passed':gates.test?.configured?'failed':'not configured')+(gates.test?.log_path?' — '+esc(gates.test.log_path):'')+'</p>';
    if(history.length)body+='<p><strong>Status history:</strong></p><ol>'+history.map(h=>'<li>'+esc(h.at||'')+' — '+esc((h.from||'received')+' → '+(h.status||''))+(h.iteration!=null?' (agent iteration '+esc(h.iteration)+')':'')+(h.reason?' • '+esc(h.reason):'')+'</li>').join('')+'</ol>';
-   const expand=body?'<details><summary>View changes, tests and status timeline</summary>'+body+'</details>':'';
+   const expand=body?'<details data-preserve-key="work-'+esc(x.id||'')+'"><summary>View changes, tests and status timeline</summary>'+body+'</details>':'';
    const cancel=canCancel?'<div class="actions"><button class="cancelLiveInstruction" data-live-id="'+esc(x.id||'')+'">Cancel request</button></div>':'';
    const className=state==='verified'?'criterion pass':'criterion pending';
    return '<div class="'+className+'">'+headline+'<br><small>'+minor+'</small>'+ (x.verification_state?'<p class="tiny">'+esc(x.verification_state)+'</p>':'')+expand+cancel+'</div>';
@@ -200,7 +200,7 @@ function renderLiveQueue(q,question,agent){
    if(entries.length)html+='<h4>'+esc(label)+'</h4>'+entries.slice(0,max).map(x=>renderItem(x,kind,canCancel)).join('');
    if(entries.length>max)html+='<p class="tiny">Showing '+max+' of '+entries.length+'; remaining records are retained in the project queue.</p>';
  }
- box.innerHTML=html||'<p class="muted">No live instruction work orders.</p>';
+ ui.setHtml(box,html||'<p class="muted">No live instruction work orders.</p>');
  box.querySelectorAll('.cancelLiveInstruction').forEach(b=>b.onclick=async()=>{
    try{await postAction('live/cancel',{id:b.dataset.liveId});await refreshState()}catch(e){alert(e.message)}
  });
