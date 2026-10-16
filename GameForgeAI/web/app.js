@@ -1,13 +1,13 @@
 const $=s=>document.querySelector(s);let current=null;let pollTimer=null;let inputRequestBusy=false;let inputRequestDirty=false;let inputRequestPending=false;let acceptanceVisibleCount=5;let activityVisibleCount=5;let lastAcceptance=null;let lastLiveAgent=null;let lastManagedProcess=null;
 function stopProjectPolling(){if(pollTimer){clearInterval(pollTimer);pollTimer=null}}
-function startProjectPolling(){if(current&&!inputRequestPending&&!pollTimer)pollTimer=setInterval(refreshState,1800)}
+function startProjectPolling(){if(current&&!pollTimer)pollTimer=setInterval(refreshState,1800)}
 async function api(path,opts={}){const r=await fetch(path,{headers:{'Content-Type':'application/json',...(opts.headers||{})},...opts});const t=await r.text();let data;try{data=JSON.parse(t)}catch{data={error:t}}if(!r.ok)throw new Error(data.error||r.statusText);return data}
 function badge(text,ok){return `<span class="badge" style="border-color:${ok?'#3c8':'#a66'}">${text}</span>`}
 async function loadSystem(){try{const s=await api('/api/status');const codexText=s.codex?`Codex ${s.codex_version||''}`:(s.codex_installing?'Codex installing…':'Codex unavailable');$('#systemBadges').innerHTML=badge(`Python ${s.python}`,true)+badge(s.git?'Git':'Git missing',s.git)+badge(codexText,s.codex)+badge(s.opencv&&s.mss?'OpenCV ready':'OpenCV deps missing',s.opencv&&s.mss);const auth=!!s.codex_auth?.authenticated;const loggingIn=!!s.codex_login_in_progress;$('#codexLogin').hidden=auth;$('#codexLogout').hidden=!auth;$('#codexLogin').disabled=loggingIn||s.codex_installing;$('#saveLogin').disabled=auth||loggingIn;$('#codexLogin').textContent=loggingIn?'Signing in…':'Sign in with ChatGPT';$('#codexAuthMessage').textContent=auth?'Authenticated':(loggingIn?(s.codex_login_message||'Complete sign-in in your browser…'):(s.codex_install_error||s.codex_login_message||s.codex_auth?.message||s.codex_install_message||'Sign in required'));}catch(e){$('#systemBadges').textContent=e.message}}
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function selectProject(id){stopProjectPolling();current=id;inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;acceptanceVisibleCount=5;activityVisibleCount=5;lastAcceptance=null;lastLiveAgent=null;lastManagedProcess=null;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();startProjectPolling()}
-async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status}`;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#cleanCmd').value=c.commands?.clean||'';$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);renderLiveQueue(d.live_queue,d.input_request,d.agent);renderFusionRuntime(d.run_reports,d.fusion_manifest,d.game_inventory,d.fusion_deployment);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);if(inputRequestPending)stopProjectPolling();else startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status} • ${d.agent.transport||'exec'}`;$('#steerLiveInstruction').disabled=!d.agent.steering_available;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#agentTransport').value=c.agent?.transport||'auto';$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#cleanCmd').value=c.commands?.clean||'';$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);renderLiveQueue(d.live_queue,d.input_request,d.agent);renderFusionRuntime(d.run_reports,d.fusion_manifest,d.game_inventory,d.fusion_deployment);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
 function activityAge(iso){
  if(!iso)return 'No activity yet';
  const ms=Date.now()-Date.parse(iso);if(!Number.isFinite(ms))return '';
@@ -87,14 +87,15 @@ function renderLiveQueue(q,question,agent){
  });
 }
 
-async function sendLiveInstruction(interrupt){
+async function sendLiveInstruction(mode){
  const input=$('#liveInstruction');
  const textValue=(input?.value||'').trim();
  if(!textValue)return alert('Type an instruction for the agent first.');
  const status=$('#liveQueueStatus');
- status.textContent=interrupt?'Stopping the current task and handing your instruction to a fresh turn…':'Queueing instruction for the next agent turn…';
+ status.textContent=mode==='interrupt'?'Interrupting current task; urgent instruction saved…':mode==='steer'?'Sending live steering to Codex (or queueing if unavailable)…':'Queueing instruction for the next agent turn…';
  try{
-   await postAction(interrupt?'live/interrupt':'live/queue',{text:textValue});
+   const result=await postAction('live/'+mode,{text:textValue});
+   if(mode==='steer')status.textContent=result.steered?'Delivered to active Codex turn.':'No steerable turn; instruction safely queued.';
    input.value='';
    await refreshState();
  }catch(e){status.textContent=e.message}
@@ -128,11 +129,52 @@ function renderFusionRuntime(runReports,manifest,inventory,deployment){
  }).join('');
 }
 function renderInputRequest(r){
- const box=$('#inputRequest');if(!r){box.hidden=true;inputRequestBusy=false;inputRequestPending=false;return}inputRequestPending=true;stopProjectPolling();box.hidden=false;
+ const box=$('#inputRequest');if(!r){box.hidden=true;inputRequestBusy=false;inputRequestPending=false;return}inputRequestPending=true;box.hidden=false;
  $('#inputRequestTitle').textContent=r.title||'GameForge needs input';
  $('#inputRequestMessage').textContent=r.message||'The agent needs additional input.';
  $('#inputRequestWhy').textContent=r.why_user_required||'';
  const c=$('#inputRequestControl');c.innerHTML='';
+ if(r.protocol==='codex-app-server'&&Array.isArray(r.questions)&&r.questions.length){
+   const controls=[];
+   for(const q of r.questions){
+     if(!q?.id)continue;
+     const wrapper=document.createElement('label');
+     wrapper.textContent=q.header||'Agent question';
+     const description=document.createElement('span');
+     description.className='tiny';
+     description.textContent=q.question||'';
+     wrapper.appendChild(description);
+     let field;
+     if(q.options?.length){
+       field=document.createElement('select');
+       for(const option of q.options){
+         const item=document.createElement('option');
+         item.value=option.label;
+         item.textContent=option.label+(option.description?' — '+option.description:'');
+         field.appendChild(item);
+       }
+     }else{
+       field=document.createElement('input');
+       field.type=(q.isSecret||q.is_secret)?'password':'text';
+       field.placeholder='Your answer';
+     }
+     field.addEventListener('focus',beginInputRequestInteraction);
+     field.addEventListener('input',beginInputRequestInteraction);
+     wrapper.appendChild(field);
+     controls.push({id:q.id,field});
+     c.appendChild(wrapper);
+   }
+   const submit=document.createElement('button');
+   submit.className='primary';
+   submit.textContent='Answer agent & continue turn';
+   submit.onclick=()=>{
+     const values=Object.fromEntries(controls.map(x=>[x.id,x.field.value]));
+     if(Object.values(values).some(x=>!String(x||'').trim()))return alert('Answer each agent question first.');
+     submitRequestedValue(r,values);
+   };
+   c.appendChild(submit);
+   return;
+ }
  if(r.kind==='file'){
    const input=document.createElement('input');input.type='file';input.id='requestedFile';
    if(r.accept_extensions?.length)input.accept=r.accept_extensions.join(',');
@@ -275,7 +317,7 @@ $('#cleanupArtifacts').onclick=async()=>{
  }catch(e){$('#runOutput').textContent=e.message}
 };
 $('#checkpoint').onclick=async()=>{try{const r=await postAction('git/checkpoint',{message:'GameForge manual checkpoint'});$('#runOutput').textContent=JSON.stringify(r,null,2)}catch(e){alert(e.message)}};
-$('#saveSettings').onclick=async()=>{try{await postAction('config',{research_mode:$('#researchMode').value,internet_research:$('#internetResearch').checked,commands:{clean:$('#cleanCmd').value,build:$('#buildCmd').value,test:$('#testCmd').value,launch:$('#launchCmd').value},visual:{monitor:Number($('#monitorNum').value)||1,interval_sec:1,freeze_seconds:Number($('#freezeSeconds').value)||8,black_mean_threshold:8,region:null,window_title:$('#windowTitle').value}});await refreshState();alert('Saved')}catch(e){alert(e.message)}};
+$('#saveSettings').onclick=async()=>{try{await postAction('config',{research_mode:$('#researchMode').value,internet_research:$('#internetResearch').checked,agent:{transport:$('#agentTransport').value},commands:{clean:$('#cleanCmd').value,build:$('#buildCmd').value,test:$('#testCmd').value,launch:$('#launchCmd').value},visual:{monitor:Number($('#monitorNum').value)||1,interval_sec:1,freeze_seconds:Number($('#freezeSeconds').value)||8,black_mean_threshold:8,region:null,window_title:$('#windowTitle').value}});await refreshState();alert('Saved')}catch(e){alert(e.message)}};
 $('#submitFeedback').onclick=async()=>{
  if(!current)return;
  const textValue=$('#userFeedback').value.trim();
@@ -318,12 +360,13 @@ $('#reopenUserDone').onclick=async()=>{
    await refreshState();
  }catch(e){status.textContent=e.message;delete status.dataset.local}
 };
-$('#queueLiveInstruction').onclick=()=>sendLiveInstruction(false);
-$('#interruptLiveInstruction').onclick=()=>sendLiveInstruction(true);
+$('#queueLiveInstruction').onclick=()=>sendLiveInstruction('queue');
+$('#steerLiveInstruction').onclick=()=>sendLiveInstruction('steer');
+$('#interruptLiveInstruction').onclick=()=>sendLiveInstruction('interrupt');
 $('#liveInstruction').addEventListener('keydown',e=>{
  if(e.key==='Enter'&&e.ctrlKey){
    e.preventDefault();
-   sendLiveInstruction(!!e.shiftKey);
+   sendLiveInstruction(e.shiftKey?'interrupt':'queue');
  }
 });
 $('#scanUploads').onclick=async()=>{try{const r=await postAction('uploads/scan');renderUploads(r)}catch(e){alert(e.message)}};

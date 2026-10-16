@@ -80,6 +80,27 @@ with tempfile.TemporaryDirectory() as td:
     app.settle_live_instructions(p, 2, delivered=True)
     assert app.live_queue_public(p)["queued_count"] == 0
 
+    # Race regression: concurrent API-style queue submissions must not overwrite
+    # each other or generate identical IDs.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        parallel = list(pool.map(
+            lambda i: app.enqueue_live_instruction(p, f"Parallel request {i}"),
+            range(48)
+        ))
+    assert len({item["id"] for item in parallel}) == 48
+    queued_parallel = app.live_queue_public(p)["queued"]
+    assert {item["id"] for item in parallel}.issubset({x["id"] for x in queued_parallel})
+    batch = app.claim_live_instructions(p, 20, limit=64)
+    assert len(batch) == 48
+    app.settle_live_instructions(p, 20, delivered=True)
+    assert app.live_queue_public(p)["queued_count"] == 0
+
+    steered = app.enqueue_live_instruction(p, "Steer in flight")
+    assert app.mark_live_instruction_steered(p, steered["id"])
+    assert not app.mark_live_instruction_steered(p, steered["id"])
+    assert app.live_queue_public(p)["queued_count"] == 0
+
     retry_item = app.enqueue_live_instruction(p, "Do not lose me if interrupted.", mode="queue")
     retry_claim = app.claim_live_instructions(p, 3)
     assert any(x["id"] == retry_item["id"] for x in retry_claim)
@@ -93,6 +114,22 @@ with tempfile.TemporaryDirectory() as td:
     app.settle_live_instructions(p, 4, delivered=True)
     assert any(x["id"] == prompt_item["id"] and x["status"] == "delivered"
                for x in app.load_live_queue(p)["items"])
+
+    # Native app-server approval requests must require a real user decision.
+    # Unrecognized requests remain denied at the JSON-RPC transport layer.
+    approval_state = app.AgentState(project_id=cfg["id"])
+    forwarded = app._fusion_agent_question(
+        p, approval_state, {
+            "id": "approve-1", "method": "item/commandExecution/requestApproval",
+            "params": {"reason": "Command needs approval", "command": "python -m pytest"},
+        }
+    )
+    approval = app.load_user_input_request(p)
+    assert forwarded and approval is not None
+    assert approval["choices"] == ["Approve once", "Decline"]
+    assert approval["rpc_method"] == "item/commandExecution/requestApproval"
+    approval["status"] = "fulfilled"
+    app.write_json(app.user_input_request_path(p), approval)
 
     before_review = app.append_user_feedback(p, "Strict quality smoke feedback.", "general")
     candidate = app.load_user_review(p)
@@ -135,6 +172,18 @@ with tempfile.TemporaryDirectory() as td:
     cfg3["commands"]["clean"] = f'"{sys.executable}" smoke_clean.py'
     cfg3["commands"]["build"] = f'"{sys.executable}" smoke_build.py'
     cfg3["cleanup"].update({"log_keep_files": 10, "capture_keep_groups": 2, "research_keep_iterations": 3})
+    # Legacy projects retain older limits; lean mode caps them automatically.
+    legacy_policy = app.cleanup_policy_settings({"cleanup": {
+        "enabled": True, "auto_after_iteration": True,
+        "log_keep_files": 60, "capture_keep_groups": 4,
+        "research_keep_iterations": 8,
+    }})
+    assert legacy_policy["log_keep_files"] == 12
+    assert legacy_policy["capture_keep_groups"] == 2
+    assert legacy_policy["research_keep_iterations"] == 3
+    assert app.cleanup_policy_settings({"cleanup": {"lean_mode": False,
+        "log_keep_files": 60}})["log_keep_files"] == 60
+
     app.write_json(p / "gameforge.json", cfg3)
     clean_build = app.run_clean_build(cfg["id"])
     assert clean_build["ok"], clean_build

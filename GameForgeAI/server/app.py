@@ -26,6 +26,9 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
+from server.codex_app_server import CodexAppServer, AppServerUnavailable, AppServerProtocolError
+from server.wsl_cleanup import cleanup_wsl_project
 
 def _resource_root() -> Path:
     # PyInstaller one-file/one-dir extracts bundled resources to sys._MEIPASS.
@@ -1021,10 +1024,15 @@ DEFAULT_CLEANUP_POLICY = {
     "enabled": True,
     "auto_after_iteration": True,
     "archive_old_logs": True,
-    "log_keep_files": 60,
-    "capture_keep_groups": 4,
-    "research_keep_iterations": 8,
+    "log_keep_files": 12,
+    "capture_keep_groups": 2,
+    "research_keep_iterations": 3,
+    "lean_mode": True,
     "process_ai_cleanup_candidates": True,
+    "wsl_cleanup_enabled": True,
+    "wsl_min_age_hours": 48,
+    "wsl_project_root": "",
+    "wsl_distro": "",
 }
 
 DEFAULT_FUSION_POLICY = {
@@ -1050,6 +1058,14 @@ def cleanup_policy_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     configured = cfg.get("cleanup")
     if isinstance(configured, dict):
         settings.update(configured)
+    # Older projects may have been created with much larger retention defaults.
+    # Lean mode bounds disposable history without touching current evidence.
+    if settings.get("lean_mode", True):
+        for key, cap in (("log_keep_files", 12), ("capture_keep_groups", 2), ("research_keep_iterations", 3)):
+            try:
+                settings[key] = max(1, min(int(settings.get(key, cap)), cap))
+            except (TypeError, ValueError):
+                settings[key] = cap
     return settings
 
 
@@ -1546,6 +1562,8 @@ class AgentState:
     active_process: subprocess.Popen | None = field(default=None, repr=False)
     active_process_kind: str = ""
     active_process_started_at: str | None = None
+    transport: CodexAppServer | None = field(default=None, repr=False)
+    interrupt_event: threading.Event = field(default_factory=threading.Event)
 
 
 @dataclass
@@ -1564,6 +1582,7 @@ MANAGED_PROCESSES: dict[str, subprocess.Popen] = {}
 MANAGED_PROCESS_META: dict[str, dict[str, Any]] = {}
 PROJECT_COMMAND_LOCKS: dict[str, threading.RLock] = {}
 PROJECT_COMMAND_LOCKS_GUARD = threading.Lock()
+LIVE_QUEUE_LOCK = threading.RLock()
 APP_SERVER: ThreadingHTTPServer | None = None
 WEB_SESSION = {"last_heartbeat": time.monotonic(), "closing": False, "shutdown_started": False}
 
@@ -1743,6 +1762,131 @@ def run_codex_agent_stream(
     return subprocess.CompletedProcess(command, returncode, "".join(stdout_lines), "".join(stderr_lines))
 
 
+
+def _fusion_agent_question(p: Path, state: AgentState, message: dict[str, Any]) -> bool:
+    """Bridge actual Codex questions and permission requests to the GameForge UI."""
+    method = str(message.get("method", ""))
+    params = message.get("params") or {}
+    questions = params.get("questions") or []
+    approvals = {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}
+    if method == "item/tool/requestUserInput":
+        if not isinstance(questions, list) or not questions:
+            return False
+        first = questions[0] if isinstance(questions[0], dict) else {}
+        options = first.get("options") or []
+        choices = [str(x.get("label")) for x in options if isinstance(x, dict) and x.get("label")]
+        title = str(first.get("header") or "Codex needs your input")[:180]
+        detail = str(first.get("question") or "How should Codex proceed?")[:3000]
+    elif method in approvals:
+        choices = ["Approve once", "Decline"]
+        title = "Approve Codex command?" if "commandExecution" in method else "Approve Codex file changes?"
+        reason = str(params.get("reason") or "The coding agent requested permission.")
+        cmd = str(params.get("command") or "")
+        detail = str(_auth_redact(reason + ("\nCommand: " + cmd if cmd else "")))[:3000]
+        questions = []
+    else:
+        return False
+    request = {
+        "id": "codex-" + str(message.get("id")),
+        "protocol": "codex-app-server",
+        "rpc_request_id": message.get("id"),
+        "rpc_method": method,
+        "kind": "choice" if choices else "text",
+        "title": title,
+        "message": detail,
+        "choices": choices,
+        "questions": questions,
+        "status": "pending",
+        "resume_after_submit": False,
+        "created_at": now_iso(),
+    }
+    write_json(user_input_request_path(p), request)
+    state.input_request = request
+    state.status = "waiting_for_user"
+    set_agent_activity(state, "Waiting for your answer", request["message"], "question")
+    return True
+
+def _fusion_codex_activity(state: AgentState, event: dict[str, Any]) -> None:
+    """Publish meaningful task transitions, not every token delta (disk/CPU hot path)."""
+    method = str(event.get("method") or "")
+    if method.endswith("/delta") or method.endswith("Delta"):
+        state.last_activity_at = now_iso()
+        return
+    params = event.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
+    summary = _codex_event_activity(json.dumps({"type": method, **params}))
+    if summary:
+        set_agent_activity(state, *summary)
+
+
+def run_codex_fusion_stream(
+    args: list[str], *, cwd: Path, input_text: str, timeout: int,
+    trace_path: Path, state: AgentState, permission_mode: str = "full-auto",
+    transport_mode: str = "auto",
+) -> subprocess.CompletedProcess[str]:
+    """Prefer a persistent, steerable Codex session; fall back only before work starts."""
+    if transport_mode == "exec":
+        return run_codex_agent_stream(
+            args, cwd=cwd, input_text=input_text, timeout=timeout,
+            trace_path=trace_path, state=state,
+        )
+    if state.transport is None:
+        command, use_shell = _command_invocation("codex", ["app-server"])
+        state.transport = CodexAppServer(
+            command, shell=use_shell, cwd=cwd, env=_codex_process_env(),
+            permission_mode=permission_mode,
+            on_event=lambda event: _fusion_codex_activity(state, event),
+            on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
+        )
+    transport = state.transport
+    assert transport is not None
+    try:
+        transport.open()
+    except AppServerUnavailable as exc:
+        state.transport = None
+        set_agent_activity(state, "Using compatible Codex engine", 
+                           "App-server handshake unavailable; using the verified Codex exec path.", "fallback")
+        auth_trace("codex_app_server_fallback", reason=str(exc)[:800])
+        return run_codex_agent_stream(
+            args, cwd=cwd, input_text=input_text, timeout=timeout,
+            trace_path=trace_path, state=state,
+        )
+    _bind_active_process(state, transport.process, "codex-app-server")
+    try:
+        return transport.run_turn(
+            input_text, timeout=timeout, trace_path=trace_path,
+            stop_event=state.stop_event, interrupt_event=state.interrupt_event,
+        )
+    except AppServerProtocolError as exc:
+        # Once a turn may have started, NEVER replay it via exec: that can duplicate edits.
+        transport.close()
+        state.transport = None
+        return subprocess.CompletedProcess(args, 1, "", f"Codex app-server protocol failed: {exc}")
+    finally:
+        req = load_user_input_request(cwd)
+        if req and req.get("protocol") == "codex-app-server":
+            req["status"] = "expired"
+            req["expired_at"] = now_iso()
+            write_json(user_input_request_path(cwd), req)
+            state.input_request = None
+        if transport.process is None or transport.process.poll() is not None:
+            _bind_active_process(state, None, "")
+
+
+def mark_live_instruction_steered(p: Path, item_id: str) -> bool:
+    with LIVE_QUEUE_LOCK:
+        data = load_live_queue(p)
+        for item in data.get("items", []):
+            if item.get("id") == item_id and item.get("status") == "queued":
+                item["status"] = "delivered"
+                item["delivered_at"] = now_iso()
+                item["delivery"] = "in-turn-steer"
+                save_live_queue(p, data)
+                return True
+    return False
+
+
 def git_checkpoint(p: Path, message: str) -> dict[str, Any]:
     if not command_exists("git"):
         return {"ok": False, "error": "git not installed"}
@@ -1770,6 +1914,14 @@ def collect_logs(p: Path, cfg: dict[str, Any]) -> str:
 
 
 
+def live_queue_atomic(fn):
+    """Serialize read-modify-write queue transactions across concurrent HTTP requests."""
+    def wrapped(*args, **kwargs):
+        with LIVE_QUEUE_LOCK:
+            return fn(*args, **kwargs)
+    return wrapped
+
+
 def live_queue_path(p: Path) -> Path:
     return p / ".gameforge" / "live_queue.json"
 
@@ -1782,14 +1934,17 @@ def load_live_queue(p: Path) -> dict[str, Any]:
     if not isinstance(items, list):
         items = []
     data["version"] = 1
-    data["items"] = [x for x in items if isinstance(x, dict)][-200:]
+    data["items"] = [x for x in items if isinstance(x, dict)]
     return data
 
 
 def save_live_queue(p: Path, data: dict[str, Any]) -> dict[str, Any]:
     data["version"] = 1
     data["updated_at"] = now_iso()
-    data["items"] = [x for x in data.get("items", []) if isinstance(x, dict)][-200:]
+    items = [x for x in data.get("items", []) if isinstance(x, dict)]
+    pending = [x for x in items if x.get("status") in {"queued", "in_progress"}]
+    recent = [x for x in items if x.get("status") not in {"queued", "in_progress"}][-200:]
+    data["items"] = sorted(pending + recent, key=lambda x: str(x.get("created_at", "")))
     write_json(live_queue_path(p), data)
     return data
 
@@ -1810,6 +1965,7 @@ def live_queue_public(p: Path) -> dict[str, Any]:
     }
 
 
+@live_queue_atomic
 def enqueue_live_instruction(
     p: Path,
     text_value: str,
@@ -1826,7 +1982,7 @@ def enqueue_live_instruction(
     mode = "interrupt" if mode == "interrupt" else "queue"
     data = load_live_queue(p)
     item = {
-        "id": f"live-{int(time.time() * 1000)}-{len(data.get('items', []))}",
+        "id": f"live-{uuid4().hex}",
         "created_at": now_iso(),
         "text": text_value,
         "mode": mode,
@@ -1836,11 +1992,14 @@ def enqueue_live_instruction(
         "attempts": 0,
         "metadata": metadata or {},
     }
+    if sum(1 for x in data.get("items", []) if x.get("status") in {"queued", "in_progress"}) >= 1000:
+        raise ValueError("Live queue is full (1000 pending instructions)")
     data.setdefault("items", []).append(item)
     save_live_queue(p, data)
     return item
 
 
+@live_queue_atomic
 def requeue_live_instructions(p: Path, *, reason: str) -> None:
     data = load_live_queue(p)
     changed = False
@@ -1855,6 +2014,7 @@ def requeue_live_instructions(p: Path, *, reason: str) -> None:
         save_live_queue(p, data)
 
 
+@live_queue_atomic
 def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[dict[str, Any]]:
     data = load_live_queue(p)
     changed = False
@@ -1883,6 +2043,7 @@ def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[di
     return [dict(x) for x in claimed]
 
 
+@live_queue_atomic
 def settle_live_instructions(p: Path, iteration: int, *, delivered: bool, reason: str = "") -> None:
     data = load_live_queue(p)
     changed = False
@@ -2330,6 +2491,7 @@ def agent_loop(project_id: str) -> None:
     max_auto_recovery = int(cfg.get("agent", {}).get("max_auto_recovery_attempts", 8) or 8)
     recovery_failures = 0
     recovery_context: dict[str, Any] | None = None
+    auth_verified_at = 0.0
     build_result = test_result = None
     state.status = "running"
     state.started_at = now_iso()
@@ -2356,13 +2518,15 @@ def agent_loop(project_id: str) -> None:
             # report logged in yet send Responses requests with no Authorization
             # header. Verify the real request path before consuming an iteration.
             # Run this before incrementing so a failed auth check remains iteration 0.
-            set_agent_activity(state, "Checking AI runtime", "Verifying Codex authentication and inference before starting this iteration.", "check")
-            auth_check = codex_auth_preflight(p)
-            if not auth_check.get("ok"):
-                state.status = "blocked"
-                state.message = auth_check.get("message", "Codex authentication preflight failed")
-                RUNTIME_STATE["codex_login_message"] = state.message
-                return
+            if time.monotonic() - auth_verified_at >= 1800:
+                set_agent_activity(state, "Checking AI runtime", "Verifying Codex authentication and inference before starting this iteration.", "check")
+                auth_check = codex_auth_preflight(p)
+                if not auth_check.get("ok"):
+                    state.status = "blocked"
+                    state.message = auth_check.get("message", "Codex authentication preflight failed")
+                    RUNTIME_STATE["codex_login_message"] = state.message
+                    return
+                auth_verified_at = time.monotonic()
 
             state.iteration += 1
             if max_iter and state.iteration > max_iter:
@@ -2400,13 +2564,15 @@ def agent_loop(project_id: str) -> None:
             try:
                 trace_path.write_text("", encoding="utf-8")
                 set_agent_activity(state, "AI is working on the project", "Codex is reading, editing, diagnosing, building, or testing. Live command activity will appear here.", "agent")
-                proc = run_codex_agent_stream(
+                proc = run_codex_fusion_stream(
                     codex_args,
                     cwd=p,
                     input_text=prompt,
                     timeout=max(timeout, 3600),
                     trace_path=trace_path,
                     state=state,
+                    permission_mode=permission_mode,
+                    transport_mode=str(cfg.get("agent", {}).get("transport", "auto")),
                 )
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 if state.stop_event.is_set():
@@ -2418,6 +2584,12 @@ def agent_loop(project_id: str) -> None:
                     state.message = "Stopped by user; active Codex work was interrupted and project state was preserved."
                     set_agent_activity(state, "Stopped", state.message, "stopped")
                     return
+                if state.interrupt_event.is_set():
+                    state.interrupt_event.clear()
+                    settle_live_instructions(p, iteration, delivered=False, reason="priority instruction interrupted this turn")
+                    reconcile_feedback_work_orders(p, review_before_iteration, verification_complete=False)
+                    set_agent_activity(state, "Switching to priority instruction", "Previous turn was interrupted; starting the queued urgent work.", "interrupt")
+                    continue
                 pending_input = detect_agent_input_request(p)
                 if pending_input:
                     settle_live_instructions(
@@ -2620,6 +2792,7 @@ def agent_loop(project_id: str) -> None:
                         "deleted_research_files": len(cleanup_report.get("deleted_research_files", [])),
                         "deleted_ai_candidates": len(cleanup_report.get("deleted_ai_candidates", [])),
                         "errors": cleanup_report.get("errors", []),
+                        "wsl": cleanup_report.get("wsl"),
                     }
                     write_json(p / ".gameforge/last_evidence.json", evidence)
                 except Exception as exc:
@@ -2647,6 +2820,9 @@ def agent_loop(project_id: str) -> None:
         state.status = "error"
         state.message = f"{exc}\n{traceback.format_exc()[-4000:]}"
     finally:
+        if state.transport is not None:
+            state.transport.close()
+            state.transport = None
         if state.stop_event.is_set() and state.status not in {"complete", "error"}:
             state.status = "stopped"
             state.message = "Stopped by user; project state preserved."
@@ -2680,6 +2856,12 @@ def interrupt_agent_and_restart(project_id: str, reason: str = "live user instru
     if not state or not state.thread or not state.thread.is_alive():
         return {"restarting": False, "agent": start_agent(project_id)}
 
+    if state.transport is not None and state.transport.active:
+        state.interrupt_event.set()
+        state.message = "Interrupting the active Codex turn; priority instruction runs next."
+        set_agent_activity(state, "Interrupting current agent turn", state.message, "interrupt")
+        return {"restarting": True, "mode": "app-server", "agent": agent_public(state)}
+
     stop_agent_now(state)
 
     def restart() -> None:
@@ -2708,6 +2890,8 @@ def interrupt_agent_and_restart(project_id: str, reason: str = "live user instru
 def agent_public(s: AgentState) -> dict[str, Any]:
     return {
         "project_id": s.project_id,
+        "transport": "app-server" if s.transport is not None else "exec",
+        "steering_available": bool(s.transport and s.transport.active),
         "status": s.status,
         "iteration": s.iteration,
         "message": s.message,
@@ -2917,6 +3101,32 @@ def _remove_empty_dirs(root: Path) -> None:
             pass
 
 
+def _wsl_cleanup_target(p: Path, policy: dict[str, Any]) -> tuple[str, str]:
+    """Find a single project worktree, never the user's distro/home directory."""
+    root = str(policy.get("wsl_project_root", "") or "").strip()
+    distro = str(policy.get("wsl_distro", "") or "").strip()
+    if root:
+        return root, distro
+    wrapper = p / "workspace" / "tools" / "build_mod.sh"
+    if not wrapper.is_file():
+        return "", distro
+    try:
+        script = wrapper.read_text(encoding="utf-8", errors="replace")
+        match = re.search(r"(?m)^mod=(?:\"([^\"]+)\"|'([^']+)'|([^\s#]+))\s*$", script)
+        if not match:
+            return "", distro
+        root = next((part for part in match.groups() if part), "")
+        ps1 = p / "workspace" / "tools" / "build_mod.ps1"
+        if ps1.is_file() and not distro:
+            ps = ps1.read_text(encoding="utf-8", errors="replace")
+            dm = re.search(r"(?i)\bwsl\s+-d\s+([A-Za-z0-9_.-]+)", ps)
+            if dm:
+                distro = dm.group(1)
+        return root, distro
+    except OSError:
+        return "", distro
+
+
 def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, reason: str = "automatic") -> dict[str, Any]:
     """Compact disposable runtime artifacts without deleting current evidence.
 
@@ -2937,6 +3147,7 @@ def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, rea
         "deleted_capture_groups": [],
         "deleted_research_files": [],
         "deleted_ai_candidates": [],
+        "wsl": None,
         "preserved_referenced": [],
         "errors": [],
     }
@@ -2956,7 +3167,7 @@ def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, rea
             if x.is_file() and x.resolve() != archive_path.resolve()
         ]
         candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-        keep_count = max(10, int(policy.get("log_keep_files", 60) or 60))
+        keep_count = max(1, int(policy.get("log_keep_files", 12) or 12))
         recent = set(candidates[:keep_count])
         archive_candidates: list[Path] = []
         for file in candidates[keep_count:]:
@@ -2979,7 +3190,7 @@ def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, rea
     if capture_root.exists():
         groups = [x for x in capture_root.iterdir() if x.is_dir()]
         groups.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-        keep_groups = max(1, int(policy.get("capture_keep_groups", 4) or 4))
+        keep_groups = max(1, int(policy.get("capture_keep_groups", 2) or 2))
         recent_groups = set(groups[:keep_groups])
         for group in groups[keep_groups:]:
             rel = str(group.relative_to(p)).replace("\\", "/")
@@ -3005,7 +3216,7 @@ def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, rea
             if m:
                 iteration_files.append((int(m.group(1)), file))
         max_iteration = max((n for n, _ in iteration_files), default=0)
-        keep_iterations = max(2, int(policy.get("research_keep_iterations", 8) or 8))
+        keep_iterations = max(1, int(policy.get("research_keep_iterations", 3) or 3))
         cutoff = max(0, max_iteration - keep_iterations + 1)
         for number, file in iteration_files:
             if number >= cutoff:
@@ -3058,6 +3269,18 @@ def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, rea
                 remaining.append(row)
         if rows:
             write_json(manifest_path, {"updated_at": now_iso(), "candidates": remaining})
+
+    # Clean only GameForge-owned scratch/cache files in the selected WSL
+    # worktree. Never run global package cache cleaners or make clean here.
+    if bool(policy.get("wsl_cleanup_enabled", True)):
+        root, distro = _wsl_cleanup_target(p, policy)
+        if root:
+            report["wsl"] = cleanup_wsl_project(
+                root=root, distro=distro,
+                min_age_hours=int(policy.get("wsl_min_age_hours", 48) or 48),
+            )
+        else:
+            report["wsl"] = {"skipped": ["No project-specific WSL worktree configured or discovered"]}
 
     report["preserved_referenced"] = sorted(set(report["preserved_referenced"]))[:500]
     write_json(p / ".gameforge" / "last_cleanup.json", report)
@@ -4078,7 +4301,16 @@ class Handler(SimpleHTTPRequestHandler):
                 body = self.body_json()
                 allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","fusion","agent","visual","log_globs"}
                 for k,v in body.items():
-                    if k in allowed: cfg[k] = v
+                    if k not in allowed:
+                        continue
+                    if k == "agent" and isinstance(v, dict):
+                        existing = cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
+                        allowed_agent = {"transport", "permission_mode", "max_iterations", "cooldown_sec", "max_auto_recovery_attempts"}
+                        cfg["agent"] = {**existing, **{key: value for key, value in v.items() if key in allowed_agent}}
+                        if cfg["agent"].get("transport") not in {"auto", "app-server", "exec"}:
+                            return self.send_json({"error": "Unsupported agent transport"}, 400)
+                    else:
+                        cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
                 return self.send_json(cfg)
             if action == "experiment/create":
@@ -4088,7 +4320,7 @@ class Handler(SimpleHTTPRequestHandler):
                 body = self.body_json()
                 result = promote_experimental_copy(pid, bool(body.get("confirm")))
                 return self.send_json(result, 200 if result.get("ok") else int(result.get("status", 409)))
-            if action in {"live/queue", "live/interrupt"}:
+            if action in {"live/queue", "live/interrupt", "live/steer"}:
                 body = self.body_json()
                 text_value = str(body.get("text", "") or "").strip()
                 mode = "interrupt" if action == "live/interrupt" else "queue"
@@ -4100,6 +4332,14 @@ class Handler(SimpleHTTPRequestHandler):
                     save_user_review(p, review)
                 st = AGENTS.get(pid)
                 restart = None
+                steered = False
+                if action == "live/steer" and st and st.transport and st.transport.active:
+                    try:
+                        steered = st.transport.steer(text_value)
+                        if steered:
+                            mark_live_instruction_steered(p, item["id"])
+                    except AppServerProtocolError:
+                        steered = False  # durable queue fallback
                 if mode == "interrupt":
                     restart = interrupt_agent_and_restart(pid, reason=f"interrupted for {item['id']}")
                 elif (not st or not st.thread or not st.thread.is_alive()) and not load_user_input_request(p):
@@ -4109,19 +4349,21 @@ class Handler(SimpleHTTPRequestHandler):
                     "item": item,
                     "queue": live_queue_public(p),
                     "restart": restart,
+                    "steered": steered,
                 })
             if action == "live/cancel":
                 body = self.body_json()
                 item_id = str(body.get("id", "") or "")
-                data = load_live_queue(p)
-                changed = False
-                for item in data.get("items", []):
-                    if item.get("id") == item_id and item.get("status") == "queued":
-                        item["status"] = "cancelled"
-                        item["cancelled_at"] = now_iso()
-                        changed = True
-                if changed:
-                    save_live_queue(p, data)
+                with LIVE_QUEUE_LOCK:
+                    data = load_live_queue(p)
+                    changed = False
+                    for item in data.get("items", []):
+                        if item.get("id") == item_id and item.get("status") == "queued":
+                            item["status"] = "cancelled"
+                            item["cancelled_at"] = now_iso()
+                            changed = True
+                    if changed:
+                        save_live_queue(p, data)
                 return self.send_json({"ok": changed, "queue": live_queue_public(p)}, 200 if changed else 404)
             if action == "agent/start":
                 return self.send_json(start_agent(pid))
@@ -4188,7 +4430,7 @@ class Handler(SimpleHTTPRequestHandler):
                 response = body.get("value")
                 if kind == "url" and response and not re.match(r"^https?://", str(response), re.I):
                     return self.send_json({"error": "A valid http(s) URL is required"}, 400)
-                if kind == "choice" and response not in req.get("choices", []):
+                if kind == "choice" and req.get("protocol") != "codex-app-server" and response not in req.get("choices", []):
                     return self.send_json({"error": "Invalid choice"}, 400)
                 if kind == "file":
                     filename = str(response or "").strip()
@@ -4199,6 +4441,44 @@ class Handler(SimpleHTTPRequestHandler):
                     supplied = f"UPLOAD/{category}/{filename}"
                 else:
                     supplied = str(response)
+                st = AGENTS.get(pid)
+                if req.get("protocol") == "codex-app-server":
+                    if not st or not st.transport or not st.transport.active:
+                        return self.send_json({"error": "The Codex question is no longer active"}, 409)
+                    if req.get("rpc_method") in {
+                        "item/commandExecution/requestApproval", "item/fileChange/requestApproval"
+                    }:
+                        if response not in {"Approve once", "Decline"}:
+                            return self.send_json({"error": "Choose Approve once or Decline"}, 400)
+                        st.transport.reply(req["rpc_request_id"], {
+                            "decision": "accept" if response == "Approve once" else "decline"
+                        })
+                        req["status"] = "fulfilled"
+                        req["fulfilled_at"] = now_iso()
+                        write_json(user_input_request_path(p), req)
+                        st.input_request = None
+                        st.status = "running"
+                        return self.send_json({"ok": True, "resume_after_submit": False})
+                    answers = {}
+                    values = response if isinstance(response, dict) else {}
+                    for q in req.get("questions", []):
+                        if not isinstance(q, dict) or not q.get("id"):
+                            continue
+                        question_id = str(q["id"])
+                        value = str(values.get(question_id, "") if isinstance(response, dict) else response or "").strip()
+                        if not value:
+                            return self.send_json({"error": "Every question requires an answer"}, 400)
+                        choices = [str(o.get("label")) for o in (q.get("options") or []) if isinstance(o, dict)]
+                        if choices and value not in choices and not q.get("isOther", q.get("is_other", False)):
+                            return self.send_json({"error": "Invalid choice for " + question_id}, 400)
+                        answers[question_id] = {"answers": [value if value in choices else "user_note: " + value]}
+                    st.transport.reply(req["rpc_request_id"], {"answers": answers})
+                    req["status"] = "fulfilled"
+                    req["fulfilled_at"] = now_iso()
+                    write_json(user_input_request_path(p), req)
+                    st.input_request = None
+                    st.status = "running"
+                    return self.send_json({"ok": True, "resume_after_submit": False})
                 write_json(p / ".gameforge" / "user_input_response.json",
                            {"request_id": req.get("id"), "kind": kind, "value": response, "received_at": now_iso()})
                 enqueue_live_instruction(
