@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 from server.codex_app_server import CodexAppServer, AppServerUnavailable, AppServerProtocolError
+from server.wsl_cleanup import cleanup_wsl_project
 
 def _resource_root() -> Path:
     # PyInstaller one-file/one-dir extracts bundled resources to sys._MEIPASS.
@@ -1028,6 +1029,10 @@ DEFAULT_CLEANUP_POLICY = {
     "research_keep_iterations": 3,
     "lean_mode": True,
     "process_ai_cleanup_candidates": True,
+    "wsl_cleanup_enabled": True,
+    "wsl_min_age_hours": 48,
+    "wsl_project_root": "",
+    "wsl_distro": "",
 }
 
 DEFAULT_FUSION_POLICY = {
@@ -2787,6 +2792,7 @@ def agent_loop(project_id: str) -> None:
                         "deleted_research_files": len(cleanup_report.get("deleted_research_files", [])),
                         "deleted_ai_candidates": len(cleanup_report.get("deleted_ai_candidates", [])),
                         "errors": cleanup_report.get("errors", []),
+                        "wsl": cleanup_report.get("wsl"),
                     }
                     write_json(p / ".gameforge/last_evidence.json", evidence)
                 except Exception as exc:
@@ -3095,6 +3101,32 @@ def _remove_empty_dirs(root: Path) -> None:
             pass
 
 
+def _wsl_cleanup_target(p: Path, policy: dict[str, Any]) -> tuple[str, str]:
+    """Find a single project worktree, never the user's distro/home directory."""
+    root = str(policy.get("wsl_project_root", "") or "").strip()
+    distro = str(policy.get("wsl_distro", "") or "").strip()
+    if root:
+        return root, distro
+    wrapper = p / "workspace" / "tools" / "build_mod.sh"
+    if not wrapper.is_file():
+        return "", distro
+    try:
+        script = wrapper.read_text(encoding="utf-8", errors="replace")
+        match = re.search(r"(?m)^mod=(?:\"([^\"]+)\"|'([^']+)'|([^\\s#]+))\\s*$", script)
+        if not match:
+            return "", distro
+        root = next((part for part in match.groups() if part), "")
+        ps1 = p / "workspace" / "tools" / "build_mod.ps1"
+        if ps1.is_file() and not distro:
+            ps = ps1.read_text(encoding="utf-8", errors="replace")
+            dm = re.search(r"(?i)\\bwsl\\s+-d\\s+([A-Za-z0-9_.-]+)", ps)
+            if dm:
+                distro = dm.group(1)
+        return root, distro
+    except OSError:
+        return "", distro
+
+
 def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, reason: str = "automatic") -> dict[str, Any]:
     """Compact disposable runtime artifacts without deleting current evidence.
 
@@ -3115,6 +3147,7 @@ def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, rea
         "deleted_capture_groups": [],
         "deleted_research_files": [],
         "deleted_ai_candidates": [],
+        "wsl": None,
         "preserved_referenced": [],
         "errors": [],
     }
@@ -3236,6 +3269,18 @@ def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, rea
                 remaining.append(row)
         if rows:
             write_json(manifest_path, {"updated_at": now_iso(), "candidates": remaining})
+
+    # Clean only GameForge-owned scratch/cache files in the selected WSL
+    # worktree. Never run global package cache cleaners or make clean here.
+    if bool(policy.get("wsl_cleanup_enabled", True)):
+        root, distro = _wsl_cleanup_target(p, policy)
+        if root:
+            report["wsl"] = cleanup_wsl_project(
+                root=root, distro=distro,
+                min_age_hours=int(policy.get("wsl_min_age_hours", 48) or 48),
+            )
+        else:
+            report["wsl"] = {"skipped": ["No project-specific WSL worktree configured or discovered"]}
 
     report["preserved_referenced"] = sorted(set(report["preserved_referenced"]))[:500]
     write_json(p / ".gameforge" / "last_cleanup.json", report)
