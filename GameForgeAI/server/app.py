@@ -1923,7 +1923,7 @@ def run_codex_fusion_stream(
             args, cwd=cwd, input_text=input_text, timeout=timeout,
             trace_path=trace_path, state=state,
         )
-    _bind_active_process(state, transport.process, "codex-app-server")
+    _bind_active_process(state, transport.process, "acp" if transport_mode == "acp" else "codex-app-server")
     try:
         return transport.run_turn(
             input_text, timeout=timeout, trace_path=trace_path,
@@ -2686,9 +2686,14 @@ def agent_loop(project_id: str) -> None:
     state.started_at = now_iso()
     state.message = "Starting autonomous game-development loop"
     try:
-        if not command_exists("codex"):
+        engine = str(cfg.get("agent", {}).get("transport", "auto"))
+        if engine != "acp" and not command_exists("codex"):
             state.status = "blocked"
             state.message = "Codex CLI not found. Install it and sign in with your ChatGPT account."
+            return
+        if engine == "acp" and not cfg.get("agent", {}).get("acp_command"):
+            state.status = "blocked"
+            state.message = "Choose an installed ACP agent command in Settings before starting."
             return
         while not state.stop_event.is_set():
             review = load_user_review(p)
@@ -2707,7 +2712,7 @@ def agent_loop(project_id: str) -> None:
             # report logged in yet send Responses requests with no Authorization
             # header. Verify the real request path before consuming an iteration.
             # Run this before incrementing so a failed auth check remains iteration 0.
-            if time.monotonic() - auth_verified_at >= 1800:
+            if engine != "acp" and time.monotonic() - auth_verified_at >= 1800:
                 set_agent_activity(state, "Checking AI runtime", "Verifying Codex authentication and inference before starting this iteration.", "check")
                 auth_check = codex_auth_preflight(p)
                 if not auth_check.get("ok"):
@@ -2744,15 +2749,19 @@ def agent_loop(project_id: str) -> None:
                 codex_args += ["--dangerously-bypass-approvals-and-sandbox"]
             else:
                 codex_args += ["--sandbox", "workspace-write"]
-            auth_trace("agent_codex_exec", project=str(p), iteration=iteration,
-                       permission_mode=permission_mode, codex_args=codex_args)
+            if engine == "acp":
+                auth_trace("agent_acp_invocation", project=str(p), iteration=iteration,
+                           agent_executable=Path(cfg.get("agent", {}).get("acp_command", [""])[0]).name)
+            else:
+                auth_trace("agent_codex_exec", project=str(p), iteration=iteration,
+                           permission_mode=permission_mode, codex_args=codex_args)
             # "-" forces Codex to read the prompt from stdin. This avoids Windows
             # npm .cmd shim execution issues and command-line length limits.
             codex_args.append("-")
             started = time.time()
             try:
                 trace_path.write_text("", encoding="utf-8")
-                set_agent_activity(state, "AI is working on the project", "Codex is reading, editing, diagnosing, building, or testing. Live command activity will appear here.", "agent")
+                set_agent_activity(state, "AI is working on the project", "The coding agent is reading, editing, diagnosing, building, or testing. Live activity will appear here.", "agent")
                 proc = run_codex_fusion_stream(
                     codex_args,
                     cwd=p,
@@ -2804,6 +2813,10 @@ def agent_loop(project_id: str) -> None:
                     )
                     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
                     lower = combined.lower()
+                    if engine == "acp" and "ACP agent unavailable:" in combined:
+                        state.status = "blocked"
+                        state.message = "ACP handshake failed: " + str(proc.stderr)[-1200:]
+                        return
                     if "401 unauthorized" in lower:
                         state.status = "blocked"
                         state.message = "Codex authentication was rejected (401). Project state is preserved; sign in again, then Resume."
