@@ -2165,6 +2165,7 @@ def settle_live_instructions(p: Path, iteration: int, *, delivered: bool, reason
 
 def reconcile_live_instruction_results(
     p: Path, iteration: int, build_result: dict[str, Any], test_result: dict[str, Any],
+    change_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Close only instruction IDs backed by source evidence and configured gates.
 
@@ -2180,6 +2181,7 @@ def reconcile_live_instruction_results(
         for gate in (build_result, test_result)
     )
     verified_ids: list[str] = []
+    changed_production = set((change_summary or {}).get("production_paths") or [])
     with LIVE_QUEUE_LOCK:
         data = load_live_queue(p)
         for item in data.get("items", []):
@@ -2212,7 +2214,17 @@ def reconcile_live_instruction_results(
                     break
             if not valid_files:
                 continue
+            # A claim for an unchanged pre-existing file is not implementation
+            # evidence. Preserve a previously observed production change when
+            # a later iteration finally fixes the full regression gates.
+            prior_proof = item.get("verification_claim") or {}
+            observed_change = all(path.replace("\\\\", "/") in changed_production for path in files)
+            source_proven = observed_change or bool(prior_proof.get("production_change_observed"))
+            if not source_proven:
+                item["verification_state"] = "Evidence submitted but no relevant production change was observed"
+                continue
             item["verification_claim"] = {
+                "production_change_observed": source_proven,
                 "resolution": resolution[:2500],
                 "evidence": evidence[:3500],
                 "changed_paths": files,
@@ -2931,7 +2943,7 @@ def agent_loop(project_id: str) -> None:
                 set_agent_activity(state, "Stopped", state.message, "stopped")
                 return
 
-            live_verification = reconcile_live_instruction_results(p, iteration, build_result, test_result)
+            live_verification = reconcile_live_instruction_results(p, iteration, build_result, test_result, change_summary)
             review_after_verification = reconcile_feedback_work_orders(
                 p,
                 review_before_iteration,
