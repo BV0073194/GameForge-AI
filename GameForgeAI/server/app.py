@@ -2098,9 +2098,10 @@ def live_queue_public(p: Path) -> dict[str, Any]:
     delivered = [x for x in items if x.get("status") == "delivered_to_agent"]
     implemented = [x for x in items if x.get("status") == "implemented"]
     recent = [x for x in items if x.get("status") in LIVE_TERMINAL_STATUSES][-20:]
-    # While a turn is active, its assigned instruction is the visible focus.
-    # Otherwise the most recently submitted urgent/normal instruction is next.
-    focus = (in_progress or queued or list(reversed(delivered)) or list(reversed(implemented)) or [None])[0]
+    # Explicit priority: newest urgent steering, then newest unfinished user
+    # instruction, regardless of whether a previous turn merely received it.
+    unfinished = sorted(in_progress + queued + delivered, key=_focus_sort, reverse=True)
+    focus = (unfinished or list(reversed(implemented)) or [None])[0]
     return {
         "queued": queued, "in_progress": in_progress,
         "delivered_to_agent": delivered, "implemented": implemented,
@@ -2657,6 +2658,7 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     # last so prompt-tail context truncation never preferentially loses them.
     awaiting_live = live_queue_public(p).get("awaiting_verification", [])
     live_inputs = awaiting_live[:12] + newly_claimed_live
+    focus_item = live_queue_public(p).get("focus")
     if fast_pipeline and pipeline.get("compact_context", True):
         compact = {
             "generated_at": now_iso(),
@@ -2667,6 +2669,8 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
             "last_evidence": read_json(p / ".gameforge/last_evidence.json", {}),
             "last_self_heal": read_json(p / ".gameforge/last_self_heal.json", {}),
             "delivery_state": delivery_state_for_prompt(p, review),
+            "focus_live_instruction": focus_item,
+            "agent_iteration_state": iteration_snapshot(p),
             "last_cleanup": read_json(p / ".gameforge/last_cleanup.json", {}),
             "live_user_inputs": live_inputs,
             "installed_games": read_json(p / ".gameforge" / "game_inventory.json", {"count": 0, "games": []}),
@@ -2689,7 +2693,9 @@ real project changes and targeted tests, update
 {"results":[{"id":"EXACT_LIVE_ID","ready_for_verification":true,
 "resolution":"Detailed description of what changed",
 "evidence":"Specific build, test and runtime evidence",
-"changed_paths":["workspace/real-source-file"]}]}
+"changed_paths":["workspace/real-source-file"],
+"tests":[{"name":"targeted gameplay regression","status":"passed",
+"log_path":"logs/relevant-test.log"}]}]}
 Use the actual IDs from the queue. Keep unfinished entries pending and
 report genuine blockers in iteration notes. Never invent evidence, and
 never delete previous valid results. GameForge independently requires
@@ -2707,6 +2713,9 @@ a completion claim.
                         "created_at": x.get("created_at"),
                         "priority": x.get("priority"),
                         "source": x.get("source"),
+                        "status": x.get("status"),
+                        "verification_state": x.get("verification_state"),
+                        "changed_paths": (x.get("verification_claim") or {}).get("changed_paths", []),
                         "text": x.get("text"),
                     }
                     for x in live_inputs
@@ -2742,6 +2751,36 @@ a completion claim.
         prior += "\nPrevious test result:\n" + json.dumps({k:v for k,v in test_result.items() if k != "output"}, indent=2) + "\n" + test_result.get("output", "")[-12000:]
     if recovery_context:
         prior += "\nAutomatic recovery context:\n" + json.dumps(recovery_context, indent=2)[-16000:]
+    # The exact actionable work-order ID is emitted at the END of the prompt,
+    # beyond any legacy context truncation. New user requests win over research
+    # and lower-priority roadmap work; implement or identify a genuine blocker.
+    if focus_item and focus_item.get("status") != "implemented":
+        focus_directive = (
+            "\n\nMANDATORY CURRENT USER WORK ORDER (priority over roadmap/research):\n"
+            + json.dumps({
+                "id": focus_item.get("id"), "status": focus_item.get("status"),
+                "source": focus_item.get("source"), "text": focus_item.get("text"),
+                "created_at": focus_item.get("created_at"),
+            }, ensure_ascii=False)
+            + "\nAct on this exact request before doing optional work. Make a real"
+              " production change when appropriate and provide specific evidence."
+              " If it requires several passes, continue it in subsequent turns;"
+              " do not silently substitute unrelated tasks or falsely mark it"
+              " complete. If blocked, record the concrete blocker and keep the"
+              " work order pending.\n"
+        )
+    elif pending_feedback:
+        latest = max(pending_feedback, key=lambda x: str(x.get("created_at") or ""))
+        focus_directive = (
+            "\n\nMANDATORY CURRENT USER FEEDBACK (priority over roadmap/research):\n"
+            + json.dumps({"id": latest.get("id"), "text": latest.get("text")},
+                         ensure_ascii=False)
+            + "\nWork on this pending user request first. Preserve unresolved"
+              " feedback and never claim verification without the configured"
+              " full build and original regression.\n"
+        )
+    else:
+        focus_directive = ""
     research = cfg.get("research_mode", "deep")
     if fast_pipeline:
         startup = """FAST STRICT PIPELINE: Start with .gameforge/compact_state.json, goal.md, design/project.json, tasks/MVP.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
@@ -2771,7 +2810,7 @@ Treat build/runtime warnings, dependency errors, WSL issues, toolchain failures,
 
 Before declaring a blocker, exhaust SAFE, LEGAL, REAL autonomous options: inspect existing project uploads/local files, public/authorized sources, official documentation, and legitimately redistributable dependencies. Never download pirated commercial games/ROMs, leaked credentials, or other unauthorized material. If progress genuinely requires user-only input, DO NOT merely mention the blocker in notes and DO NOT keep burning iterations. Write .gameforge/user_input_request.json and stop the iteration cleanly. Schema:
 {{"status":"pending","kind":"file|url|text|choice|confirm","title":"short human title","message":"exactly what is needed and why","why_user_required":"why autonomous acquisition is unavailable/inappropriate","accept_extensions":[".z64"],"upload_category":"ROMS_LOCAL","placeholder":"","choices":[],"resume_after_submit":true}}
-For files, list ONLY valid expected extensions. For a copyrighted base ROM, tell the user to provide their own legally obtained copy; never search for unauthorized ROM downloads. For URLs, request a URL only when the user must identify/authorize the source.\n\nRecent evidence from logs/OpenCV/runtime:\n{evidence[-50000:] if evidence else '(none yet)'}\n{prior[-30000:]}\n'''
+For files, list ONLY valid expected extensions. For a copyrighted base ROM, tell the user to provide their own legally obtained copy; never search for unauthorized ROM downloads. For URLs, request a URL only when the user must identify/authorize the source.\n\nRecent evidence from logs/OpenCV/runtime:\n{evidence[-50000:] if evidence else '(none yet)'}\n{prior[-30000:]}\n{focus_directive}\n'''
 
 
 def agent_loop(project_id: str) -> None:
