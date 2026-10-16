@@ -7,7 +7,7 @@ async function loadSystem(){try{const s=await api('/api/status');const codexText
 async function loadProjects(selectId=null){const d=await api('/api/projects');const list=$('#projectList');list.innerHTML='';for(const p of d.projects){const b=document.createElement('button');b.className='project-item'+((current===p.id)?' active':'');b.innerHTML=`<strong>${esc(p.name)}</strong><small>${esc(p.agent_status.status||'idle')} • iteration ${p.agent_status.iteration||0}</small>`;b.onclick=()=>selectProject(p.id);list.appendChild(b)}if(selectId)await selectProject(selectId)}
 function esc(s=''){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 async function selectProject(id){stopProjectPolling();current=id;inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;acceptanceVisibleCount=5;activityVisibleCount=5;lastAcceptance=null;lastLiveAgent=null;lastManagedProcess=null;$('#emptyState').hidden=true;$('#workspace').hidden=false;await refreshState();await loadProjects();startProjectPolling()}
-async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status} • ${d.agent.transport||'exec'}`;$('#steerLiveInstruction').disabled=!d.agent.steering_available;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#agentTransport').value=c.agent?.transport||'auto';$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#cleanCmd').value=c.commands?.clean||'';$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);renderLiveQueue(d.live_queue,d.input_request,d.agent);renderFusionRuntime(d.run_reports,d.fusion_manifest,d.game_inventory,d.fusion_deployment);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
+async function refreshState(){if(!current)return;if(inputRequestBusy){inputRequestDirty=true;return}try{const d=await api(`/api/project/${current}/state`);const c=d.config;$('#projectTitle').textContent=c.name;$('#projectGoal').textContent=c.goal;$('#agentBadge').textContent=`Agent: ${d.agent.status} • ${d.agent.transport||'exec'}`;$('#steerLiveInstruction').disabled=!d.agent.steering_available;$('#iterationBadge').textContent=`Iteration ${d.agent.iteration||0}`;$('#agentMessage').textContent=d.agent.message||d.agent.status;renderLiveTask(d.agent,d.managed_process);$('#cvMessage').textContent=d.cv.message||d.cv.status;$('#agentTransport').value=c.agent?.transport||'auto';if(document.activeElement!==$('#agentCodexModel'))$('#agentCodexModel').value=c.agent?.model||'';if(document.activeElement!==$('#agentCodexEffort'))$('#agentCodexEffort').value=c.agent?.effort||'';if(document.activeElement!==$('#agentAcpCommand'))$('#agentAcpCommand').value=JSON.stringify(c.agent?.acp_command||[],null,2);if(document.activeElement!==$('#agentMcpServers'))$('#agentMcpServers').value=JSON.stringify(c.mcp_servers||[],null,2);$('#researchMode').value=c.research_mode||'deep';$('#internetResearch').checked=!!c.internet_research;$('#cleanCmd').value=c.commands?.clean||'';$('#buildCmd').value=c.commands?.build||'';$('#testCmd').value=c.commands?.test||'';$('#launchCmd').value=c.commands?.launch||'';$('#monitorNum').value=c.visual?.monitor??1;$('#freezeSeconds').value=c.visual?.freeze_seconds??8;renderAcceptance(d.acceptance);renderUserReview(d.user_review);renderUploads(d.uploads);renderLiveQueue(d.live_queue,d.input_request,d.agent);renderFusionRuntime(d.run_reports,d.fusion_manifest,d.game_inventory,d.fusion_deployment);inputRequestPending=!!d.input_request;renderInputRequest(d.input_request);startProjectPolling();$('#visualMetrics').textContent=Object.keys(d.visual||{}).length?JSON.stringify(d.visual,null,2):'No visual metrics yet.';if(d.visual?.timestamp){const img=$('#capture');img.hidden=false;img.src=`/api/project/${current}/capture.jpg?t=${Date.now()}`}else $('#capture').hidden=true}catch(e){console.error(e)}}
 function activityAge(iso){
  if(!iso)return 'No activity yet';
  const ms=Date.now()-Date.parse(iso);if(!Number.isFinite(ms))return '';
@@ -59,29 +59,34 @@ function renderLiveTask(agent,managed){
  const collapse=$('#collapseActivity');if(collapse)collapse.onclick=()=>{activityVisibleCount=5;renderLiveTask(lastLiveAgent,lastManagedProcess);$('#liveTaskHistory').scrollIntoView({block:'nearest'})};
 }
 function renderLiveQueue(q,question,agent){
- q=q||{queued:[],in_progress:[],recent:[],queued_count:0,in_progress_count:0};
+ q=q||{queued:[],in_progress:[],awaiting_verification:[],recent:[],queued_count:0,in_progress_count:0};
  const status=$('#liveQueueStatus');
  const box=$('#liveQueueList');
  if(!status||!box)return;
  const active=q.in_progress||[];
  const queued=q.queued||[];
- const recent=(q.recent||[]).slice(-5).reverse();
+ const awaiting=q.awaiting_verification||[];
+ const recent=(q.recent||[]).slice(-8).reverse();
  const parts=[];
- if(active.length)parts.push(active.length+' instruction'+(active.length===1?' is':'s are')+' in the current AI turn');
+ if(active.length)parts.push(active.length+' instruction(s) assigned to the current turn');
  if(queued.length)parts.push(queued.length+' queued');
+ if(awaiting.length)parts.push(awaiting.length+' waiting for implementation/verification');
  if(question)parts.push('agent is waiting for your answer');
  status.textContent=parts.length?parts.join(' • '):((agent?.status==='running')?'Agent is working; you can steer it live.':'Nothing queued.');
  let html='';
  if(active.length){
-   html+='<h4>In progress</h4>'+active.map(x=>'<div class="criterion pass"><strong>'+esc(x.priority==='immediate'?'Immediate':'Current')+'</strong> — '+esc(x.text||'')+'<br><small>'+esc(x.created_at||'')+'</small></div>').join('');
+   html+='<h4>Active work orders — not completed</h4>'+active.map(x=>'<div class="criterion pending"><strong>'+esc(x.priority==='immediate'?'Immediate':'Current')+'</strong> — '+esc(x.text||'')+'<br><small>Attempt '+esc(x.attempts||1)+' • claimed iteration '+esc(x.claimed_iteration||'')+'</small></div>').join('');
  }
  if(queued.length){
    html+='<h4>Queued next</h4>'+queued.map(x=>'<div class="criterion pending"><strong>'+esc(x.priority==='immediate'?'Immediate':'Queued')+'</strong> — '+esc(x.text||'')+'<br><small>'+esc(x.created_at||'')+'</small><div class="actions"><button class="cancelLiveInstruction" data-live-id="'+esc(x.id||'')+'">Cancel</button></div></div>').join('');
  }
- if(recent.length){
-   html+='<details><summary>Recent delivered instructions</summary>'+recent.map(x=>'<div class="criterion"><strong>'+esc(x.status||'delivered')+'</strong> — '+esc(x.text||'')+'<br><small>'+esc(x.delivered_at||x.cancelled_at||x.created_at||'')+'</small></div>').join('')+'</details>';
+ if(awaiting.length){
+   html+='<h4>Not yet verified</h4>'+awaiting.map(x=>'<div class="criterion pending"><strong>Pending evidence</strong> — '+esc(x.text||'')+'<br><small>'+esc(x.verification_state||'Sent to agent; not verified')+'</small><div class="actions"><button class="cancelLiveInstruction" data-live-id="'+esc(x.id||'')+'">Cancel</button></div></div>').join('');
  }
- box.innerHTML=html;
+ if(recent.length){
+   html+='<details><summary>Verified and cancelled instructions</summary>'+recent.map(x=>'<div class="criterion"><strong>'+esc(x.status||'')+'</strong> — '+esc(x.text||'')+'<br><small>'+esc(x.verification_claim?.evidence||x.verified_at||x.cancelled_at||'')+'</small></div>').join('')+'</details>';
+ }
+ box.innerHTML=html||'<p class="muted">No live instruction work orders.</p>';
  box.querySelectorAll('.cancelLiveInstruction').forEach(b=>b.onclick=async()=>{
    try{await postAction('live/cancel',{id:b.dataset.liveId});await refreshState()}catch(e){alert(e.message)}
  });
@@ -95,7 +100,7 @@ async function sendLiveInstruction(mode){
  status.textContent=mode==='interrupt'?'Interrupting current task; urgent instruction saved…':mode==='steer'?'Sending live steering to Codex (or queueing if unavailable)…':'Queueing instruction for the next agent turn…';
  try{
    const result=await postAction('live/'+mode,{text:textValue});
-   if(mode==='steer')status.textContent=result.steered?'Delivered to active Codex turn.':'No steerable turn; instruction safely queued.';
+   if(mode==='steer')status.textContent=result.steered?'Steering accepted; implementation still awaiting verification.':'No steerable turn; instruction safely queued.';
    input.value='';
    await refreshState();
  }catch(e){status.textContent=e.message}
@@ -175,7 +180,19 @@ function renderInputRequest(r){
    c.appendChild(submit);
    return;
  }
- if(r.kind==='file'){
+ if(r.kind==='json'){
+   const hint=document.createElement('p');hint.className='tiny';
+   const schema=r.requested_schema||{};
+   const required=Array.isArray(schema.required)?schema.required:[];
+   hint.textContent=required.length?'Required fields: '+required.join(', '):'Provide a JSON object. Values are sent only to the requesting agent/server.';
+   const input=document.createElement('textarea');input.rows=6;input.spellcheck=false;
+   input.placeholder='{"answer":"..."}';
+   input.value=JSON.stringify(Object.fromEntries(required.map(k=>[k,''])),null,2);
+   input.addEventListener('focus',beginInputRequestInteraction);input.addEventListener('input',beginInputRequestInteraction);
+   const b=document.createElement('button');b.className='primary';b.textContent='Submit MCP response';b.onclick=()=>submitRequestedValue(r,input.value);
+   const decline=document.createElement('button');decline.textContent='Decline';decline.onclick=()=>submitRequestedValue(r,'Decline');
+   c.append(hint,input,b,decline);
+ }else if(r.kind==='file'){
    const input=document.createElement('input');input.type='file';input.id='requestedFile';
    if(r.accept_extensions?.length)input.accept=r.accept_extensions.join(',');
    const b=document.createElement('button');b.className='primary';b.textContent='Upload required file';
@@ -317,7 +334,7 @@ $('#cleanupArtifacts').onclick=async()=>{
  }catch(e){$('#runOutput').textContent=e.message}
 };
 $('#checkpoint').onclick=async()=>{try{const r=await postAction('git/checkpoint',{message:'GameForge manual checkpoint'});$('#runOutput').textContent=JSON.stringify(r,null,2)}catch(e){alert(e.message)}};
-$('#saveSettings').onclick=async()=>{try{await postAction('config',{research_mode:$('#researchMode').value,internet_research:$('#internetResearch').checked,agent:{transport:$('#agentTransport').value},commands:{clean:$('#cleanCmd').value,build:$('#buildCmd').value,test:$('#testCmd').value,launch:$('#launchCmd').value},visual:{monitor:Number($('#monitorNum').value)||1,interval_sec:1,freeze_seconds:Number($('#freezeSeconds').value)||8,black_mean_threshold:8,region:null,window_title:$('#windowTitle').value}});await refreshState();alert('Saved')}catch(e){alert(e.message)}};
+$('#saveSettings').onclick=async()=>{try{const acp=JSON.parse($('#agentAcpCommand').value||'[]');const mcp=JSON.parse($('#agentMcpServers').value||'[]');await postAction('config',{research_mode:$('#researchMode').value,internet_research:$('#internetResearch').checked,agent:{transport:$('#agentTransport').value,acp_command:acp,model:$('#agentCodexModel').value.trim(),effort:$('#agentCodexEffort').value},mcp_servers:mcp,commands:{clean:$('#cleanCmd').value,build:$('#buildCmd').value,test:$('#testCmd').value,launch:$('#launchCmd').value},visual:{monitor:Number($('#monitorNum').value)||1,interval_sec:1,freeze_seconds:Number($('#freezeSeconds').value)||8,black_mean_threshold:8,region:null,window_title:$('#windowTitle').value}});await refreshState();alert('Saved')}catch(e){alert(e.message)}};
 $('#submitFeedback').onclick=async()=>{
  if(!current)return;
  const textValue=$('#userFeedback').value.trim();

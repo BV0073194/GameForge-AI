@@ -95,6 +95,7 @@
               </div>
               <p id="liveQueueStatus" class="muted" role="status" aria-live="polite">Nothing queued.</p>
               <div id="liveQueueList"></div>
+              <p class="tiny">Instructions remain pending until implementation evidence and the configured full build/test gates pass. Receiving an instruction is not verification.</p>
               <p class="tiny">Ctrl+Enter queues. Ctrl+Shift+Enter interrupts and prioritizes your instruction. Steer active turn injects directly into a live Codex app-server turn; if unavailable, the instruction remains safely queued.</p>
             </article>
 
@@ -220,9 +221,38 @@
                 <option value="auto">Automatic — persistent Codex, compatible fallback</option>
                 <option value="app-server">Persistent Codex app-server (fallback on handshake failure)</option>
                 <option value="exec">Classic Codex CLI execution</option>
+                <option value="acp">External ACP agent (configured command)</option>
               </select>
             </label>
+            <div class="grid two">
+              <label>Codex model (optional)
+                <input id="agentCodexModel" placeholder="Use the CLI default model">
+              </label>
+              <label>Codex reasoning effort
+                <select id="agentCodexEffort">
+                  <option value="">Use CLI default</option>
+                  <option value="minimal">Minimal</option>
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="xhigh">Extra high</option>
+                </select>
+              </label>
+            </div>
+            <p class="tiny">Model and effort settings apply to Codex app-server and its CLI fallback, not to external ACP providers.</p>
+            <label>ACP executable and arguments (JSON array)
+              <textarea id="agentAcpCommand" rows="3" spellcheck="false" placeholder='["C:\\\\tools\\\\agent.exe","acp"]'></textarea>
+            </label>
+            <p class="tiny">Use a locally installed ACP-compatible agent. GameForge never starts a remote executable on your behalf. ACP steering is queued unless supported; permission requests need your approval.</p>
             <p class="tiny">Change takes effect the next time you start the autonomous agent.</p>
+          </div>
+          <div class="card" style="margin:12px 0">
+            <h3>MCP tool servers</h3>
+            <p class="muted">Configure MCP servers per project for Codex app-server or compatible ACP agents. Use environment variable <em>names</em> for tokens and headers; do not paste API keys into this file.</p>
+            <label>MCP servers (JSON array)
+              <textarea id="agentMcpServers" rows="9" spellcheck="false" placeholder='[{"name":"my-tools","type":"http","url":"https://example.com/mcp","bearer_token_env_var":"MY_MCP_TOKEN","enabled":true}]'></textarea>
+            </label>
+            <p class="tiny">Supports streamable HTTP MCP endpoints and local stdio tools. On Codex, MCP settings are supplied per thread. Classic exec uses your installed Codex CLI configuration. ACP capabilities vary by provider.</p>
           </div>
           <div class="grid two">
             <label>Research depth<select id="researchMode"><option value="off">Off</option><option value="normal">Normal</option><option value="deep">Deep</option><option value="exhaustive">Exhaustive / professional</option></select></label>

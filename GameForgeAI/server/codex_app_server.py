@@ -5,6 +5,7 @@ JSON-RPC interface and retains an existing thread across verified turns.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -13,6 +14,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+from .fusion_mcp import codex_mcp_config
 
 
 class AppServerUnavailable(RuntimeError):
@@ -34,10 +37,16 @@ class CodexAppServer:
         permission_mode: str = "full-auto",
         on_event: Callable[[dict[str, Any]], None] | None = None,
         on_question: Callable[[dict[str, Any]], bool] | None = None,
+        mcp_servers: list[dict[str, Any]] | None = None,
+        model: str = "",
+        effort: str = "",
     ) -> None:
         self.command, self.shell, self.cwd, self.env = command, shell, cwd, env
         self.permission_mode = permission_mode
         self.on_event, self.on_question = on_event, on_question
+        self.mcp_servers = mcp_servers or []
+        self.model = model
+        self.effort = effort
         self.process: subprocess.Popen[str] | None = None
         self.thread_id: str | None = None
         self.turn_id: str | None = None
@@ -61,7 +70,7 @@ class CodexAppServer:
         with self._write_lock:
             if self.process is None or self.process.poll() is not None or self.process.stdin is None:
                 raise AppServerProtocolError("Codex app-server is not running")
-            self.process.stdin.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            self.process.stdin.write(json.dumps(msg, ensure_ascii=True) + "\n")
             self.process.stdin.flush()
 
     def _request(self, method: str, params: dict[str, Any], timeout: float = 15) -> Any:
@@ -178,7 +187,9 @@ class CodexAppServer:
                 saved = json.loads(self._thread_file.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 pass
-            previous = saved.get("thread_id") if saved.get("cwd") == str(self.cwd.resolve()) else None
+            fingerprint = hashlib.sha256(json.dumps(codex_mcp_config(self.mcp_servers), sort_keys=True).encode("utf-8")).hexdigest()
+            previous = (saved.get("thread_id") if saved.get("cwd") == str(self.cwd.resolve())
+                        and saved.get("mcp_fingerprint") == fingerprint else None)
             if isinstance(previous, str) and previous:
                 try:
                     result = self._request("thread/resume", {"threadId": previous}, timeout=12)
@@ -187,6 +198,9 @@ class CodexAppServer:
                     self.thread_id = None
             if not self.thread_id:
                 params: dict[str, Any] = {"cwd": str(self.cwd)}
+                mcp_config = codex_mcp_config(self.mcp_servers)
+                if mcp_config:
+                    params["config"] = mcp_config
                 if self.permission_mode == "full-auto":
                     params.update({"approvalPolicy": "never", "sandbox": "danger-full-access"})
                 else:
@@ -198,6 +212,7 @@ class CodexAppServer:
             self._thread_file.parent.mkdir(parents=True, exist_ok=True)
             self._thread_file.write_text(json.dumps({
                 "thread_id": self.thread_id, "cwd": str(self.cwd.resolve()),
+                "mcp_fingerprint": fingerprint,
             }), encoding="utf-8")
         except Exception as exc:
             self.close()
@@ -206,6 +221,7 @@ class CodexAppServer:
     def steer(self, text: str) -> bool:
         if not self.active or not text.strip():
             return False
+        text = text.encode("utf-8", errors="replace").decode("utf-8")
         self._request("turn/steer", {
             "threadId": self.thread_id,
             "expectedTurnId": self.turn_id,
@@ -236,9 +252,14 @@ class CodexAppServer:
         self.open()
         assert self.thread_id
         prompt = prompt.encode("utf-8", errors="replace").decode("utf-8")
-        response = self._request("turn/start", {
+        settings: dict[str, Any] = {
             "threadId": self.thread_id, "input": [{"type": "text", "text": prompt}],
-        }, timeout=20)
+        }
+        if self.model:
+            settings["model"] = self.model
+        if self.effort:
+            settings["effort"] = self.effort
+        response = self._request("turn/start", settings, timeout=20)
         turn = response.get("turn") or {}
         turn_id = turn.get("id")
         if not turn_id:

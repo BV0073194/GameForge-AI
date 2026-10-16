@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 from server.codex_app_server import CodexAppServer, AppServerUnavailable, AppServerProtocolError
+from server.acp_transport import AcpAgentTransport
+from server.fusion_mcp import validate_mcp_servers, public_mcp_servers
 from server.wsl_cleanup import cleanup_wsl_project
 
 def _resource_root() -> Path:
@@ -1562,7 +1564,8 @@ class AgentState:
     active_process: subprocess.Popen | None = field(default=None, repr=False)
     active_process_kind: str = ""
     active_process_started_at: str | None = None
-    transport: CodexAppServer | None = field(default=None, repr=False)
+    transport: CodexAppServer | AcpAgentTransport | None = field(default=None, repr=False)
+    configured_transport: str = "auto"
     interrupt_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -1766,38 +1769,71 @@ def run_codex_agent_stream(
 
 
 def _fusion_agent_question(p: Path, state: AgentState, message: dict[str, Any]) -> bool:
-    """Bridge actual Codex questions and permission requests to the GameForge UI."""
+    """Persist real agent requests for explicit approval, MCP elicitation or answers."""
     method = str(message.get("method", ""))
     params = message.get("params") or {}
+    if not isinstance(params, dict):
+        params = {}
     questions = params.get("questions") or []
-    approvals = {"item/commandExecution/requestApproval", "item/fileChange/requestApproval"}
+    approvals = {
+        "item/commandExecution/requestApproval",
+        "item/fileChange/requestApproval",
+        "item/permissions/requestApproval",
+        "execCommandApproval",
+        "applyPatchApproval",
+    }
+    protocol = "acp" if isinstance(state.transport, AcpAgentTransport) else "codex-app-server"
+    permission_options = []
     if method == "item/tool/requestUserInput":
         if not isinstance(questions, list) or not questions:
             return False
         first = questions[0] if isinstance(questions[0], dict) else {}
-        options = first.get("options") or []
-        choices = [str(x.get("label")) for x in options if isinstance(x, dict) and x.get("label")]
+        choices = [str(x.get("label")) for x in (first.get("options") or []) if isinstance(x, dict) and x.get("label")]
         title = str(first.get("header") or "Codex needs your input")[:180]
         detail = str(first.get("question") or "How should Codex proceed?")[:3000]
+        kind = "choice" if choices else "text"
+    elif method == "session/request_permission":
+        raw_options = params.get("options") or []
+        permission_options = [
+            {"id": str(x["optionId"]), "label": str(x.get("name") or x.get("kind") or x["optionId"])}
+            for x in raw_options if isinstance(x, dict) and x.get("optionId")
+        ]
+        if not permission_options:
+            return False
+        choices = [x["label"] for x in permission_options] + ["Decline"]
+        title = "ACP agent requests permission"
+        tool = params.get("toolCall") or {}
+        detail = str(_auth_redact(str(params.get("title") or (tool.get("title") if isinstance(tool, dict) else "") or "Approve an agent action?")))[:3000]
+        kind = "choice"
     elif method in approvals:
         choices = ["Approve once", "Decline"]
-        title = "Approve Codex command?" if "commandExecution" in method else "Approve Codex file changes?"
-        reason = str(params.get("reason") or "The coding agent requested permission.")
+        title = "Approve agent permissions?" if "permissions" in method else "Approve Codex command or file edit?"
+        reason = str(params.get("reason") or "The coding agent requested your authorization.")
         cmd = str(params.get("command") or "")
         detail = str(_auth_redact(reason + ("\nCommand: " + cmd if cmd else "")))[:3000]
         questions = []
+        kind = "choice"
+    elif method in {"mcpServer/elicitation/request", "elicitation/create"}:
+        choices = []
+        questions = []
+        kind = "json"
+        title = "MCP server needs your input"
+        detail = str(_auth_redact(str(params.get("message") or params.get("title") or "Review the requested fields before responding.")))[:3000]
     else:
         return False
     request = {
-        "id": "codex-" + str(message.get("id")),
-        "protocol": "codex-app-server",
+        "id": "fusion-request-" + str(message.get("id")),
+        "protocol": protocol,
         "rpc_request_id": message.get("id"),
         "rpc_method": method,
-        "kind": "choice" if choices else "text",
+        "kind": kind,
         "title": title,
         "message": detail,
         "choices": choices,
         "questions": questions,
+        "permission_options": permission_options,
+        "requested_schema": params.get("requestedSchema") if kind == "json" else None,
+        "requested_permissions": params.get("permissions") if method == "item/permissions/requestApproval" else None,
         "status": "pending",
         "resume_after_submit": False,
         "created_at": now_iso(),
@@ -1808,9 +1844,22 @@ def _fusion_agent_question(p: Path, state: AgentState, message: dict[str, Any]) 
     set_agent_activity(state, "Waiting for your answer", request["message"], "question")
     return True
 
+
 def _fusion_codex_activity(state: AgentState, event: dict[str, Any]) -> None:
     """Publish meaningful task transitions, not every token delta (disk/CPU hot path)."""
     method = str(event.get("method") or "")
+    if method == "session/update":
+        update = (event.get("params") or {}).get("update") or {}
+        if isinstance(update, dict):
+            kind = str(update.get("sessionUpdate") or "")
+            if kind in {"tool_call", "tool_call_update"}:
+                title = str(_auth_redact(str(update.get("title") or update.get("toolCallId") or "Agent tool call")))[:350]
+                set_agent_activity(state, "ACP tool activity", title, "command")
+            elif kind in {"agent_message_chunk", "agent_message"}:
+                state.last_activity_at = now_iso()
+            elif kind:
+                set_agent_activity(state, "ACP agent update", kind[:120], "agent")
+        return
     if method.endswith("/delta") or method.endswith("Delta"):
         state.last_activity_at = now_iso()
         return
@@ -1826,6 +1875,9 @@ def run_codex_fusion_stream(
     args: list[str], *, cwd: Path, input_text: str, timeout: int,
     trace_path: Path, state: AgentState, permission_mode: str = "full-auto",
     transport_mode: str = "auto",
+    mcp_servers: list[dict[str, Any]] | None = None,
+    acp_command: list[str] | None = None,
+    model: str = "", effort: str = "",
 ) -> subprocess.CompletedProcess[str]:
     """Prefer a persistent, steerable Codex session; fall back only before work starts."""
     # Persist a safe transport downgrade across recovery attempts. A lost
@@ -1835,33 +1887,51 @@ def run_codex_fusion_stream(
     input_text = input_text.encode("utf-8", errors="replace").decode("utf-8")
     if transport_mode == "auto" and downgrade_path.exists():
         transport_mode = "exec"
+    codex_args = list(args)
+    if model and transport_mode != "acp":
+        codex_args[-1:-1] = ["--model", model]
+    if effort and transport_mode != "acp":
+        codex_args[-1:-1] = ["-c", f"model_reasoning_effort={effort}"]
     if transport_mode == "exec":
         return run_codex_agent_stream(
-            args, cwd=cwd, input_text=input_text, timeout=timeout,
+            codex_args, cwd=cwd, input_text=input_text, timeout=timeout,
             trace_path=trace_path, state=state,
         )
     if state.transport is None:
-        command, use_shell = _command_invocation("codex", ["app-server"])
-        state.transport = CodexAppServer(
-            command, shell=use_shell, cwd=cwd, env=_codex_process_env(),
-            permission_mode=permission_mode,
-            on_event=lambda event: _fusion_codex_activity(state, event),
-            on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
-        )
+        if transport_mode == "acp":
+            if not isinstance(acp_command, list) or not acp_command or not all(isinstance(x, str) and x for x in acp_command):
+                return subprocess.CompletedProcess(args, 1, "", "Configure agent.acp_command as an executable and argument list")
+            state.transport = AcpAgentTransport(
+                acp_command, cwd=cwd, env=_gameforge_process_env(),
+                mcp_servers=mcp_servers or [],
+                on_event=lambda event: _fusion_codex_activity(state, event),
+                on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
+            )
+        else:
+            command, use_shell = _command_invocation("codex", ["app-server"])
+            state.transport = CodexAppServer(
+                command, shell=use_shell, cwd=cwd, env=_codex_process_env(),
+                permission_mode=permission_mode, mcp_servers=mcp_servers or [],
+                model=model, effort=effort,
+                on_event=lambda event: _fusion_codex_activity(state, event),
+                on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
+            )
     transport = state.transport
     assert transport is not None
     try:
         transport.open()
     except AppServerUnavailable as exc:
         state.transport = None
+        if transport_mode == "acp":
+            return subprocess.CompletedProcess(args, 1, "", "ACP agent unavailable: " + str(exc))
         set_agent_activity(state, "Using compatible Codex engine", 
                            "App-server handshake unavailable; using the verified Codex exec path.", "fallback")
         auth_trace("codex_app_server_fallback", reason=str(exc)[:800])
         return run_codex_agent_stream(
-            args, cwd=cwd, input_text=input_text, timeout=timeout,
+            codex_args, cwd=cwd, input_text=input_text, timeout=timeout,
             trace_path=trace_path, state=state,
         )
-    _bind_active_process(state, transport.process, "codex-app-server")
+    _bind_active_process(state, transport.process, "acp" if transport_mode == "acp" else "codex-app-server")
     try:
         return transport.run_turn(
             input_text, timeout=timeout, trace_path=trace_path,
@@ -1879,11 +1949,17 @@ def run_codex_fusion_stream(
             "ambiguous_turn_not_replayed": True,
             "stderr_tail": "".join(transport._stderr_lines)[-6000:],
         }
-        write_json(cwd / ".gameforge" / "codex_transport_downgrade.json", diagnostics)
-        auth_trace("codex_app_server_protocol_downgrade", **diagnostics)
+        if transport_mode != "acp":
+            write_json(cwd / ".gameforge" / "codex_transport_downgrade.json", diagnostics)
+        if transport_mode != "acp":
+            auth_trace("codex_app_server_protocol_downgrade", **diagnostics)
+        else:
+            auth_trace("acp_protocol_failure", reason=str(exc)[:800])
         transport.close()
         state.transport = None
-        return subprocess.CompletedProcess(args, 1, "", f"Codex app-server protocol failed: {exc}; next iteration will use codex exec")
+        label = "ACP agent" if transport_mode == "acp" else "Codex app-server"
+        suffix = "" if transport_mode == "acp" else "; next iteration will use codex exec"
+        return subprocess.CompletedProcess(args, 1, "", f"{label} protocol failed: {exc}{suffix}")
     finally:
         req = load_user_input_request(cwd)
         if req and req.get("protocol") == "codex-app-server":
@@ -1900,7 +1976,7 @@ def mark_live_instruction_steered(p: Path, item_id: str) -> bool:
         data = load_live_queue(p)
         for item in data.get("items", []):
             if item.get("id") == item_id and item.get("status") == "queued":
-                item["status"] = "delivered"
+                item["status"] = "awaiting_verification"
                 item["delivered_at"] = now_iso()
                 item["delivery"] = "in-turn-steer"
                 save_live_queue(p, data)
@@ -1954,17 +2030,23 @@ def load_live_queue(p: Path) -> dict[str, Any]:
     items = data.get("items")
     if not isinstance(items, list):
         items = []
-    data["version"] = 1
+    data["version"] = 2
     data["items"] = [x for x in items if isinstance(x, dict)]
+    # Old "delivered" records only meant Codex received the message. They
+    # never proved implementation and must not appear as completed work.
+    for item in data["items"]:
+        if item.get("status") == "delivered":
+            item["status"] = "awaiting_verification"
+            item["migration_note"] = "Legacy delivery was not proof of implementation"
     return data
 
 
 def save_live_queue(p: Path, data: dict[str, Any]) -> dict[str, Any]:
-    data["version"] = 1
+    data["version"] = 2
     data["updated_at"] = now_iso()
     items = [x for x in data.get("items", []) if isinstance(x, dict)]
-    pending = [x for x in items if x.get("status") in {"queued", "in_progress"}]
-    recent = [x for x in items if x.get("status") not in {"queued", "in_progress"}][-200:]
+    pending = [x for x in items if x.get("status") in {"queued", "in_progress", "awaiting_verification"}]
+    recent = [x for x in items if x.get("status") not in {"queued", "in_progress", "awaiting_verification"}][-200:]
     data["items"] = sorted(pending + recent, key=lambda x: str(x.get("created_at", "")))
     write_json(live_queue_path(p), data)
     return data
@@ -1975,10 +2057,13 @@ def live_queue_public(p: Path) -> dict[str, Any]:
     items = data.get("items", [])
     queued = [x for x in items if x.get("status") == "queued"]
     in_progress = [x for x in items if x.get("status") == "in_progress"]
-    recent = [x for x in items if x.get("status") in {"delivered", "cancelled"}][-20:]
+    awaiting = [x for x in items if x.get("status") == "awaiting_verification"]
+    recent = [x for x in items if x.get("status") in {"verified", "cancelled"}][-20:]
     return {
         "queued": queued,
         "in_progress": in_progress,
+        "awaiting_verification": awaiting,
+        "awaiting_count": len(awaiting),
         "recent": recent,
         "queued_count": len(queued),
         "in_progress_count": len(in_progress),
@@ -2013,7 +2098,7 @@ def enqueue_live_instruction(
         "attempts": 0,
         "metadata": metadata or {},
     }
-    if sum(1 for x in data.get("items", []) if x.get("status") in {"queued", "in_progress"}) >= 1000:
+    if sum(1 for x in data.get("items", []) if x.get("status") in {"queued", "in_progress", "awaiting_verification"}) >= 1000:
         raise ValueError("Live queue is full (1000 pending instructions)")
     data.setdefault("items", []).append(item)
     save_live_queue(p, data)
@@ -2046,7 +2131,7 @@ def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[di
         if item.get("status") == "in_progress":
             item["status"] = "queued"
             item["requeued_at"] = now_iso()
-            item["requeue_reason"] = "previous turn did not settle"
+            item["requeue_reason"] = "unfinished user instruction requires verification"
             item.pop("claimed_iteration", None)
             changed = True
 
@@ -2072,8 +2157,9 @@ def settle_live_instructions(p: Path, iteration: int, *, delivered: bool, reason
         if item.get("status") != "in_progress" or int(item.get("claimed_iteration", -1) or -1) != iteration:
             continue
         if delivered:
-            item["status"] = "delivered"
+            item["status"] = "awaiting_verification"
             item["delivered_at"] = now_iso()
+            item["verification_state"] = "Awaiting implementation evidence and full project gates"
         else:
             item["status"] = "queued"
             item["requeued_at"] = now_iso()
@@ -2082,6 +2168,87 @@ def settle_live_instructions(p: Path, iteration: int, *, delivered: bool, reason
         changed = True
     if changed:
         save_live_queue(p, data)
+
+
+
+def reconcile_live_instruction_results(
+    p: Path, iteration: int, build_result: dict[str, Any], test_result: dict[str, Any],
+    change_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Close only instruction IDs backed by source evidence and configured gates.
+
+    Agents write evidence claims; GameForge independently checks that claimed
+    files exist and the *original* configured build and test both pass. A
+    missing gate or incomplete claim keeps the instruction pending.
+    """
+    raw = read_json(p / ".gameforge" / "live_instruction_results.json", {}) or {}
+    results = raw.get("results", []) if isinstance(raw, dict) else []
+    by_id = {str(x.get("id")): x for x in results if isinstance(x, dict) and x.get("id")}
+    gate_passed = all(
+        bool(gate.get("configured")) and bool(gate.get("ok"))
+        for gate in (build_result, test_result)
+    )
+    verified_ids: list[str] = []
+    changed_production = set((change_summary or {}).get("production_paths") or [])
+    with LIVE_QUEUE_LOCK:
+        data = load_live_queue(p)
+        for item in data.get("items", []):
+            if item.get("status") != "awaiting_verification":
+                continue
+            claim = by_id.get(item.get("id"))
+            if not claim or not claim.get("ready_for_verification"):
+                continue
+            resolution = claim.get("resolution")
+            evidence = claim.get("evidence")
+            files = claim.get("changed_paths")
+            if not isinstance(resolution, str) or len(resolution.strip()) < 12:
+                continue
+            if not isinstance(evidence, str) or len(evidence.strip()) < 12:
+                continue
+            if not isinstance(files, list) or not files or len(files) > 60:
+                continue
+            valid_files = True
+            for relative in files:
+                if not isinstance(relative, str) or not relative or len(relative) > 400:
+                    valid_files = False
+                    break
+                try:
+                    candidate = safe_child(p, relative)
+                    if not candidate.is_file() or ".gameforge" in candidate.parts:
+                        valid_files = False
+                        break
+                except (OSError, ValueError):
+                    valid_files = False
+                    break
+            if not valid_files:
+                continue
+            # A claim for an unchanged pre-existing file is not implementation
+            # evidence. Preserve a previously observed production change when
+            # a later iteration finally fixes the full regression gates.
+            prior_proof = item.get("verification_claim") or {}
+            observed_change = all(path.replace("\\\\", "/") in changed_production for path in files)
+            source_proven = observed_change or bool(prior_proof.get("production_change_observed"))
+            if not source_proven:
+                item["verification_state"] = "Evidence submitted but no relevant production change was observed"
+                continue
+            item["verification_claim"] = {
+                "production_change_observed": source_proven,
+                "resolution": resolution[:2500],
+                "evidence": evidence[:3500],
+                "changed_paths": files,
+                "iteration": iteration,
+                "configured_quality_gates_passed": gate_passed,
+            }
+            if gate_passed:
+                item["status"] = "verified"
+                item["verified_at"] = now_iso()
+                item["verification_state"] = "Agent evidence accepted; configured build and tests passed"
+                verified_ids.append(item["id"])
+            else:
+                item["verification_state"] = "Implementation claimed; full build/test gates have not passed"
+        save_live_queue(p, data)
+    return {"verified_ids": verified_ids, "gates_passed": gate_passed}
+
 
 
 def user_input_request_path(p: Path) -> Path:
@@ -2400,7 +2567,11 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     pipeline = iteration_pipeline_settings(cfg)
     fast_pipeline = bool(pipeline.get("enabled"))
     review = load_user_review(p)
-    live_inputs = claim_live_instructions(p, iteration)
+    newly_claimed_live = claim_live_instructions(p, iteration)
+    # Previously delivered but unverified work remains active. Put new requests
+    # last so prompt-tail context truncation never preferentially loses them.
+    awaiting_live = live_queue_public(p).get("awaiting_verification", [])
+    live_inputs = awaiting_live[:12] + newly_claimed_live
     if fast_pipeline and pipeline.get("compact_context", True):
         compact = {
             "generated_at": now_iso(),
@@ -2424,6 +2595,22 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
         evidence = collect_logs(p, cfg)
     prior = ""
     if live_inputs:
+        prior += """
+LIVE USER WORK-ORDER CONTRACT: Receiving a message or finishing a turn
+does NOT prove the work is implemented. Every listed instruction is
+persistent and takes priority over lower-value roadmap work. After making
+real project changes and targeted tests, update
+.gameforge/live_instruction_results.json using this exact JSON format:
+{"results":[{"id":"EXACT_LIVE_ID","ready_for_verification":true,
+"resolution":"Detailed description of what changed",
+"evidence":"Specific build, test and runtime evidence",
+"changed_paths":["workspace/real-source-file"]}]}
+Use the actual IDs from the queue. Keep unfinished entries pending and
+report genuine blockers in iteration notes. Never invent evidence, and
+never delete previous valid results. GameForge independently requires
+the originally configured full build and test to pass before it accepts
+a completion claim.
+"""
         prior += (
             "\nLIVE USER INSTRUCTIONS — THESE ARRIVED WHILE THE AGENT WAS RUNNING. "
             "Honor them before lower-priority roadmap work. If an instruction conflicts with an older plan, "
@@ -2518,9 +2705,14 @@ def agent_loop(project_id: str) -> None:
     state.started_at = now_iso()
     state.message = "Starting autonomous game-development loop"
     try:
-        if not command_exists("codex"):
+        engine = str(cfg.get("agent", {}).get("transport", "auto"))
+        if engine != "acp" and not command_exists("codex"):
             state.status = "blocked"
             state.message = "Codex CLI not found. Install it and sign in with your ChatGPT account."
+            return
+        if engine == "acp" and not cfg.get("agent", {}).get("acp_command"):
+            state.status = "blocked"
+            state.message = "Choose an installed ACP agent command in Settings before starting."
             return
         while not state.stop_event.is_set():
             review = load_user_review(p)
@@ -2539,7 +2731,7 @@ def agent_loop(project_id: str) -> None:
             # report logged in yet send Responses requests with no Authorization
             # header. Verify the real request path before consuming an iteration.
             # Run this before incrementing so a failed auth check remains iteration 0.
-            if time.monotonic() - auth_verified_at >= 1800:
+            if engine != "acp" and time.monotonic() - auth_verified_at >= 1800:
                 set_agent_activity(state, "Checking AI runtime", "Verifying Codex authentication and inference before starting this iteration.", "check")
                 auth_check = codex_auth_preflight(p)
                 if not auth_check.get("ok"):
@@ -2576,15 +2768,19 @@ def agent_loop(project_id: str) -> None:
                 codex_args += ["--dangerously-bypass-approvals-and-sandbox"]
             else:
                 codex_args += ["--sandbox", "workspace-write"]
-            auth_trace("agent_codex_exec", project=str(p), iteration=iteration,
-                       permission_mode=permission_mode, codex_args=codex_args)
+            if engine == "acp":
+                auth_trace("agent_acp_invocation", project=str(p), iteration=iteration,
+                           agent_executable=Path(cfg.get("agent", {}).get("acp_command", [""])[0]).name)
+            else:
+                auth_trace("agent_codex_exec", project=str(p), iteration=iteration,
+                           permission_mode=permission_mode, codex_args=codex_args)
             # "-" forces Codex to read the prompt from stdin. This avoids Windows
             # npm .cmd shim execution issues and command-line length limits.
             codex_args.append("-")
             started = time.time()
             try:
                 trace_path.write_text("", encoding="utf-8")
-                set_agent_activity(state, "AI is working on the project", "Codex is reading, editing, diagnosing, building, or testing. Live command activity will appear here.", "agent")
+                set_agent_activity(state, "AI is working on the project", "The coding agent is reading, editing, diagnosing, building, or testing. Live activity will appear here.", "agent")
                 proc = run_codex_fusion_stream(
                     codex_args,
                     cwd=p,
@@ -2594,6 +2790,10 @@ def agent_loop(project_id: str) -> None:
                     state=state,
                     permission_mode=permission_mode,
                     transport_mode=str(cfg.get("agent", {}).get("transport", "auto")),
+                    mcp_servers=cfg.get("mcp_servers", []),
+                    acp_command=cfg.get("agent", {}).get("acp_command", []),
+                    model=str(cfg.get("agent", {}).get("model", "") or ""),
+                    effort=str(cfg.get("agent", {}).get("effort", "") or ""),
                 )
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 if state.stop_event.is_set():
@@ -2634,6 +2834,10 @@ def agent_loop(project_id: str) -> None:
                     )
                     combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
                     lower = combined.lower()
+                    if engine == "acp" and "ACP agent unavailable:" in combined:
+                        state.status = "blocked"
+                        state.message = "ACP handshake failed: " + str(proc.stderr)[-1200:]
+                        return
                     if "401 unauthorized" in lower:
                         state.status = "blocked"
                         state.message = "Codex authentication was rejected (401). Project state is preserved; sign in again, then Resume."
@@ -2749,6 +2953,7 @@ def agent_loop(project_id: str) -> None:
                 set_agent_activity(state, "Stopped", state.message, "stopped")
                 return
 
+            live_verification = reconcile_live_instruction_results(p, iteration, build_result, test_result, change_summary)
             review_after_verification = reconcile_feedback_work_orders(
                 p,
                 review_before_iteration,
@@ -2791,6 +2996,7 @@ def agent_loop(project_id: str) -> None:
                 "test": {k:v for k,v in test_result.items() if k != "output"},
                 "visual": read_json(p / "captures/metrics.json", {}),
                 "pending_user_feedback": pending_feedback_count,
+                "live_instruction_verification": live_verification,
                 "change_summary": change_summary,
                 "delivery_state": delivery_state,
             }
@@ -2861,7 +3067,8 @@ def start_agent(project_id: str) -> dict[str, Any]:
             return agent_public(existing)
         persisted_iteration = int((read_json(p / ".gameforge" / "last_evidence.json", {}) or {}).get("iteration", 0) or 0)
         resume_iteration = max(persisted_iteration, existing.iteration if existing else 0)
-        state = AgentState(project_id=project_id, iteration=resume_iteration)
+        state = AgentState(project_id=project_id, iteration=resume_iteration,
+                           configured_transport=str(cfg.get("agent", {}).get("transport", "auto")))
         AGENTS[project_id] = state
         t = threading.Thread(target=agent_loop, args=(project_id,), daemon=True, name=f"agent-{project_id}")
         state.thread = t
@@ -2911,8 +3118,8 @@ def interrupt_agent_and_restart(project_id: str, reason: str = "live user instru
 def agent_public(s: AgentState) -> dict[str, Any]:
     return {
         "project_id": s.project_id,
-        "transport": "app-server" if s.transport is not None else "exec",
-        "steering_available": bool(s.transport and s.transport.active),
+        "transport": ("acp" if isinstance(s.transport, AcpAgentTransport) else ("app-server" if s.transport is not None else s.active_process_kind or s.configured_transport)),
+        "steering_available": bool(s.transport and s.transport.active and not isinstance(s.transport, AcpAgentTransport)),
         "status": s.status,
         "iteration": s.iteration,
         "message": s.message,
@@ -4320,16 +4527,30 @@ class Handler(SimpleHTTPRequestHandler):
             p = project_path(pid); cfg = project_config(pid)
             if action == "config":
                 body = self.body_json()
-                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","fusion","agent","visual","log_globs"}
+                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","fusion","agent","visual","log_globs","mcp_servers"}
                 for k,v in body.items():
                     if k not in allowed:
                         continue
                     if k == "agent" and isinstance(v, dict):
                         existing = cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
-                        allowed_agent = {"transport", "permission_mode", "max_iterations", "cooldown_sec", "max_auto_recovery_attempts"}
+                        allowed_agent = {"transport", "permission_mode", "max_iterations", "cooldown_sec", "max_auto_recovery_attempts", "acp_command", "model", "effort"}
                         cfg["agent"] = {**existing, **{key: value for key, value in v.items() if key in allowed_agent}}
-                        if cfg["agent"].get("transport") not in {"auto", "app-server", "exec"}:
+                        if cfg["agent"].get("transport") not in {"auto", "app-server", "exec", "acp"}:
                             return self.send_json({"error": "Unsupported agent transport"}, 400)
+                        command = cfg["agent"].get("acp_command", [])
+                        if not isinstance(command, list) or len(command) > 64 or any(not isinstance(x, str) or not x or len(x) > 2048 for x in command):
+                            return self.send_json({"error": "ACP command must be a list of executable and arguments"}, 400)
+                        model = cfg["agent"].get("model", "")
+                        effort = cfg["agent"].get("effort", "")
+                        if not isinstance(model, str) or len(model) > 100 or (model and not re.fullmatch(r"[A-Za-z0-9._:/-]+", model)):
+                            return self.send_json({"error": "Invalid Codex model identifier"}, 400)
+                        if effort not in {"", "minimal", "low", "medium", "high", "xhigh"}:
+                            return self.send_json({"error": "Unsupported Codex effort"}, 400)
+                    elif k == "mcp_servers":
+                        try:
+                            cfg[k] = validate_mcp_servers(v)
+                        except ValueError as exc:
+                            return self.send_json({"error": str(exc)}, 400)
                     else:
                         cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
@@ -4379,7 +4600,7 @@ class Handler(SimpleHTTPRequestHandler):
                     data = load_live_queue(p)
                     changed = False
                     for item in data.get("items", []):
-                        if item.get("id") == item_id and item.get("status") == "queued":
+                        if item.get("id") == item_id and item.get("status") in {"queued", "awaiting_verification"}:
                             item["status"] = "cancelled"
                             item["cancelled_at"] = now_iso()
                             changed = True
@@ -4463,17 +4684,53 @@ class Handler(SimpleHTTPRequestHandler):
                 else:
                     supplied = str(response)
                 st = AGENTS.get(pid)
-                if req.get("protocol") == "codex-app-server":
+                if req.get("protocol") in {"codex-app-server", "acp"}:
                     if not st or not st.transport or not st.transport.active:
                         return self.send_json({"error": "The Codex question is no longer active"}, 409)
-                    if req.get("rpc_method") in {
-                        "item/commandExecution/requestApproval", "item/fileChange/requestApproval"
+                    rpc_method = str(req.get("rpc_method") or "")
+                    if rpc_method == "session/request_permission":
+                        choice = next((x for x in (req.get("permission_options") or []) if x.get("label") == response), None)
+                        if response != "Decline" and not choice:
+                            return self.send_json({"error": "Select a listed permission option or Decline"}, 400)
+                        outcome = {"outcome": "selected", "optionId": choice["id"]} if choice else {"outcome": "cancelled"}
+                        st.transport.reply(req["rpc_request_id"], {"outcome": outcome})
+                    elif rpc_method in {"mcpServer/elicitation/request", "elicitation/create"}:
+                        if response == "Decline":
+                            answer = {"action": "decline", "content": None}
+                        else:
+                            try:
+                                values = json.loads(response) if isinstance(response, str) else response
+                            except ValueError:
+                                return self.send_json({"error": "Provide valid JSON or Decline"}, 400)
+                            if not isinstance(values, dict):
+                                return self.send_json({"error": "MCP elicitation requires a JSON object"}, 400)
+                            schema = req.get("requested_schema") or {}
+                            required = schema.get("required", []) if isinstance(schema, dict) else []
+                            if any(field not in values for field in required):
+                                return self.send_json({"error": "Some required MCP form fields are missing"}, 400)
+                            answer = {"action": "accept", "content": values}
+                        st.transport.reply(req["rpc_request_id"], answer)
+                    elif rpc_method in {
+                        "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                        "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval",
                     }:
                         if response not in {"Approve once", "Decline"}:
                             return self.send_json({"error": "Choose Approve once or Decline"}, 400)
-                        st.transport.reply(req["rpc_request_id"], {
-                            "decision": "accept" if response == "Approve once" else "decline"
-                        })
+                        approved = response == "Approve once"
+                        if rpc_method == "item/permissions/requestApproval":
+                            answer = {"permissions": req.get("requested_permissions") or {}, "scope": "turn"} if approved else {"permissions": {}, "scope": "turn"}
+                        elif rpc_method in {"execCommandApproval", "applyPatchApproval"}:
+                            answer = {"decision": "approved" if approved else "denied"}
+                        else:
+                            answer = {"decision": "accept" if approved else "decline"}
+                        st.transport.reply(req["rpc_request_id"], answer)
+                    else:
+                        answers = None
+                    if rpc_method in {
+                        "session/request_permission", "mcpServer/elicitation/request", "elicitation/create",
+                        "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+                        "item/permissions/requestApproval", "execCommandApproval", "applyPatchApproval",
+                    }:
                         req["status"] = "fulfilled"
                         req["fulfilled_at"] = now_iso()
                         write_json(user_input_request_path(p), req)
