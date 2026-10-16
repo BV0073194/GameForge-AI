@@ -68,7 +68,7 @@ Bound message size and queue growth; redact auth tokens from logs; validate proj
 - Tests use a simulated app-server. A real signed-in Codex session has not yet been exercised against this branch, nor has a native packaged executable been tested.
 - Command/file approvals and Codex tool questions are bridged; advanced permission requests and MCP elicitation remain unsupported and default to rejection.
 - A failed app-server handshake falls back to CLI. An error after turn start is reported rather than blindly replaying edits.
-- Do not merge this development branch to `main` before real Codex and native Windows validation.
+- The original PR #7 was merged in October 2026; its source smoke tests were green, but real Codex/native Windows validation remained outstanding. Treat this as a record of the original integration, not a current merge gate.
 
 ## Automatic project-scoped WSL cleanup
 
@@ -88,3 +88,7 @@ environment is missing, cleanup skips safely and records why in
 
 Set `cleanup.wsl_cleanup_enabled=false` to disable, or
 `cleanup.wsl_min_age_hours` to increase the retention age.
+
+## Follow-on integration: ACP, MCP and instruction verification
+
+The newer Fusion integration adds an external ACP v1 agent transport, project-scoped MCP server configuration for Codex/ACP, interactive MCP elicitation and ACP permission requests, Codex model and effort controls, and a durable `awaiting_verification` state for live instructions. It requires actual production file changes and original configured build/test gates before recording verified work orders. See [FUSION_MCP_ACP_GUIDE.md](FUSION_MCP_ACP_GUIDE.md) for configuration, compatibility limitations and open end-to-end test requirements. This is an independent implementation based on protocol observations rather than a copy of Melty's distribution code.
