@@ -414,8 +414,24 @@ with tempfile.TemporaryDirectory() as td:
         assert any(x.get("source") == "agent-answer" and "option-a" in x.get("text", "")
                    for x in answer_items), answer_items
 
+        # User-review feedback must also reach the durable live-agent queue.
+        feedback_request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/project/{cfg['id']}/review/feedback",
+            data=json.dumps({"text": "Make the player weapon changes a priority.", "category": "gameplay"}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(feedback_request, timeout=5) as r:
+            submitted = json.loads(r.read())
+            feedback_id = submitted["feedback"][-1]["id"]
+        linked = [x for x in app.load_live_queue(p)["items"]
+                  if (x.get("metadata") or {}).get("feedback_id") == feedback_id]
+        assert len(linked) == 1 and linked[0]["status"] == "queued", linked
+
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/project/{cfg['id']}/state", timeout=5) as r:
             state_payload = json.loads(r.read())
+            assert "iteration_progress" in state_payload
+            assert "agent_iteration" in state_payload["iteration_progress"]
+            assert "project_progress_iteration" in state_payload["iteration_progress"]
             assert "live_queue" in state_payload
             assert state_payload["fusion_manifest"]["format"] == "GameForgeAI.Fusion"
             assert "fusion_deployment" in state_payload
