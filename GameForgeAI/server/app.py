@@ -1588,6 +1588,7 @@ MANAGED_PROCESS_META: dict[str, dict[str, Any]] = {}
 PROJECT_COMMAND_LOCKS: dict[str, threading.RLock] = {}
 PROJECT_COMMAND_LOCKS_GUARD = threading.Lock()
 LIVE_QUEUE_LOCK = threading.RLock()
+USER_REVIEW_LOCK = threading.RLock()
 APP_SERVER: ThreadingHTTPServer | None = None
 WEB_SESSION = {"last_heartbeat": time.monotonic(), "closing": False, "shutdown_started": False}
 
@@ -2417,37 +2418,99 @@ def user_review_path(p: Path) -> Path:
     return p / ".gameforge" / "user_review.json"
 
 
-def load_user_review(p: Path) -> dict[str, Any]:
-    data = read_json(user_review_path(p), {}) or {}
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("user_done", False)
-    data.setdefault("satisfaction", None)
-    data.setdefault("feedback", [])
+def user_feedback_inbox_path(p: Path) -> Path:
+    return p / ".gameforge" / "user_feedback_inbox.json"
+
+
+def user_review_atomic(fn):
+    """Serialize user-feedback transactions against the agent verifier."""
+    def wrapped(*args, **kwargs):
+        with USER_REVIEW_LOCK:
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+def _original_feedback(item: dict[str, Any]) -> dict[str, Any]:
+    """Preserve user-authored fields; the AI may only propose resolution data."""
+    return {key: item.get(key) for key in ("id", "created_at", "category", "text")}
+
+
+def _restore_feedback_inbox(p: Path, data: dict[str, Any]) -> dict[str, Any]:
+    items = data.get("feedback")
+    if not isinstance(items, list):
+        items = []
+    items = [x for x in items if isinstance(x, dict) and x.get("id")]
+    path = user_feedback_inbox_path(p)
+    inbox = read_json(path, {}) or {}
+    records = inbox.get("entries") if isinstance(inbox, dict) else []
+    if not isinstance(records, list):
+        records = []
+    # One-time migration of old user reviews predating the durable inbox.
+    if not path.exists() and items:
+        records = [_original_feedback(item) for item in items]
+        write_json(path, {"version": 1, "entries": records})
+    by_id = {str(x["id"]): x for x in items}
+    for original in records:
+        if not isinstance(original, dict) or not original.get("id"):
+            continue
+        feedback_id = str(original["id"])
+        current = by_id.get(feedback_id)
+        if current is None:
+            current = {
+                **original, "addressed": False, "status": "pending",
+                "ready_for_verification": False, "resolution": "", "evidence": "",
+            }
+            items.append(current)
+            by_id[feedback_id] = current
+        else:
+            for field in ("id", "created_at", "category", "text"):
+                if field in original:
+                    current[field] = original[field]
+    data["feedback"] = items
     return data
 
 
+def load_user_review(p: Path) -> dict[str, Any]:
+    with USER_REVIEW_LOCK:
+        data = read_json(user_review_path(p), {}) or {}
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("user_done", False)
+        data.setdefault("satisfaction", None)
+        return _restore_feedback_inbox(p, data)
+
+
+@user_review_atomic
 def save_user_review(p: Path, data: dict[str, Any]) -> dict[str, Any]:
+    data = _restore_feedback_inbox(p, data)
     data["updated_at"] = now_iso()
     write_json(user_review_path(p), data)
     return data
 
 
+@user_review_atomic
 def append_user_feedback(p: Path, text: str, category: str = "general") -> dict[str, Any]:
     review = load_user_review(p)
-    feedback = review.setdefault("feedback", [])
-    text = text.encode("utf-8", errors="replace").decode("utf-8")
-    feedback.append({
-        "id": f"feedback-{int(time.time() * 1000)}",
+    text = str(text or "").encode("utf-8", errors="replace").decode("utf-8")
+    item = {
+        "id": f"feedback-{int(time.time() * 1000)}-{uuid4().hex[:10]}",
         "created_at": now_iso(),
         "category": category or "general",
         "text": text.strip(),
-        "addressed": False,
-        "status": "pending",
+        "addressed": False, "status": "pending",
         "ready_for_verification": False,
-        "resolution": "",
-        "evidence": "",
-    })
+        "resolution": "", "evidence": "",
+    }
+    # Journal the authoritative user content FIRST. If a running agent later
+    # rewrites an older user_review.json, its missing entries are rehydrated.
+    path = user_feedback_inbox_path(p)
+    inbox = read_json(path, {}) or {}
+    entries = inbox.get("entries") if isinstance(inbox, dict) else None
+    if not isinstance(entries, list):
+        entries = []
+    entries.append(_original_feedback(item))
+    write_json(path, {"version": 1, "entries": entries})
+    review.setdefault("feedback", []).append(item)
     return save_user_review(p, review)
 
 
@@ -2459,6 +2522,7 @@ def pending_user_feedback(p: Path) -> list[dict[str, Any]]:
     ]
 
 
+@user_review_atomic
 def reconcile_feedback_work_orders(
     p: Path,
     before: dict[str, Any],
