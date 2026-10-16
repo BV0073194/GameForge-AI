@@ -38,11 +38,15 @@ class CodexAppServer:
         on_event: Callable[[dict[str, Any]], None] | None = None,
         on_question: Callable[[dict[str, Any]], bool] | None = None,
         mcp_servers: list[dict[str, Any]] | None = None,
+        model: str = "",
+        effort: str = "",
     ) -> None:
         self.command, self.shell, self.cwd, self.env = command, shell, cwd, env
         self.permission_mode = permission_mode
         self.on_event, self.on_question = on_event, on_question
         self.mcp_servers = mcp_servers or []
+        self.model = model
+        self.effort = effort
         self.process: subprocess.Popen[str] | None = None
         self.thread_id: str | None = None
         self.turn_id: str | None = None
@@ -247,9 +251,14 @@ class CodexAppServer:
         self.open()
         assert self.thread_id
         prompt = prompt.encode("utf-8", errors="replace").decode("utf-8")
-        response = self._request("turn/start", {
+        settings: dict[str, Any] = {
             "threadId": self.thread_id, "input": [{"type": "text", "text": prompt}],
-        }, timeout=20)
+        }
+        if self.model:
+            settings["model"] = self.model
+        if self.effort:
+            settings["effort"] = self.effort
+        response = self._request("turn/start", settings, timeout=20)
         turn = response.get("turn") or {}
         turn_id = turn.get("id")
         if not turn_id:
