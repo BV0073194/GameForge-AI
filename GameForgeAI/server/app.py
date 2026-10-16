@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 from server.codex_app_server import CodexAppServer, AppServerUnavailable, AppServerProtocolError
+from server.acp_transport import AcpAgentTransport
+from server.fusion_mcp import validate_mcp_servers, public_mcp_servers
 from server.wsl_cleanup import cleanup_wsl_project
 
 def _resource_root() -> Path:
@@ -1562,7 +1564,7 @@ class AgentState:
     active_process: subprocess.Popen | None = field(default=None, repr=False)
     active_process_kind: str = ""
     active_process_started_at: str | None = None
-    transport: CodexAppServer | None = field(default=None, repr=False)
+    transport: CodexAppServer | AcpAgentTransport | None = field(default=None, repr=False)
     interrupt_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -1826,6 +1828,8 @@ def run_codex_fusion_stream(
     args: list[str], *, cwd: Path, input_text: str, timeout: int,
     trace_path: Path, state: AgentState, permission_mode: str = "full-auto",
     transport_mode: str = "auto",
+    mcp_servers: list[dict[str, Any]] | None = None,
+    acp_command: list[str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Prefer a persistent, steerable Codex session; fall back only before work starts."""
     # Persist a safe transport downgrade across recovery attempts. A lost
@@ -1841,19 +1845,31 @@ def run_codex_fusion_stream(
             trace_path=trace_path, state=state,
         )
     if state.transport is None:
-        command, use_shell = _command_invocation("codex", ["app-server"])
-        state.transport = CodexAppServer(
-            command, shell=use_shell, cwd=cwd, env=_codex_process_env(),
-            permission_mode=permission_mode,
-            on_event=lambda event: _fusion_codex_activity(state, event),
-            on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
-        )
+        if transport_mode == "acp":
+            if not isinstance(acp_command, list) or not acp_command or not all(isinstance(x, str) and x for x in acp_command):
+                return subprocess.CompletedProcess(args, 1, "", "Configure agent.acp_command as an executable and argument list")
+            state.transport = AcpAgentTransport(
+                acp_command, cwd=cwd, env=_codex_process_env(),
+                mcp_servers=mcp_servers or [],
+                on_event=lambda event: _fusion_codex_activity(state, event),
+                on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
+            )
+        else:
+            command, use_shell = _command_invocation("codex", ["app-server"])
+            state.transport = CodexAppServer(
+                command, shell=use_shell, cwd=cwd, env=_codex_process_env(),
+                permission_mode=permission_mode, mcp_servers=mcp_servers or [],
+                on_event=lambda event: _fusion_codex_activity(state, event),
+                on_question=lambda msg: _fusion_agent_question(cwd, state, msg),
+            )
     transport = state.transport
     assert transport is not None
     try:
         transport.open()
     except AppServerUnavailable as exc:
         state.transport = None
+        if transport_mode == "acp":
+            return subprocess.CompletedProcess(args, 1, "", "ACP agent unavailable: " + str(exc))
         set_agent_activity(state, "Using compatible Codex engine", 
                            "App-server handshake unavailable; using the verified Codex exec path.", "fallback")
         auth_trace("codex_app_server_fallback", reason=str(exc)[:800])
@@ -1879,8 +1895,12 @@ def run_codex_fusion_stream(
             "ambiguous_turn_not_replayed": True,
             "stderr_tail": "".join(transport._stderr_lines)[-6000:],
         }
-        write_json(cwd / ".gameforge" / "codex_transport_downgrade.json", diagnostics)
-        auth_trace("codex_app_server_protocol_downgrade", **diagnostics)
+        if transport_mode != "acp":
+            write_json(cwd / ".gameforge" / "codex_transport_downgrade.json", diagnostics)
+        if transport_mode != "acp":
+            auth_trace("codex_app_server_protocol_downgrade", **diagnostics)
+        else:
+            auth_trace("acp_protocol_failure", reason=str(exc)[:800])
         transport.close()
         state.transport = None
         return subprocess.CompletedProcess(args, 1, "", f"Codex app-server protocol failed: {exc}; next iteration will use codex exec")
@@ -2594,6 +2614,8 @@ def agent_loop(project_id: str) -> None:
                     state=state,
                     permission_mode=permission_mode,
                     transport_mode=str(cfg.get("agent", {}).get("transport", "auto")),
+                    mcp_servers=cfg.get("mcp_servers", []),
+                    acp_command=cfg.get("agent", {}).get("acp_command", []),
                 )
                 final_path.write_text((proc.stderr or "")[-120000:], encoding="utf-8")
                 if state.stop_event.is_set():
@@ -2911,8 +2933,8 @@ def interrupt_agent_and_restart(project_id: str, reason: str = "live user instru
 def agent_public(s: AgentState) -> dict[str, Any]:
     return {
         "project_id": s.project_id,
-        "transport": "app-server" if s.transport is not None else "exec",
-        "steering_available": bool(s.transport and s.transport.active),
+        "transport": ("acp" if isinstance(s.transport, AcpAgentTransport) else ("app-server" if s.transport is not None else s.active_process_kind or "exec")),
+        "steering_available": bool(s.transport and s.transport.active and not isinstance(s.transport, AcpAgentTransport)),
         "status": s.status,
         "iteration": s.iteration,
         "message": s.message,
@@ -4320,16 +4342,24 @@ class Handler(SimpleHTTPRequestHandler):
             p = project_path(pid); cfg = project_config(pid)
             if action == "config":
                 body = self.body_json()
-                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","fusion","agent","visual","log_globs"}
+                allowed = {"research_mode","internet_research","commands","command_timeout_sec","iteration_pipeline","cleanup","fusion","agent","visual","log_globs","mcp_servers"}
                 for k,v in body.items():
                     if k not in allowed:
                         continue
                     if k == "agent" and isinstance(v, dict):
                         existing = cfg.get("agent", {}) if isinstance(cfg.get("agent"), dict) else {}
-                        allowed_agent = {"transport", "permission_mode", "max_iterations", "cooldown_sec", "max_auto_recovery_attempts"}
+                        allowed_agent = {"transport", "permission_mode", "max_iterations", "cooldown_sec", "max_auto_recovery_attempts", "acp_command"}
                         cfg["agent"] = {**existing, **{key: value for key, value in v.items() if key in allowed_agent}}
-                        if cfg["agent"].get("transport") not in {"auto", "app-server", "exec"}:
+                        if cfg["agent"].get("transport") not in {"auto", "app-server", "exec", "acp"}:
                             return self.send_json({"error": "Unsupported agent transport"}, 400)
+                        command = cfg["agent"].get("acp_command", [])
+                        if not isinstance(command, list) or len(command) > 64 or any(not isinstance(x, str) or not x or len(x) > 2048 for x in command):
+                            return self.send_json({"error": "ACP command must be a list of executable and arguments"}, 400)
+                    elif k == "mcp_servers":
+                        try:
+                            cfg[k] = validate_mcp_servers(v)
+                        except ValueError as exc:
+                            return self.send_json({"error": str(exc)}, 400)
                     else:
                         cfg[k] = v
                 write_json(p / "gameforge.json", cfg)
