@@ -230,7 +230,7 @@ test('live app uses single-flight polling, stable agent questions and capture ti
     document:doc,window:win,navigator:win.navigator,fetch,URLSearchParams,
     location:{search:'?project=demo'},
     setTimeout(){return 1},clearTimeout(){},setInterval(){return 1},clearInterval(){},
-    alert(){},confirm(){return true},console,Blob:class{},Date
+    alert(){},confirm(){return true},console,Blob:class{},Date,AbortController
   });
   vm.runInContext(uiSource,context);
   vm.runInContext(appSource,context);
