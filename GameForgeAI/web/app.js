@@ -24,6 +24,7 @@ async function selectProject(id){
  stopProjectPolling();projectGeneration++;current=id;
  ui.resetProject();
  inputRequestBusy=false;inputRequestDirty=false;inputRequestPending=false;lastInputRequestKey=null;lastCaptureKey=null;
+ $('#inputRequest').hidden=true;$('#inputRequestControl').replaceChildren();
  acceptanceVisibleCount=5;activityVisibleCount=5;lastAcceptance=null;lastLiveAgent=null;lastManagedProcess=null;
  $('#emptyState').hidden=true;$('#workspace').hidden=false;
  await refreshState();await loadProjects();startProjectPolling();
@@ -252,7 +253,8 @@ function renderFusionRuntime(runReports,manifest,inventory,deployment){
 function renderInputRequest(r){
  const box=$('#inputRequest');
  if(!r){
-   if(lastInputRequestKey!==null){box.hidden=true;$('#inputRequestControl').replaceChildren();lastInputRequestKey=null}
+   box.hidden=true;
+   if(lastInputRequestKey!==null){$('#inputRequestControl').replaceChildren();lastInputRequestKey=null}
    inputRequestBusy=false;inputRequestPending=false;
    return;
  }
