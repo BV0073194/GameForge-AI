@@ -101,6 +101,16 @@ test('unchanged HTML preserves DOM and expanded detail state on every poll',()=>
   assert.equal(box.htmlWrites,2);
 });
 
+test('a temporary error message cannot poison the HTML render cache',()=>{
+  const {ui}=makeUi();
+  const box=new FakeElement('systemBadges');
+  ui.setHtml(box,'<span class="badge">Online</span>');
+  const initialWrites=box.htmlWrites;
+  ui.setText(box,'Offline');
+  assert.equal(ui.setHtml(box,'<span class="badge">Online</span>'),true);
+  assert.equal(box.htmlWrites,initialWrites+1);
+});
+
 test('text selection survives a changing live activity stream until deselected',()=>{
   const {ui,doc}=makeUi();
   const text=new FakeElement('activity');
@@ -248,6 +258,9 @@ test('live app uses single-flight polling, stable agent questions and capture ti
   assert.equal(answer.value,'B','Open question selection is preserved');
   assert.equal(queue.htmlWrites,initialQueueWrites,'Unchanged work-order HTML is never replaced');
   assert.equal(capture.srcWrites,initialCaptures,'A repeated capture timestamp does not reload the image');
+  payload.visual.timestamp='capture-002';
+  await vm.runInContext('refreshState()',context);
+  assert.equal(capture.srcWrites,initialCaptures+1,'A new capture timestamp refreshes the image exactly once');
   doc.activeElement=null;
   doc.chooseSelection(doc.querySelector('#liveTaskDetail'));
   await vm.runInContext('refreshState()',context);
@@ -258,6 +271,10 @@ test('live app uses single-flight polling, stable agent questions and capture ti
   doc.chooseSelection(null);
   await vm.runInContext('refreshState()',context);
   assert.match(doc.querySelector('#liveTaskDetail').textContent,/another update/);
+  payload.input_request=null;
+  await vm.runInContext('refreshState()',context);
+  assert.equal(doc.querySelector('#inputRequest').hidden,true,'Resolved question disappears');
+  assert.equal(questions.children.length,0,'Resolved question controls are retired');
   pendingStates=1;
   const first=vm.runInContext('refreshState()',context);
   const second=vm.runInContext('refreshState()',context);
