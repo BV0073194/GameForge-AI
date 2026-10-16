@@ -1670,6 +1670,7 @@ def run_codex_agent_stream(
     state: AgentState,
 ) -> subprocess.CompletedProcess[str]:
     """Run Codex while streaming JSONL into the live task panel and trace file."""
+    input_text = input_text.encode("utf-8", errors="replace").decode("utf-8")
     command, use_shell = _command_invocation("codex", args)
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     popen_kwargs: dict[str, Any] = {
@@ -1679,6 +1680,7 @@ def run_codex_agent_stream(
         "stdout": subprocess.PIPE,
         "stderr": subprocess.PIPE,
         "text": True,
+        "encoding": "utf-8",
         "errors": "replace",
         "env": _codex_process_env(),
     }
@@ -1830,6 +1832,7 @@ def run_codex_fusion_stream(
     # turn/start response is ambiguous, so never replay that turn immediately.
     # Subsequent iterations use exec rather than retrying a dead app-server.
     downgrade_path = cwd / ".gameforge" / "codex_transport_downgrade.json"
+    input_text = input_text.encode("utf-8", errors="replace").decode("utf-8")
     if transport_mode == "auto" and downgrade_path.exists():
         transport_mode = "exec"
     if transport_mode == "exec":
