@@ -129,13 +129,15 @@ with tempfile.TemporaryDirectory() as td:
     implemented_file.parent.mkdir(parents=True, exist_ok=True)
     implemented_file.write_text("# Simulated implementation\n", encoding="utf-8")
     failure = app.reconcile_live_instruction_results(
-        p, 4, {"configured": True, "ok": True}, {"configured": False, "ok": True}
+        p, 4, {"configured": True, "ok": True}, {"configured": False, "ok": True},
+        {"production_paths": ["workspace/verified_gameplay.py"]}
     )
     assert not failure["gates_passed"]
     assert any(x["id"] == prompt_item["id"] and x["status"] == "awaiting_verification"
                for x in app.load_live_queue(p)["items"])
     success = app.reconcile_live_instruction_results(
-        p, 4, {"configured": True, "ok": True}, {"configured": True, "ok": True}
+        p, 4, {"configured": True, "ok": True}, {"configured": True, "ok": True},
+        {"production_paths": ["workspace/verified_gameplay.py"]}
     )
     assert prompt_item["id"] in success["verified_ids"]
     assert any(x["id"] == prompt_item["id"] and x["status"] == "verified"
