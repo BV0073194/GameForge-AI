@@ -1567,6 +1567,7 @@ class AgentState:
     active_process_started_at: str | None = None
     transport: CodexAppServer | AcpAgentTransport | None = field(default=None, repr=False)
     configured_transport: str = "auto"
+    active_instruction_id: str | None = None
     interrupt_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -1977,9 +1978,11 @@ def mark_live_instruction_steered(p: Path, item_id: str) -> bool:
         data = load_live_queue(p)
         for item in data.get("items", []):
             if item.get("id") == item_id and item.get("status") == "queued":
-                item["status"] = "awaiting_verification"
+                _live_transition(item, "delivered_to_agent",
+                                 reason="Active Codex turn acknowledged steering")
                 item["delivered_at"] = now_iso()
                 item["delivery"] = "in-turn-steer"
+                item["verification_state"] = "Delivered to active Codex; no implementation evidence yet"
                 save_live_queue(p, data)
                 return True
     return False
@@ -2840,6 +2843,7 @@ def agent_loop(project_id: str) -> None:
             pre_iteration_rev = str(pre_checkpoint.get("rev", "") or "")
             review_before_iteration = load_user_review(p)
             prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result, recovery_context)
+            state.active_instruction_id = live_queue_public(p).get("focus_id")
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
             final_path = p / f"logs/codex-iteration-{iteration:04d}.final.txt"
             trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3213,6 +3217,7 @@ def agent_public(s: AgentState) -> dict[str, Any]:
         "steering_available": bool(s.transport and s.transport.active and not isinstance(s.transport, AcpAgentTransport)),
         "status": s.status,
         "iteration": s.iteration,
+        "active_instruction_id": s.active_instruction_id,
         "message": s.message,
         "started_at": s.started_at,
         "last_update": s.last_update,
@@ -4672,6 +4677,7 @@ class Handler(SimpleHTTPRequestHandler):
                         steered = st.transport.steer(text_value)
                         if steered:
                             mark_live_instruction_steered(p, item["id"])
+                            st.active_instruction_id = item["id"]
                     except AppServerProtocolError:
                         steered = False  # durable queue fallback
                 if mode == "interrupt":
@@ -4692,8 +4698,8 @@ class Handler(SimpleHTTPRequestHandler):
                     data = load_live_queue(p)
                     changed = False
                     for item in data.get("items", []):
-                        if item.get("id") == item_id and item.get("status") in {"queued", "awaiting_verification"}:
-                            item["status"] = "cancelled"
+                        if item.get("id") == item_id and item.get("status") in {"queued", "delivered_to_agent", "implemented"}:
+                            _live_transition(item, "cancelled", reason="User explicitly cancelled instruction")
                             item["cancelled_at"] = now_iso()
                             changed = True
                     if changed:
