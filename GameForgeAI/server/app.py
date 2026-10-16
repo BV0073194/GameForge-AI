@@ -1023,9 +1023,10 @@ DEFAULT_CLEANUP_POLICY = {
     "enabled": True,
     "auto_after_iteration": True,
     "archive_old_logs": True,
-    "log_keep_files": 60,
-    "capture_keep_groups": 4,
-    "research_keep_iterations": 8,
+    "log_keep_files": 12,
+    "capture_keep_groups": 2,
+    "research_keep_iterations": 3,
+    "lean_mode": True,
     "process_ai_cleanup_candidates": True,
 }
 
@@ -1052,6 +1053,14 @@ def cleanup_policy_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     configured = cfg.get("cleanup")
     if isinstance(configured, dict):
         settings.update(configured)
+    # Older projects may have been created with much larger retention defaults.
+    # Lean mode bounds disposable history without touching current evidence.
+    if settings.get("lean_mode", True):
+        for key, cap in (("log_keep_files", 12), ("capture_keep_groups", 2), ("research_keep_iterations", 3)):
+            try:
+                settings[key] = max(1, min(int(settings.get(key, cap)), cap))
+            except (TypeError, ValueError):
+                settings[key] = cap
     return settings
 
 
@@ -3125,7 +3134,7 @@ def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, rea
             if x.is_file() and x.resolve() != archive_path.resolve()
         ]
         candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-        keep_count = max(10, int(policy.get("log_keep_files", 60) or 60))
+        keep_count = max(1, int(policy.get("log_keep_files", 12) or 12))
         recent = set(candidates[:keep_count])
         archive_candidates: list[Path] = []
         for file in candidates[keep_count:]:
@@ -3148,7 +3157,7 @@ def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, rea
     if capture_root.exists():
         groups = [x for x in capture_root.iterdir() if x.is_dir()]
         groups.sort(key=lambda x: x.stat().st_mtime, reverse=True)
-        keep_groups = max(1, int(policy.get("capture_keep_groups", 4) or 4))
+        keep_groups = max(1, int(policy.get("capture_keep_groups", 2) or 2))
         recent_groups = set(groups[:keep_groups])
         for group in groups[keep_groups:]:
             rel = str(group.relative_to(p)).replace("\\", "/")
@@ -3174,7 +3183,7 @@ def cleanup_project_artifacts(p: Path, cfg: dict[str, Any] | None = None, *, rea
             if m:
                 iteration_files.append((int(m.group(1)), file))
         max_iteration = max((n for n, _ in iteration_files), default=0)
-        keep_iterations = max(2, int(policy.get("research_keep_iterations", 8) or 8))
+        keep_iterations = max(1, int(policy.get("research_keep_iterations", 3) or 3))
         cutoff = max(0, max_iteration - keep_iterations + 1)
         for number, file in iteration_files:
             if number >= cutoff:
