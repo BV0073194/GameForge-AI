@@ -112,7 +112,7 @@ with tempfile.TemporaryDirectory() as td:
     assert "LIVE USER INSTRUCTIONS" in prompt_live
     assert "Use the live steering message in this turn." in prompt_live
     app.settle_live_instructions(p, 4, delivered=True)
-    assert any(x["id"] == prompt_item["id"] and x["status"] == "awaiting_verification"
+    assert any(x["id"] == prompt_item["id"] and x["status"] == "delivered_to_agent"
                for x in app.load_live_queue(p)["items"])
 
     # Delivery is NOT implementation. A bare successful turn cannot close user
@@ -133,7 +133,8 @@ with tempfile.TemporaryDirectory() as td:
         {"production_paths": ["workspace/verified_gameplay.py"]}
     )
     assert not failure["gates_passed"]
-    assert any(x["id"] == prompt_item["id"] and x["status"] == "awaiting_verification"
+    assert prompt_item["id"] in failure["implemented_ids"]
+    assert any(x["id"] == prompt_item["id"] and x["status"] == "implemented"
                for x in app.load_live_queue(p)["items"])
     success = app.reconcile_live_instruction_results(
         p, 4, {"configured": True, "ok": True}, {"configured": True, "ok": True},
@@ -413,8 +414,24 @@ with tempfile.TemporaryDirectory() as td:
         assert any(x.get("source") == "agent-answer" and "option-a" in x.get("text", "")
                    for x in answer_items), answer_items
 
+        # User-review feedback must also reach the durable live-agent queue.
+        feedback_request = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/project/{cfg['id']}/review/feedback",
+            data=json.dumps({"text": "Make the player weapon changes a priority.", "category": "gameplay"}).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        with urllib.request.urlopen(feedback_request, timeout=5) as r:
+            submitted = json.loads(r.read())
+            feedback_id = submitted["feedback"][-1]["id"]
+        linked = [x for x in app.load_live_queue(p)["items"]
+                  if (x.get("metadata") or {}).get("feedback_id") == feedback_id]
+        assert len(linked) == 1 and linked[0]["status"] == "queued", linked
+
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/project/{cfg['id']}/state", timeout=5) as r:
             state_payload = json.loads(r.read())
+            assert "iteration_progress" in state_payload
+            assert "agent_iteration" in state_payload["iteration_progress"]
+            assert "project_progress_iteration" in state_payload["iteration_progress"]
             assert "live_queue" in state_payload
             assert state_payload["fusion_manifest"]["format"] == "GameForgeAI.Fusion"
             assert "fusion_deployment" in state_payload

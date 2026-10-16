@@ -24,9 +24,7 @@ install or authenticate a Melty service, or treat that bundle as a license.
 - **Human interaction**: ACP permission choices, Codex command/file change
   permissions, Codex tool questions and MCP elicitation forms are presented
   to the user. No unknown permission request is silently approved.
-- **Instruction accountability**: queued -> in_progress ->
-  awaiting_verification -> verified (or cancelled). A successful agent turn
-  never by itself marks an instruction fulfilled.
+- **Instruction accountability**: `queued → in_progress → delivered_to_agent → implemented → verified` (or explicitly `cancelled`). A successful agent turn can acknowledge delivery, but cannot independently declare implementation or verification. Each item now carries its own audit history, production changed paths, targeted-test claims, original full-gate results and the Git checkpoint associated with the implementation.
 
 ## Configure an ACP agent
 
@@ -98,18 +96,32 @@ fulfilled items in `.gameforge/live_instruction_results.json`:
       "ready_for_verification": true,
       "resolution": "What changed and why",
       "evidence": "Specific tests and runtime observations",
-      "changed_paths": ["workspace/path-to-modified-source"]
+      "changed_paths": ["workspace/path-to-modified-source"],
+      "tests": [
+        {"name": "Weapon smoke test", "status": "passed", "log_path": "logs/weapon-smoke.log"}
+      ]
     }
   ]
 }
 ```
 
 GameForge checks that the claim has a real instruction ID, non-empty
-resolution and evidence, and existing project-local source paths. It only
-accepts it as `verified` after **both configured original build and test**
-return success. If either gate is absent/fails, it remains pending.
-The requirement remains in subsequent prompts, and the dashboard separates
-"assigned", "awaiting verification" and "verified" statuses.
+resolution and evidence, and actual modified project-local production paths.
+A valid implementation claim moves the item to `implemented`, which remains
+pending even when one of the full gates fails. The separate `verified` status
+requires **both originally configured full build and test** to pass. The UI
+shows per-instruction paths, agent-reported targeted tests, full-gate status,
+status timeline and the Git checkpoint when available. A finished Codex turn
+is never sufficient evidence, and the project cannot be declared complete
+with pending live work orders.
+
+For recovery, `.gameforge/iteration_state.json` records every GameForge
+agent-iteration reservation before running Codex. It reconciles legacy
+`live_activity.json`, `compact_state.json`, `last_evidence.json`, delivery
+state and recent trace filenames. The separate game-authored
+`acceptance.json.iteration` value is shown as **project progress** and is
+never treated as GameForge's agent counter. See
+[LIVE_AGENT_ACCOUNTABILITY.md](LIVE_AGENT_ACCOUNTABILITY.md) for details.
 
 **Scope of verification:** these gates verify submitted implementation evidence
 and the configured tests. They do not automatically prove that the game plays

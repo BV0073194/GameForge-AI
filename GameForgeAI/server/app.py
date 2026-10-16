@@ -31,6 +31,7 @@ from server.codex_app_server import CodexAppServer, AppServerUnavailable, AppSer
 from server.acp_transport import AcpAgentTransport
 from server.fusion_mcp import validate_mcp_servers, public_mcp_servers
 from server.wsl_cleanup import cleanup_wsl_project
+from server.iteration_state import iteration_snapshot, reserve_iteration, finish_iteration
 
 def _resource_root() -> Path:
     # PyInstaller one-file/one-dir extracts bundled resources to sys._MEIPASS.
@@ -1566,6 +1567,7 @@ class AgentState:
     active_process_started_at: str | None = None
     transport: CodexAppServer | AcpAgentTransport | None = field(default=None, repr=False)
     configured_transport: str = "auto"
+    active_instruction_id: str | None = None
     interrupt_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -1586,6 +1588,7 @@ MANAGED_PROCESS_META: dict[str, dict[str, Any]] = {}
 PROJECT_COMMAND_LOCKS: dict[str, threading.RLock] = {}
 PROJECT_COMMAND_LOCKS_GUARD = threading.Lock()
 LIVE_QUEUE_LOCK = threading.RLock()
+USER_REVIEW_LOCK = threading.RLock()
 APP_SERVER: ThreadingHTTPServer | None = None
 WEB_SESSION = {"last_heartbeat": time.monotonic(), "closing": False, "shutdown_started": False}
 
@@ -1976,9 +1979,11 @@ def mark_live_instruction_steered(p: Path, item_id: str) -> bool:
         data = load_live_queue(p)
         for item in data.get("items", []):
             if item.get("id") == item_id and item.get("status") == "queued":
-                item["status"] = "awaiting_verification"
+                _live_transition(item, "delivered_to_agent",
+                                 reason="Active Codex turn acknowledged steering")
                 item["delivered_at"] = now_iso()
                 item["delivery"] = "in-turn-steer"
+                item["verification_state"] = "Delivered to active Codex; no implementation evidence yet"
                 save_live_queue(p, data)
                 return True
     return False
@@ -2023,6 +2028,35 @@ def live_queue_path(p: Path) -> Path:
     return p / ".gameforge" / "live_queue.json"
 
 
+LIVE_PENDING_STATUSES = {"queued", "in_progress", "delivered_to_agent", "implemented"}
+LIVE_TERMINAL_STATUSES = {"verified", "cancelled"}
+
+
+def _live_transition(
+    item: dict[str, Any], status: str, *, reason: str = "",
+    iteration: int | None = None, details: dict[str, Any] | None = None,
+) -> None:
+    """Keep a bounded audit trail for each user instruction, not just a badge."""
+    previous = str(item.get("status") or "received")
+    if previous == status and not reason and not details:
+        return
+    item["status"] = status
+    event: dict[str, Any] = {
+        "at": now_iso(), "from": previous, "status": status,
+    }
+    if iteration is not None:
+        event["iteration"] = iteration
+    if reason:
+        event["reason"] = reason[:350]
+    if details:
+        event["details"] = details
+    history = item.get("history")
+    if not isinstance(history, list):
+        history = []
+    history.append(event)
+    item["history"] = history[-40:]
+
+
 def load_live_queue(p: Path) -> dict[str, Any]:
     data = read_json(live_queue_path(p), {}) or {}
     if not isinstance(data, dict):
@@ -2030,43 +2064,65 @@ def load_live_queue(p: Path) -> dict[str, Any]:
     items = data.get("items")
     if not isinstance(items, list):
         items = []
-    data["version"] = 2
-    data["items"] = [x for x in items if isinstance(x, dict)]
-    # Old "delivered" records only meant Codex received the message. They
-    # never proved implementation and must not appear as completed work.
+    data["version"] = 3
+    data["items"] = [x for x in items if isinstance(x, dict) and isinstance(x.get("id"), str)]
+    # ISO timestamps can share the same second. Preserve true submission order
+    # with a project-local sequence rather than relying on timestamp sorting.
+    highest = 0
+    for position, item in enumerate(data["items"], start=1):
+        value = item.get("sequence")
+        if not isinstance(value, int) or value <= 0:
+            item["sequence"] = max(highest + 1, position)
+        highest = max(highest, item["sequence"])
+    data["next_sequence"] = max(highest, data.get("next_sequence", 0)
+                                if isinstance(data.get("next_sequence"), int) else 0)
     for item in data["items"]:
-        if item.get("status") == "delivered":
-            item["status"] = "awaiting_verification"
-            item["migration_note"] = "Legacy delivery was not proof of implementation"
+        if item.get("status") in {"delivered", "awaiting_verification"}:
+            # Earlier Fusion versions called a finished turn "delivered".
+            # Do not treat legacy delivery as implementation or verification.
+            _live_transition(item, "delivered_to_agent", reason="Migrated unverified legacy delivery")
+        if item.get("status") not in LIVE_PENDING_STATUSES | LIVE_TERMINAL_STATUSES:
+            _live_transition(item, "queued", reason="Recovered an unknown legacy work-order state")
     return data
 
 
 def save_live_queue(p: Path, data: dict[str, Any]) -> dict[str, Any]:
-    data["version"] = 2
+    data["version"] = 3
     data["updated_at"] = now_iso()
     items = [x for x in data.get("items", []) if isinstance(x, dict)]
-    pending = [x for x in items if x.get("status") in {"queued", "in_progress", "awaiting_verification"}]
-    recent = [x for x in items if x.get("status") not in {"queued", "in_progress", "awaiting_verification"}][-200:]
+    pending = [x for x in items if x.get("status") in LIVE_PENDING_STATUSES]
+    recent = [x for x in items if x.get("status") not in LIVE_PENDING_STATUSES][-200:]
     data["items"] = sorted(pending + recent, key=lambda x: str(x.get("created_at", "")))
     write_json(live_queue_path(p), data)
     return data
 
 
+def _focus_sort(item: dict[str, Any]) -> tuple[int, int]:
+    return (1 if item.get("priority") == "immediate" else 0, int(item.get("sequence", 0)))
+
+
 def live_queue_public(p: Path) -> dict[str, Any]:
     data = load_live_queue(p)
     items = data.get("items", [])
-    queued = [x for x in items if x.get("status") == "queued"]
-    in_progress = [x for x in items if x.get("status") == "in_progress"]
-    awaiting = [x for x in items if x.get("status") == "awaiting_verification"]
-    recent = [x for x in items if x.get("status") in {"verified", "cancelled"}][-20:]
+    queued = sorted((x for x in items if x.get("status") == "queued"), key=_focus_sort, reverse=True)
+    in_progress = sorted((x for x in items if x.get("status") == "in_progress"), key=_focus_sort, reverse=True)
+    delivered = [x for x in items if x.get("status") == "delivered_to_agent"]
+    implemented = [x for x in items if x.get("status") == "implemented"]
+    recent = [x for x in items if x.get("status") in LIVE_TERMINAL_STATUSES][-20:]
+    # Explicit priority: newest urgent steering, then newest unfinished user
+    # instruction, regardless of whether a previous turn merely received it.
+    unfinished = sorted(in_progress + queued + delivered, key=_focus_sort, reverse=True)
+    focus = (unfinished or list(reversed(implemented)) or [None])[0]
     return {
-        "queued": queued,
-        "in_progress": in_progress,
-        "awaiting_verification": awaiting,
-        "awaiting_count": len(awaiting),
+        "queued": queued, "in_progress": in_progress,
+        "delivered_to_agent": delivered, "implemented": implemented,
+        "awaiting_verification": delivered + implemented,  # older dashboard compatibility
+        "awaiting_count": len(delivered) + len(implemented),
         "recent": recent,
-        "queued_count": len(queued),
-        "in_progress_count": len(in_progress),
+        "focus": focus,
+        "focus_id": focus.get("id") if focus else None,
+        "queued_count": len(queued), "in_progress_count": len(in_progress),
+        "delivered_count": len(delivered), "implemented_count": len(implemented),
         "updated_at": data.get("updated_at"),
     }
 
@@ -2080,26 +2136,29 @@ def enqueue_live_instruction(
     source: str = "user",
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    text_value = str(text_value or "").strip()
+    text_value = str(text_value or "").strip().encode("utf-8", errors="replace").decode("utf-8")
     if not text_value:
         raise ValueError("Live instruction cannot be empty")
     if len(text_value) > 20000:
         raise ValueError("Live instruction is too long")
     mode = "interrupt" if mode == "interrupt" else "queue"
     data = load_live_queue(p)
-    item = {
+    if sum(1 for x in data.get("items", []) if x.get("status") in LIVE_PENDING_STATUSES) >= 1000:
+        raise ValueError("Live queue is full (1000 unfinished instructions)")
+    sequence = int(data.get("next_sequence", 0)) + 1
+    data["next_sequence"] = sequence
+    item: dict[str, Any] = {
         "id": f"live-{uuid4().hex}",
+        "sequence": sequence,
         "created_at": now_iso(),
         "text": text_value,
         "mode": mode,
         "priority": "immediate" if mode == "interrupt" else "normal",
         "source": source,
-        "status": "queued",
         "attempts": 0,
         "metadata": metadata or {},
     }
-    if sum(1 for x in data.get("items", []) if x.get("status") in {"queued", "in_progress", "awaiting_verification"}) >= 1000:
-        raise ValueError("Live queue is full (1000 pending instructions)")
+    _live_transition(item, "queued", reason="User instruction safely received")
     data.setdefault("items", []).append(item)
     save_live_queue(p, data)
     return item
@@ -2111,9 +2170,8 @@ def requeue_live_instructions(p: Path, *, reason: str) -> None:
     changed = False
     for item in data.get("items", []):
         if item.get("status") == "in_progress":
-            item["status"] = "queued"
+            _live_transition(item, "queued", reason=reason)
             item["requeued_at"] = now_iso()
-            item["requeue_reason"] = reason
             item.pop("claimed_iteration", None)
             changed = True
     if changed:
@@ -2124,22 +2182,19 @@ def requeue_live_instructions(p: Path, *, reason: str) -> None:
 def claim_live_instructions(p: Path, iteration: int, limit: int = 12) -> list[dict[str, Any]]:
     data = load_live_queue(p)
     changed = False
-    # A previous prompt construction/turn may have died before it could settle
-    # claimed instructions. No user steering is ever discarded: at the start of
-    # a fresh prompt build, return all unfinished claims to the queue first.
+    # Recover interrupted agent turns without dropping their original inputs.
     for item in data.get("items", []):
         if item.get("status") == "in_progress":
-            item["status"] = "queued"
+            _live_transition(item, "queued", reason="Previous turn did not settle", iteration=iteration)
             item["requeued_at"] = now_iso()
-            item["requeue_reason"] = "unfinished user instruction requires verification"
             item.pop("claimed_iteration", None)
             changed = True
-
-    queued = [x for x in data.get("items", []) if x.get("status") == "queued"]
-    queued.sort(key=lambda x: (0 if x.get("priority") == "immediate" else 1, str(x.get("created_at", ""))))
-    claimed = queued[:max(1, limit)]
+    # Fresh user steering wins over stale roadmap work and earlier instructions.
+    queued = sorted((x for x in data.get("items", []) if x.get("status") == "queued"),
+                    key=_focus_sort, reverse=True)
+    claimed = queued[:max(1, min(int(limit), 100))]
     for item in claimed:
-        item["status"] = "in_progress"
+        _live_transition(item, "in_progress", reason="Assigned to this AI iteration", iteration=iteration)
         item["claimed_iteration"] = iteration
         item["claimed_at"] = now_iso()
         item["attempts"] = int(item.get("attempts", 0) or 0) + 1
@@ -2157,98 +2212,209 @@ def settle_live_instructions(p: Path, iteration: int, *, delivered: bool, reason
         if item.get("status") != "in_progress" or int(item.get("claimed_iteration", -1) or -1) != iteration:
             continue
         if delivered:
-            item["status"] = "awaiting_verification"
+            _live_transition(item, "delivered_to_agent",
+                             reason="Agent turn completed, implementation unproven",
+                             iteration=iteration)
             item["delivered_at"] = now_iso()
-            item["verification_state"] = "Awaiting implementation evidence and full project gates"
+            item["verification_state"] = "Agent received the instruction; waiting for implementation evidence"
         else:
-            item["status"] = "queued"
+            _live_transition(item, "queued", reason=reason or "Agent turn failed", iteration=iteration)
             item["requeued_at"] = now_iso()
-            if reason:
-                item["requeue_reason"] = reason
         changed = True
     if changed:
         save_live_queue(p, data)
 
+
+def _live_test_evidence(p: Path, value: Any) -> list[dict[str, Any]]:
+    """Only expose bounded, project-relative test metadata in the dashboard."""
+    if not isinstance(value, list):
+        return []
+    tests: list[dict[str, Any]] = []
+    for obj in value[:30]:
+        if not isinstance(obj, dict):
+            continue
+        name = str(obj.get("name") or "")[:160].strip()
+        result = str(obj.get("status") or "unknown").lower()
+        if not name or result not in {"passed", "failed", "skipped", "unknown"}:
+            continue
+        entry = {"name": name, "status": result}
+        log = obj.get("log_path")
+        if isinstance(log, str) and 0 < len(log) < 350:
+            try:
+                target = safe_child(p, log)
+                if target.is_file():
+                    entry["log_path"] = str(target.relative_to(p)).replace("\\", "/")
+            except (OSError, ValueError):
+                pass
+        tests.append(entry)
+    return tests
 
 
 def reconcile_live_instruction_results(
     p: Path, iteration: int, build_result: dict[str, Any], test_result: dict[str, Any],
     change_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Close only instruction IDs backed by source evidence and configured gates.
+    """Distinguish delivered, implemented and verified with concrete evidence.
 
-    Agents write evidence claims; GameForge independently checks that claimed
-    files exist and the *original* configured build and test both pass. A
-    missing gate or incomplete claim keeps the instruction pending.
+    Agent-submitted claims cannot mark queue entries verified. GameForge
+    independently validates changed production paths and its original full
+    build and test gates. Implementation may remain pending verification for
+    multiple iterations if a full gate fails.
     """
     raw = read_json(p / ".gameforge" / "live_instruction_results.json", {}) or {}
     results = raw.get("results", []) if isinstance(raw, dict) else []
-    by_id = {str(x.get("id")): x for x in results if isinstance(x, dict) and x.get("id")}
-    gate_passed = all(
-        bool(gate.get("configured")) and bool(gate.get("ok"))
-        for gate in (build_result, test_result)
-    )
+    if not isinstance(results, list):
+        results = []
+    claims = {str(x.get("id")): x for x in results if isinstance(x, dict) and x.get("id")}
+    gate_passed = all(bool(gate.get("configured")) and bool(gate.get("ok"))
+                      for gate in (build_result, test_result))
+    observed = set((change_summary or {}).get("production_paths") or [])
+    feedback_by_id = {
+        str(f.get("id")): f for f in load_user_review(p).get("feedback", [])
+        if isinstance(f, dict) and f.get("id")
+    }
+    gate_evidence = {
+        "iteration": iteration,
+        "build": {"configured": bool(build_result.get("configured")),
+                  "passed": bool(build_result.get("configured") and build_result.get("ok")),
+                  "log_path": f"logs/build-{iteration:04d}.log" if build_result.get("configured") else None},
+        "test": {"configured": bool(test_result.get("configured")),
+                 "passed": bool(test_result.get("configured") and test_result.get("ok")),
+                 "log_path": f"logs/test-{iteration:04d}.log" if test_result.get("configured") else None},
+    }
+    implemented_ids: list[str] = []
     verified_ids: list[str] = []
-    changed_production = set((change_summary or {}).get("production_paths") or [])
     with LIVE_QUEUE_LOCK:
         data = load_live_queue(p)
         for item in data.get("items", []):
-            if item.get("status") != "awaiting_verification":
+            if item.get("status") not in {"delivered_to_agent", "implemented"}:
                 continue
-            claim = by_id.get(item.get("id"))
-            if not claim or not claim.get("ready_for_verification"):
-                continue
-            resolution = claim.get("resolution")
-            evidence = claim.get("evidence")
-            files = claim.get("changed_paths")
-            if not isinstance(resolution, str) or len(resolution.strip()) < 12:
-                continue
-            if not isinstance(evidence, str) or len(evidence.strip()) < 12:
-                continue
-            if not isinstance(files, list) or not files or len(files) > 60:
-                continue
-            valid_files = True
-            for relative in files:
-                if not isinstance(relative, str) or not relative or len(relative) > 400:
-                    valid_files = False
-                    break
-                try:
-                    candidate = safe_child(p, relative)
-                    if not candidate.is_file() or ".gameforge" in candidate.parts:
-                        valid_files = False
-                        break
-                except (OSError, ValueError):
-                    valid_files = False
-                    break
-            if not valid_files:
-                continue
-            # A claim for an unchanged pre-existing file is not implementation
-            # evidence. Preserve a previously observed production change when
-            # a later iteration finally fixes the full regression gates.
-            prior_proof = item.get("verification_claim") or {}
-            observed_change = all(path.replace("\\\\", "/") in changed_production for path in files)
-            source_proven = observed_change or bool(prior_proof.get("production_change_observed"))
-            if not source_proven:
-                item["verification_state"] = "Evidence submitted but no relevant production change was observed"
-                continue
-            item["verification_claim"] = {
-                "production_change_observed": source_proven,
-                "resolution": resolution[:2500],
-                "evidence": evidence[:3500],
-                "changed_paths": files,
-                "iteration": iteration,
-                "configured_quality_gates_passed": gate_passed,
-            }
-            if gate_passed:
-                item["status"] = "verified"
+            claim = claims.get(item.get("id"))
+            linked_id = str((item.get("metadata") or {}).get("feedback_id") or "")
+            feedback = feedback_by_id.get(linked_id) if item.get("source") == "user-feedback" else None
+            if feedback and feedback.get("addressed") and gate_passed:
+                # User-review reconciliation already validated the linked
+                # feedback and the original full gates. Avoid demanding two
+                # independent completion claims for the exact same request.
+                if item.get("status") == "delivered_to_agent":
+                    paths = sorted(observed)
+                    item["verification_claim"] = {
+                        "resolution": str(feedback.get("resolution") or "")[:2500],
+                        "evidence": str(feedback.get("evidence") or "")[:3500],
+                        "changed_paths": paths,
+                        "tests": [],
+                        "linked_feedback_id": linked_id,
+                        "implemented_iteration": iteration,
+                        "source_change_verified": bool(paths),
+                    }
+                    item["implemented_at"] = now_iso()
+                    item["implementation_iteration"] = iteration
+                    _live_transition(item, "implemented", reason="Linked feedback completed and verified",
+                                     iteration=iteration, details={"feedback_id": linked_id, "changed_paths": paths})
+                    implemented_ids.append(item["id"])
+                item["last_full_gates"] = gate_evidence
+                _live_transition(item, "verified", reason="Linked user feedback passed full verification",
+                                 iteration=iteration, details={"feedback_id": linked_id})
                 item["verified_at"] = now_iso()
-                item["verification_state"] = "Agent evidence accepted; configured build and tests passed"
+                item["verification_iteration"] = iteration
+                item["verification_state"] = "Linked feedback verified by GameForge original full gates"
                 verified_ids.append(item["id"])
-            else:
-                item["verification_state"] = "Implementation claimed; full build/test gates have not passed"
+                continue
+            if item.get("status") == "delivered_to_agent":
+                if not claim or not claim.get("ready_for_verification"):
+                    continue
+                resolution, evidence, paths = claim.get("resolution"), claim.get("evidence"), claim.get("changed_paths")
+                if not isinstance(resolution, str) or len(resolution.strip()) < 12:
+                    continue
+                if not isinstance(evidence, str) or len(evidence.strip()) < 12:
+                    continue
+                if not isinstance(paths, list) or not 1 <= len(paths) <= 60:
+                    continue
+                valid: list[str] = []
+                for path in paths:
+                    if not isinstance(path, str) or not 0 < len(path) <= 400:
+                        valid = []
+                        break
+                    try:
+                        source = safe_child(p, path)
+                        rel = source.relative_to(p).as_posix()
+                        if not source.is_file() or ".gameforge" in source.parts or rel not in observed:
+                            valid = []
+                            break
+                        valid.append(rel)
+                    except (OSError, ValueError):
+                        valid = []
+                        break
+                if not valid:
+                    item["verification_state"] = "Agent claim did not match changed production files"
+                    continue
+                item["verification_claim"] = {
+                    "resolution": resolution[:2500],
+                    "evidence": evidence[:3500],
+                    "changed_paths": valid,
+                    "tests": _live_test_evidence(p, claim.get("tests")),
+                    "implemented_iteration": iteration,
+                    "source_change_verified": True,
+                }
+                item["implemented_at"] = now_iso()
+                item["implementation_iteration"] = iteration
+                item["verification_state"] = "Implementation evidence recorded; full build and test pending"
+                _live_transition(item, "implemented", reason="Matched agent claim to real changed source paths",
+                                 iteration=iteration, details={"changed_paths": valid})
+                implemented_ids.append(item["id"])
+            if item.get("status") == "implemented":
+                proof = item.get("verification_claim") or {}
+                changed = proof.get("changed_paths")
+                if not proof.get("source_change_verified") or not isinstance(changed, list) or not changed:
+                    continue
+                try:
+                    sources_present = all(isinstance(path, str) and safe_child(p, path).is_file()
+                                          for path in changed)
+                except (OSError, ValueError):
+                    sources_present = False
+                if not sources_present:
+                    item["verification_state"] = "Previously implemented source files are missing"
+                    continue
+                item["last_full_gates"] = gate_evidence
+                if gate_passed:
+                    _live_transition(item, "verified", reason="Configured full build and regression passed",
+                                     iteration=iteration, details={"build": "passed", "test": "passed"})
+                    item["verified_at"] = now_iso()
+                    item["verification_iteration"] = iteration
+                    item["verification_state"] = "Implementation evidence accepted and original full gates passed"
+                    verified_ids.append(item["id"])
+                else:
+                    item["verification_state"] = "Implemented, awaiting successful configured full build and test"
         save_live_queue(p, data)
-    return {"verified_ids": verified_ids, "gates_passed": gate_passed}
+        remaining = sum(x.get("status") in LIVE_PENDING_STATUSES for x in data.get("items", []))
+    return {"implemented_ids": implemented_ids, "verified_ids": verified_ids,
+            "gates_passed": gate_passed, "pending_count": remaining}
 
+
+def link_live_instruction_checkpoint(p: Path, iteration: int, base_revision: str, revision: str) -> None:
+    """Associate accepted implementation evidence with the actual Git revision."""
+    if not revision:
+        return
+    with LIVE_QUEUE_LOCK:
+        data = load_live_queue(p)
+        updated = False
+        for item in data.get("items", []):
+            if item.get("status") not in {"implemented", "verified"}:
+                continue
+            if int(item.get("implementation_iteration") or -1) != iteration:
+                continue
+            proof = item.get("verification_claim")
+            if not isinstance(proof, dict) or not proof.get("changed_paths"):
+                continue
+            if proof.get("git_checkpoint"):
+                continue
+            proof["git_checkpoint"] = revision
+            proof["git_diff_base"] = base_revision
+            _live_transition(item, item["status"], reason="Linked production change to Git checkpoint",
+                             iteration=iteration, details={"revision": revision[:12]})
+            updated = True
+        if updated:
+            save_live_queue(p, data)
 
 
 def user_input_request_path(p: Path) -> Path:
@@ -2279,36 +2445,99 @@ def user_review_path(p: Path) -> Path:
     return p / ".gameforge" / "user_review.json"
 
 
-def load_user_review(p: Path) -> dict[str, Any]:
-    data = read_json(user_review_path(p), {}) or {}
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("user_done", False)
-    data.setdefault("satisfaction", None)
-    data.setdefault("feedback", [])
+def user_feedback_inbox_path(p: Path) -> Path:
+    return p / ".gameforge" / "user_feedback_inbox.json"
+
+
+def user_review_atomic(fn):
+    """Serialize user-feedback transactions against the agent verifier."""
+    def wrapped(*args, **kwargs):
+        with USER_REVIEW_LOCK:
+            return fn(*args, **kwargs)
+    return wrapped
+
+
+def _original_feedback(item: dict[str, Any]) -> dict[str, Any]:
+    """Preserve user-authored fields; the AI may only propose resolution data."""
+    return {key: item.get(key) for key in ("id", "created_at", "category", "text")}
+
+
+def _restore_feedback_inbox(p: Path, data: dict[str, Any]) -> dict[str, Any]:
+    items = data.get("feedback")
+    if not isinstance(items, list):
+        items = []
+    items = [x for x in items if isinstance(x, dict) and x.get("id")]
+    path = user_feedback_inbox_path(p)
+    inbox = read_json(path, {}) or {}
+    records = inbox.get("entries") if isinstance(inbox, dict) else []
+    if not isinstance(records, list):
+        records = []
+    # One-time migration of old user reviews predating the durable inbox.
+    if not path.exists() and items:
+        records = [_original_feedback(item) for item in items]
+        write_json(path, {"version": 1, "entries": records})
+    by_id = {str(x["id"]): x for x in items}
+    for original in records:
+        if not isinstance(original, dict) or not original.get("id"):
+            continue
+        feedback_id = str(original["id"])
+        current = by_id.get(feedback_id)
+        if current is None:
+            current = {
+                **original, "addressed": False, "status": "pending",
+                "ready_for_verification": False, "resolution": "", "evidence": "",
+            }
+            items.append(current)
+            by_id[feedback_id] = current
+        else:
+            for field in ("id", "created_at", "category", "text"):
+                if field in original:
+                    current[field] = original[field]
+    data["feedback"] = items
     return data
 
 
+def load_user_review(p: Path) -> dict[str, Any]:
+    with USER_REVIEW_LOCK:
+        data = read_json(user_review_path(p), {}) or {}
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("user_done", False)
+        data.setdefault("satisfaction", None)
+        return _restore_feedback_inbox(p, data)
+
+
+@user_review_atomic
 def save_user_review(p: Path, data: dict[str, Any]) -> dict[str, Any]:
+    data = _restore_feedback_inbox(p, data)
     data["updated_at"] = now_iso()
     write_json(user_review_path(p), data)
     return data
 
 
+@user_review_atomic
 def append_user_feedback(p: Path, text: str, category: str = "general") -> dict[str, Any]:
     review = load_user_review(p)
-    feedback = review.setdefault("feedback", [])
-    feedback.append({
-        "id": f"feedback-{int(time.time() * 1000)}",
+    text = str(text or "").encode("utf-8", errors="replace").decode("utf-8")
+    item = {
+        "id": f"feedback-{int(time.time() * 1000)}-{uuid4().hex[:10]}",
         "created_at": now_iso(),
         "category": category or "general",
         "text": text.strip(),
-        "addressed": False,
-        "status": "pending",
+        "addressed": False, "status": "pending",
         "ready_for_verification": False,
-        "resolution": "",
-        "evidence": "",
-    })
+        "resolution": "", "evidence": "",
+    }
+    # Journal the authoritative user content FIRST. If a running agent later
+    # rewrites an older user_review.json, its missing entries are rehydrated.
+    path = user_feedback_inbox_path(p)
+    inbox = read_json(path, {}) or {}
+    entries = inbox.get("entries") if isinstance(inbox, dict) else None
+    if not isinstance(entries, list):
+        entries = []
+    entries.append(_original_feedback(item))
+    write_json(path, {"version": 1, "entries": entries})
+    review.setdefault("feedback", []).append(item)
     return save_user_review(p, review)
 
 
@@ -2320,6 +2549,7 @@ def pending_user_feedback(p: Path) -> list[dict[str, Any]]:
     ]
 
 
+@user_review_atomic
 def reconcile_feedback_work_orders(
     p: Path,
     before: dict[str, Any],
@@ -2519,9 +2749,9 @@ def update_delivery_state(p: Path, review: dict[str, Any], iteration: int, chang
         if isinstance(x, dict) and not bool(x.get("addressed")) and x.get("id")
     ]
     pending_ids = [str(x["id"]) for x in pending]
-    focus = str(state.get("focus_feedback_id") or "")
-    if focus not in pending_ids:
-        focus = pending_ids[0] if pending_ids else ""
+    # New user feedback supersedes stale roadmap focus. Entry order, unlike
+    # second-resolution timestamps, preserves submission precedence.
+    focus = pending_ids[-1] if pending_ids else ""
 
     diagnostic_only = bool(change_summary.get("diagnostic_only"))
     production_changed = bool(change_summary.get("production_changed"))
@@ -2552,9 +2782,9 @@ def delivery_state_for_prompt(p: Path, review: dict[str, Any]) -> dict[str, Any]
         if isinstance(x, dict) and not bool(x.get("addressed")) and x.get("id")
     ]
     pending_ids = [str(x["id"]) for x in pending]
-    focus = str(state.get("focus_feedback_id") or "")
-    if focus not in pending_ids:
-        focus = pending_ids[0] if pending_ids else ""
+    # New user feedback supersedes stale roadmap focus. Entry order, unlike
+    # second-resolution timestamps, preserves submission precedence.
+    focus = pending_ids[-1] if pending_ids else ""
     state["focus_feedback_id"] = focus
     state["pending_feedback_ids"] = pending_ids
     state["delivery_enforcement"] = bool(
@@ -2572,6 +2802,7 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
     # last so prompt-tail context truncation never preferentially loses them.
     awaiting_live = live_queue_public(p).get("awaiting_verification", [])
     live_inputs = awaiting_live[:12] + newly_claimed_live
+    focus_item = live_queue_public(p).get("focus")
     if fast_pipeline and pipeline.get("compact_context", True):
         compact = {
             "generated_at": now_iso(),
@@ -2582,6 +2813,8 @@ def build_agent_prompt(p: Path, cfg: dict[str, Any], iteration: int, build_resul
             "last_evidence": read_json(p / ".gameforge/last_evidence.json", {}),
             "last_self_heal": read_json(p / ".gameforge/last_self_heal.json", {}),
             "delivery_state": delivery_state_for_prompt(p, review),
+            "focus_live_instruction": focus_item,
+            "agent_iteration_state": iteration_snapshot(p),
             "last_cleanup": read_json(p / ".gameforge/last_cleanup.json", {}),
             "live_user_inputs": live_inputs,
             "installed_games": read_json(p / ".gameforge" / "game_inventory.json", {"count": 0, "games": []}),
@@ -2604,7 +2837,9 @@ real project changes and targeted tests, update
 {"results":[{"id":"EXACT_LIVE_ID","ready_for_verification":true,
 "resolution":"Detailed description of what changed",
 "evidence":"Specific build, test and runtime evidence",
-"changed_paths":["workspace/real-source-file"]}]}
+"changed_paths":["workspace/real-source-file"],
+"tests":[{"name":"targeted gameplay regression","status":"passed",
+"log_path":"logs/relevant-test.log"}]}]}
 Use the actual IDs from the queue. Keep unfinished entries pending and
 report genuine blockers in iteration notes. Never invent evidence, and
 never delete previous valid results. GameForge independently requires
@@ -2622,6 +2857,9 @@ a completion claim.
                         "created_at": x.get("created_at"),
                         "priority": x.get("priority"),
                         "source": x.get("source"),
+                        "status": x.get("status"),
+                        "verification_state": x.get("verification_state"),
+                        "changed_paths": (x.get("verification_claim") or {}).get("changed_paths", []),
                         "text": x.get("text"),
                     }
                     for x in live_inputs
@@ -2657,6 +2895,36 @@ a completion claim.
         prior += "\nPrevious test result:\n" + json.dumps({k:v for k,v in test_result.items() if k != "output"}, indent=2) + "\n" + test_result.get("output", "")[-12000:]
     if recovery_context:
         prior += "\nAutomatic recovery context:\n" + json.dumps(recovery_context, indent=2)[-16000:]
+    # The exact actionable work-order ID is emitted at the END of the prompt,
+    # beyond any legacy context truncation. New user requests win over research
+    # and lower-priority roadmap work; implement or identify a genuine blocker.
+    if focus_item and focus_item.get("status") != "implemented":
+        focus_directive = (
+            "\n\nMANDATORY CURRENT USER WORK ORDER (priority over roadmap/research):\n"
+            + json.dumps({
+                "id": focus_item.get("id"), "status": focus_item.get("status"),
+                "source": focus_item.get("source"), "text": focus_item.get("text"),
+                "created_at": focus_item.get("created_at"),
+            }, ensure_ascii=False)
+            + "\nAct on this exact request before doing optional work. Make a real"
+              " production change when appropriate and provide specific evidence."
+              " If it requires several passes, continue it in subsequent turns;"
+              " do not silently substitute unrelated tasks or falsely mark it"
+              " complete. If blocked, record the concrete blocker and keep the"
+              " work order pending.\n"
+        )
+    elif pending_feedback:
+        latest = pending_feedback[-1]
+        focus_directive = (
+            "\n\nMANDATORY CURRENT USER FEEDBACK (priority over roadmap/research):\n"
+            + json.dumps({"id": latest.get("id"), "text": latest.get("text")},
+                         ensure_ascii=False)
+            + "\nWork on this pending user request first. Preserve unresolved"
+              " feedback and never claim verification without the configured"
+              " full build and original regression.\n"
+        )
+    else:
+        focus_directive = ""
     research = cfg.get("research_mode", "deep")
     if fast_pipeline:
         startup = """FAST STRICT PIPELINE: Start with .gameforge/compact_state.json, goal.md, design/project.json, tasks/MVP.md, .gameforge/acceptance.json, .gameforge/user_review.json, and Git status/history. Do NOT bulk-read every old log, research file, capture, or the entire source tree on every iteration. Inspect only the source/tests/research needed for the current work, and retrieve older evidence only when it is specifically relevant.
@@ -2686,7 +2954,7 @@ Treat build/runtime warnings, dependency errors, WSL issues, toolchain failures,
 
 Before declaring a blocker, exhaust SAFE, LEGAL, REAL autonomous options: inspect existing project uploads/local files, public/authorized sources, official documentation, and legitimately redistributable dependencies. Never download pirated commercial games/ROMs, leaked credentials, or other unauthorized material. If progress genuinely requires user-only input, DO NOT merely mention the blocker in notes and DO NOT keep burning iterations. Write .gameforge/user_input_request.json and stop the iteration cleanly. Schema:
 {{"status":"pending","kind":"file|url|text|choice|confirm","title":"short human title","message":"exactly what is needed and why","why_user_required":"why autonomous acquisition is unavailable/inappropriate","accept_extensions":[".z64"],"upload_category":"ROMS_LOCAL","placeholder":"","choices":[],"resume_after_submit":true}}
-For files, list ONLY valid expected extensions. For a copyrighted base ROM, tell the user to provide their own legally obtained copy; never search for unauthorized ROM downloads. For URLs, request a URL only when the user must identify/authorize the source.\n\nRecent evidence from logs/OpenCV/runtime:\n{evidence[-50000:] if evidence else '(none yet)'}\n{prior[-30000:]}\n'''
+For files, list ONLY valid expected extensions. For a copyrighted base ROM, tell the user to provide their own legally obtained copy; never search for unauthorized ROM downloads. For URLs, request a URL only when the user must identify/authorize the source.\n\nRecent evidence from logs/OpenCV/runtime:\n{evidence[-50000:] if evidence else '(none yet)'}\n{prior[-30000:]}\n{focus_directive}\n'''
 
 
 def agent_loop(project_id: str) -> None:
@@ -2701,6 +2969,7 @@ def agent_loop(project_id: str) -> None:
     recovery_context: dict[str, Any] | None = None
     auth_verified_at = 0.0
     build_result = test_result = None
+    reserved_iteration: int | None = None
     state.status = "running"
     state.started_at = now_iso()
     state.message = "Starting autonomous game-development loop"
@@ -2741,13 +3010,15 @@ def agent_loop(project_id: str) -> None:
                     return
                 auth_verified_at = time.monotonic()
 
-            state.iteration += 1
-            if max_iter and state.iteration > max_iter:
+            # Reserve a durable ID before any checkpoint/prompt/tool is started.
+            # Evidence may lag after interrupted or failed turns; never reuse IDs.
+            reserved_iteration = reserve_iteration(p, maximum=max_iter)
+            if reserved_iteration is None:
                 state.status = "paused"
                 state.message = f"Reached configured max_iterations={max_iter}"
                 return
-
-            iteration = state.iteration
+            state.iteration = reserved_iteration
+            iteration = reserved_iteration
             state.last_update = now_iso()
             state.message = f"Iteration {iteration}: checkpointing and asking Codex to improve the playable result"
             set_agent_activity(state, "Saving a safety checkpoint", f"Creating the pre-iteration Git checkpoint for iteration {iteration}.", "checkpoint")
@@ -2755,6 +3026,7 @@ def agent_loop(project_id: str) -> None:
             pre_iteration_rev = str(pre_checkpoint.get("rev", "") or "")
             review_before_iteration = load_user_review(p)
             prompt = build_agent_prompt(p, cfg, iteration, build_result, test_result, recovery_context)
+            state.active_instruction_id = live_queue_public(p).get("focus_id")
             trace_path = p / f"logs/codex-iteration-{iteration:04d}.jsonl"
             final_path = p / f"logs/codex-iteration-{iteration:04d}.final.txt"
             trace_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2953,7 +3225,6 @@ def agent_loop(project_id: str) -> None:
                 set_agent_activity(state, "Stopped", state.message, "stopped")
                 return
 
-            live_verification = reconcile_live_instruction_results(p, iteration, build_result, test_result, change_summary)
             review_after_verification = reconcile_feedback_work_orders(
                 p,
                 review_before_iteration,
@@ -2961,6 +3232,7 @@ def agent_loop(project_id: str) -> None:
                 test_result,
                 verification_complete=True,
             )
+            live_verification = reconcile_live_instruction_results(p, iteration, build_result, test_result, change_summary)
             pending_feedback_count = sum(
                 1 for item in review_after_verification.get("feedback", [])
                 if isinstance(item, dict) and not bool(item.get("addressed"))
@@ -3001,6 +3273,7 @@ def agent_loop(project_id: str) -> None:
                 "delivery_state": delivery_state,
             }
             write_json(p / ".gameforge/last_evidence.json", evidence)
+            finish_iteration(p, iteration, "tested")
             try:
                 fusion_manifest(p, cfg, persist=True)
             except Exception:
@@ -3027,17 +3300,23 @@ def agent_loop(project_id: str) -> None:
                         "timestamp": now_iso(), "reason": f"iteration-{iteration}", "errors": [str(exc)]
                     })
 
-            if acceptance_is_complete(p, build_result, test_result):
-                git_checkpoint(p, f"GameForge verified completion iteration {iteration}")
+            if acceptance_is_complete(p, build_result, test_result) and live_verification["pending_count"] == 0:
+                checkpoint = git_checkpoint(p, f"GameForge verified completion iteration {iteration}")
+                link_live_instruction_checkpoint(p, iteration, pre_iteration_rev, str(checkpoint.get("rev") or ""))
                 state.status = "complete"
                 state.message = "Acceptance criteria are marked complete with evidence and configured build/tests pass."
                 set_agent_activity(state, "Project verified complete", state.message, "complete")
                 return
 
-            git_checkpoint(p, f"GameForge iteration {iteration} progress")
+            checkpoint = git_checkpoint(p, f"GameForge iteration {iteration} progress")
+            link_live_instruction_checkpoint(p, iteration, pre_iteration_rev, str(checkpoint.get("rev") or ""))
             state.last_update = now_iso()
-            if pending_feedback_count:
-                state.message = f"Iteration {iteration} incomplete; {pending_feedback_count} user feedback work order(s) still pending"
+            pending_live = live_verification["pending_count"]
+            if pending_live or pending_feedback_count:
+                state.message = (
+                    f"Iteration {iteration} incomplete; {pending_live} live user instruction(s)"
+                    f" and {pending_feedback_count} feedback work order(s) remain unverified"
+                )
             else:
                 state.message = f"Iteration {iteration} incomplete; continuing after evidence/regression checks"
             set_agent_activity(state, "Preparing the next improvement pass", state.message, "loop")
@@ -3047,6 +3326,11 @@ def agent_loop(project_id: str) -> None:
         state.status = "error"
         state.message = f"{exc}\n{traceback.format_exc()[-4000:]}"
     finally:
+        if reserved_iteration is not None and state.status in {"error", "blocked", "stopped", "paused", "complete"}:
+            finish_iteration(p, reserved_iteration, {
+                "error": "failed", "blocked": "blocked", "stopped": "stopped",
+                "paused": "paused", "complete": "complete",
+            }[state.status])
         if state.transport is not None:
             state.transport.close()
             state.transport = None
@@ -3065,7 +3349,7 @@ def start_agent(project_id: str) -> dict[str, Any]:
         if existing and existing.thread and existing.thread.is_alive():
             existing.pause_event.clear()
             return agent_public(existing)
-        persisted_iteration = int((read_json(p / ".gameforge" / "last_evidence.json", {}) or {}).get("iteration", 0) or 0)
+        persisted_iteration = iteration_snapshot(p)["agent_iteration"]
         resume_iteration = max(persisted_iteration, existing.iteration if existing else 0)
         state = AgentState(project_id=project_id, iteration=resume_iteration,
                            configured_transport=str(cfg.get("agent", {}).get("transport", "auto")))
@@ -3122,6 +3406,7 @@ def agent_public(s: AgentState) -> dict[str, Any]:
         "steering_available": bool(s.transport and s.transport.active and not isinstance(s.transport, AcpAgentTransport)),
         "status": s.status,
         "iteration": s.iteration,
+        "active_instruction_id": s.active_instruction_id,
         "message": s.message,
         "started_at": s.started_at,
         "last_update": s.last_update,
@@ -4411,7 +4696,7 @@ class Handler(SimpleHTTPRequestHandler):
                     cfg["id"] = pid
                     cfg["project_root"] = str(d.resolve())
                     cfg["gfai_files"] = [x.name for x in d.glob("*.gfai")]
-                    cfg["agent_status"] = agent_public(st) if st else {"status": "idle", "iteration": 0, "message": ""}
+                    cfg["agent_status"] = agent_public(st) if st else {"status": "idle", "iteration": iteration_snapshot(d)["agent_iteration"], "message": ""}
                     cfg["acceptance"] = read_json(d / ".gameforge/acceptance.json", {})
                     projects.append(cfg)
                 return self.send_json({"projects": projects})
@@ -4427,7 +4712,8 @@ class Handler(SimpleHTTPRequestHandler):
                     "user_review": load_user_review(p),
                     "evidence": read_json(p / ".gameforge/last_evidence.json", {}),
                     "uploads": read_json(p / ".gameforge/upload_manifest.json", {"count": 0, "items": []}),
-                    "agent": agent_public(st) if st else {"status":"idle","iteration":0,"message":""},
+                    "agent": agent_public(st) if st else {"status":"idle","iteration":iteration_snapshot(p)["agent_iteration"],"message":""},
+                    "iteration_progress": iteration_snapshot(p),
                     "input_request": load_user_input_request(p),
                     "cv": {"status": cv.status, "message": cv.message} if cv else {"status":"idle","message":""},
                     "visual": read_json(p / "captures/metrics.json", {}),
@@ -4580,6 +4866,7 @@ class Handler(SimpleHTTPRequestHandler):
                         steered = st.transport.steer(text_value)
                         if steered:
                             mark_live_instruction_steered(p, item["id"])
+                            st.active_instruction_id = item["id"]
                     except AppServerProtocolError:
                         steered = False  # durable queue fallback
                 if mode == "interrupt":
@@ -4600,8 +4887,8 @@ class Handler(SimpleHTTPRequestHandler):
                     data = load_live_queue(p)
                     changed = False
                     for item in data.get("items", []):
-                        if item.get("id") == item_id and item.get("status") in {"queued", "awaiting_verification"}:
-                            item["status"] = "cancelled"
+                        if item.get("id") == item_id and item.get("status") in {"queued", "delivered_to_agent", "implemented"}:
+                            _live_transition(item, "cancelled", reason="User explicitly cancelled instruction")
                             item["cancelled_at"] = now_iso()
                             changed = True
                     if changed:
@@ -4785,6 +5072,16 @@ class Handler(SimpleHTTPRequestHandler):
                     return self.send_json({"error": "Feedback cannot be empty"}, 400)
                 category = str(body.get("category", "general") or "general")[:80]
                 review = append_user_feedback(p, text_value, category)
+                # Feedback is a user work order, not merely historical review text.
+                # Give it a linked durable live ID and steer an active Codex turn
+                # when the transport supports that protocol. Otherwise queue it.
+                feedback_id = str(review.get("feedback", [])[-1].get("id") or "")
+                linked = enqueue_live_instruction(
+                    p, f"User feedback {feedback_id}: {text_value[:18000]} "
+                       f"Read the complete authoritative entry in .gameforge/user_review.json.",
+                    mode="queue", source="user-feedback",
+                    metadata={"feedback_id": feedback_id},
+                )
                 # New feedback means there is new work to do even if the user previously
                 # considered the project done.
                 if review.get("user_done"):
@@ -4792,6 +5089,13 @@ class Handler(SimpleHTTPRequestHandler):
                     review["reopened_at"] = now_iso()
                     save_user_review(p, review)
                 st = AGENTS.get(pid)
+                if st and st.transport and st.transport.active and not isinstance(st.transport, AcpAgentTransport):
+                    try:
+                        if st.transport.steer(linked["text"]):
+                            mark_live_instruction_steered(p, linked["id"])
+                            st.active_instruction_id = linked["id"]
+                    except AppServerProtocolError:
+                        pass  # Persistence/next-turn dispatch remains the fallback.
                 if st and st.status == "user-complete":
                     st.status = "paused"
                     st.message = "New user feedback received; ready to continue from the current state"
