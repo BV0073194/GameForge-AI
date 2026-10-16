@@ -5,6 +5,7 @@ JSON-RPC interface and retains an existing thread across verified turns.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -182,7 +183,9 @@ class CodexAppServer:
                 saved = json.loads(self._thread_file.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 pass
-            previous = saved.get("thread_id") if saved.get("cwd") == str(self.cwd.resolve()) else None
+            fingerprint = hashlib.sha256(json.dumps(codex_mcp_config(self.mcp_servers), sort_keys=True).encode("utf-8")).hexdigest()
+            previous = (saved.get("thread_id") if saved.get("cwd") == str(self.cwd.resolve())
+                        and saved.get("mcp_fingerprint") == fingerprint else None)
             if isinstance(previous, str) and previous:
                 try:
                     result = self._request("thread/resume", {"threadId": previous}, timeout=12)
@@ -205,6 +208,7 @@ class CodexAppServer:
             self._thread_file.parent.mkdir(parents=True, exist_ok=True)
             self._thread_file.write_text(json.dumps({
                 "thread_id": self.thread_id, "cwd": str(self.cwd.resolve()),
+                "mcp_fingerprint": fingerprint,
             }), encoding="utf-8")
         except Exception as exc:
             self.close()
