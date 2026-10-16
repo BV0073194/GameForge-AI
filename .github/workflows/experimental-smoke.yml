@@ -44,7 +44,9 @@ jobs:
           python -m unittest discover -s tests -p "test_fusion_protocols.py" -v
           python -m unittest discover -s tests -p "test_live_agent_accountability.py" -v
           python -m unittest discover -s tests -p "test_wsl_cleanup.py" -v
+          node --check web/ui_refresh.js
           node --check web/app.js
+          node --test tests/test_ui_refresh.cjs
 
       - name: Run source smoke
         shell: bash
@@ -83,7 +85,9 @@ jobs:
           python -m unittest discover -s tests -p "test_fusion_protocols.py" -v
           python -m unittest discover -s tests -p "test_live_agent_accountability.py" -v
           python -m unittest discover -s tests -p "test_wsl_cleanup.py" -v
+          node --check web/ui_refresh.js
           node --check web/app.js
+          node --test tests/test_ui_refresh.cjs
 
       - name: Run source smoke
         shell: pwsh

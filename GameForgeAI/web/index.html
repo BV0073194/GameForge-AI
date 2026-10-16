@@ -70,7 +70,10 @@
             </article>
 
             <article class="card" id="liveTaskCard">
-              <h3>Live task activity</h3>
+              <div class="row between wrap">
+                <h3>Live task activity</h3>
+                <button type="button" class="copy-control" data-copy-target="#liveTaskDetail">Copy activity text</button>
+              </div>
               <div class="badges">
                 <span id="liveTaskState" class="badge">Idle</span>
                 <span id="liveTaskAge" class="badge">No activity yet</span>
@@ -79,12 +82,14 @@
               <p id="liveTaskFocus" class="muted" role="status" aria-live="polite">No user instruction assigned.</p>
               <pre id="liveTaskDetail" class="compact">Start or resume the autonomous developer to see what GameForge is doing on the computer.</pre>
               <div id="liveTaskHistory"></div>
+              <span id="liveRefreshStatus" class="tiny" aria-live="off">Live updates run without interrupting selection or open details.</span>
               <p class="tiny">Updates from actual AI/tool/build/test activity. Long WSL installs, compiler runs, file edits, research, and self-repair steps will stay visible here so a busy task does not look frozen.</p>
             </article>
 
             <article class="card" id="liveSteeringCard">
               <div class="row between wrap">
                 <h3>Live agent queue</h3>
+                <button type="button" class="copy-control" data-copy-target="#liveQueueList">Copy queue</button>
                 <span class="badge">Fusion</span>
               </div>
               <p class="muted">Steer the coding agent while it is working. Queue an instruction for the next safe turn, or stop only the current task and run your new instruction immediately.</p>
@@ -114,7 +119,7 @@
             <article class="card">
               <h3>Build / test / launch</h3>
               <div class="actions"><button id="runBuild">Build</button><button id="runCleanBuild">Clean &amp; Build</button><button id="runTest">Test</button><button id="runLaunch">Launch</button><button id="cleanupArtifacts">Clean up artifacts</button><button id="checkpoint">Git checkpoint</button></div>
-              <pre id="runOutput" class="console"></pre>
+              <div class="row between"><span class="tiny">Build and test output</span><button type="button" class="copy-control" data-copy-target="#runOutput">Copy output</button></div><pre id="runOutput" class="console"></pre>
             </article>
             <article class="card">
               <h3>Acceptance</h3>
@@ -270,11 +275,12 @@
             <label>Game window title (Windows)<input id="windowTitle" placeholder="Titanfall 2 / Project64 / BeamNG"></label>
           </div>
           <button id="saveSettings" class="primary">Save settings</button>
+          <p id="settingsDraftStatus" class="tiny" role="status" aria-live="polite">Settings changes are saved only when you choose Save settings.</p>
           <p class="tiny">For best results, configure clean/build/test/launch commands after the AI establishes the target toolchain. Clean &amp; Build runs the clean step first and only builds if cleaning succeeds. GameForge also compacts obsolete logs, research evidence, and captures automatically after successful iterations.</p>
         </div>
 
         <div id="tab-logs" class="tab">
-          <div class="row between"><h3>Recent logs</h3><button id="refreshLogs">Refresh logs</button></div>
+          <div class="row between wrap"><h3>Recent logs</h3><div class="actions"><button type="button" class="copy-control" data-copy-target="#logs">Copy logs</button><button id="refreshLogs">Refresh logs</button></div></div>
           <div id="logs"></div>
         </div>
       </div>
@@ -282,6 +288,7 @@
   </div>
 </main>
 <footer>GameForge AI Desktop • .gfai project workflow</footer>
+<script src="/ui_refresh.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>
