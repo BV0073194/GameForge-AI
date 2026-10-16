@@ -45,3 +45,23 @@ textarea:focus,input:focus,select:focus{border-color:var(--accent)}
 @media(max-width:900px){.layout,.cards,.grid.two{grid-template-columns:1fr}.projects-panel{position:static;max-height:none}header{flex-direction:column}}
 @media(max-width:600px){header{padding:20px 16px 14px}main{padding:14px 12px 28px}.panel{padding:13px}.card{padding:14px}.actions button{flex:1 1 auto}.tabs button{padding:10px 12px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{scroll-behavior:auto!important;transition:none!important;animation:none!important}}
+
+/* The live dashboard is readable and copyable even while agent data changes.
+   Never turn selectable evidence into a drag-only interaction surface. */
+:where(.panel,.card,.criterion,.logbox,pre,code,.muted,.tiny,#liveQueueList,#liveTaskHistory,#userReviewHistory,#logs){
+  -webkit-user-select:text;
+  user-select:text;
+}
+:where(input,textarea,select){-webkit-user-select:text;user-select:text}
+:where(button,.tabs button){-webkit-user-select:none;user-select:none}
+:where(pre,code){font-variant-ligatures:none}
+:where(pre,.console,#liveTaskDetail){overflow:auto;overscroll-behavior:contain}
+#liveTaskDetail{max-height:360px;white-space:pre-wrap}
+#liveQueueList details,#logs details{margin:10px 0}
+#liveQueueList details>summary,#logs details>summary{cursor:pointer;padding:5px 0}
+#liveQueueList details[open]>summary,#logs details[open]>summary{color:var(--accent)}
+#liveQueueList details:focus-within,#logs details:focus-within{outline:1px solid rgba(115,189,255,.3);outline-offset:4px;border-radius:6px}
+.copy-control{font-size:12px;padding:6px 10px;min-height:30px;flex-shrink:0}
+#liveRefreshStatus{display:inline-block;margin-top:8px}
+#liveQueueList .criterion{word-break:break-word}
+@media(max-width:600px){.copy-control{flex:0 0 auto!important}}
